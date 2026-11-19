@@ -96,6 +96,28 @@ jobs:
           sha256sum autotmpl-* > SHA256SUMS
           cat SHA256SUMS
 
+      - name: Write release notes
+        run: |
+          cat > release-notes.md <<'EOF'
+          Prebuilt `autotmpl` CLI binaries. No LLVM, libclang, clang headers,
+          C++ runtime, or compile database needed.
+
+          | Asset | Platform |
+          | --- | --- |
+          | `autotmpl-macos-arm64` | macOS ARM64 |
+          | `autotmpl-linux-x86_64` | Linux x86-64 |
+          | `autotmpl-windows-x86_64.exe` | Windows x86-64 |
+
+          Verify a download with `SHA256SUMS`:
+
+          ```sh
+          sha256sum -c SHA256SUMS --ignore-missing
+          ```
+
+          The clangd plugin is not prebuilt because it must match your clangd
+          revision and build ABI. See the build guide in the repository.
+          EOF
+
       - name: Publish assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -105,5 +127,7 @@ jobs:
             gh release upload "$GITHUB_REF_NAME" dist/* --clobber
           else
             gh release create "$GITHUB_REF_NAME" dist/* \
-              --title "$GITHUB_REF_NAME" --generate-notes
+              --verify-tag \
+              --title "c-autotmpl $GITHUB_REF_NAME" \
+              --notes-file release-notes.md
           fi
