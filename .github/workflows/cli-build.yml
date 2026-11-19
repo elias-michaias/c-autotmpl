@@ -1,0 +1,109 @@
+name: CLI binaries
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-cli:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            os: macos-15
+            artifact: autotmpl-macos-arm64
+            cc: clang
+            python: python3
+          - name: linux-x86_64
+            os: ubuntu-latest
+            artifact: autotmpl-linux-x86_64
+            cc: gcc
+            python: python3
+          - name: windows-x86_64
+            os: windows-latest
+            artifact: autotmpl-windows-x86_64.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and smoke-test (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          "${{ matrix.cc }}" -std=c99 -O2 -Wall -Wextra -pedantic-errors \
+            src/cli/autotmpl.c -o "${{ matrix.artifact }}"
+          chmod +x "${{ matrix.artifact }}"
+          "./${{ matrix.artifact }}" --help >/dev/null 2>&1
+          "${{ matrix.python }}" tools/standalone-check.py "./${{ matrix.artifact }}"
+
+      - name: Set up MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build and smoke-test (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cl /nologo /TC /std:c11 /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /Fe:${{ matrix.artifact }} src\cli\autotmpl.c
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & .\${{ matrix.artifact }} --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tools\standalone-check.py .\${{ matrix.artifact }}
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Attach binaries to release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-cli
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: autotmpl-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum autotmpl-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --title "$GITHUB_REF_NAME" --generate-notes
+          fi

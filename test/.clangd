@@ -1,0 +1,2 @@
+CompileFlags:
+  Add: ["-xc-header", "-std=c23", "-Wall", "-Wextra", "-Wno-missing-field-initializers", "-Werror"]
