@@ -1,173 +1,177 @@
-# Using c-autotmpl
+# Usage
 
-## Which path should I use?
+Use the CLI for build scripts and reproducible generation. Use the clangd module
+for generation from unsaved buffers, type lookup through the AST, and pruning.
+Both write the same generated headers. Their rules are the same, except that the
+CLI does not prune.
 
-| Situation | Use |
-| --- | --- |
-| You want deterministic generation in a build script or CI job | `autotmpl` CLI |
-| You want a tiny executable to ship with a project | `autotmpl` CLI |
-| You want headers generated while you type, from unsaved buffers | clangd module |
-| You want unused instantiations removed automatically | clangd module |
-| You want the AST to help find a type's declaring header | clangd module |
+Build instructions are in [BUILD.md](BUILD.md).
 
-Both paths write the same generated headers. Many projects use both: the plugin
-for editor feedback and the CLI as the reproducible build step.
-
-See [TEMPLATES.md](TEMPLATES.md) before using either path; guard and include
-order rules are shared.
-
----
-
-## Standalone CLI
-
-Build it in one command:
+## CLI
 
 ```sh
 cc -std=c99 -O2 src/cli/autotmpl.c -o autotmpl
-```
-
-Or use the prebuilt binary from [CI.md](CI.md).
-
-### Options
-
-```text
-usage: autotmpl [--root DIR] [--dry-run] [--verbose] <file-or-dir>...
-
-  --root DIR, -r DIR   workspace root for template/type discovery
-  --dry-run, -n        report changes without writing files
-  --verbose, -v        print generated blocks and summary counters
-  --                   treat remaining arguments as files/directories
-  --help, -h           show usage and exit
-```
-
-Inputs may be files or directories. Directories are walked recursively in
-sorted order, with files visited before subdirectories. Source extensions are
-`.c`, `.h`, `.cc`, `.cpp`, `.cxx`, `.hh`, `.hpp`, and `.hxx`. Hidden
-directories, `build/`, `node_modules/`, and `gen/` are skipped.
-
-Without `--root`, the CLI uses the common ancestor of all input files. For
-predictable results in scripts, pass `--root .` explicitly.
-
-### Examples
-
-```sh
-# Scan an entire project
-autotmpl --root . src include
-
-# See what would change
+autotmpl --root . --verbose src/ include/
 autotmpl --root . --dry-run --verbose src/main.c
-
-# Generate from one source file
-autotmpl --root . src/main.c
 ```
 
-A verbose run prints lines like:
+Options:
 
 ```text
-generated List(int) in /project/gen/list.h
-generated Box(int) in /project/gen/box.h
-templates=2 added=2 skipped=0
+--root DIR, -r DIR   root for template and type discovery
+--dry-run, -n        report changes without writing
+--verbose, -v        print generated blocks and counters
+--                   treat the rest as file names
+--help, -h           show usage
 ```
 
-A second run should report `added=0`. The CLI is additive and idempotent; it
-does **not** prune unused instantiations. Use the plugin for pruning.
+Inputs can be files or directories. Directories are walked in sorted order,
+with files before subdirectories. Without `--root`, the CLI uses the common
+ancestor of the inputs. In scripts, pass `--root .` explicitly.
 
-### Build integration
+A second run reports `added=0`. The CLI is additive and idempotent. It does not
+remove unused blocks.
+
+A simple build rule:
 
 ```make
-.PHONY: gen all
+.PHONY: gen
 gen:
 	autotmpl --root . src include
-
-all: gen
-	$(CC) $(CFLAGS) src/*.c -o app
 ```
-
-The CLI has no compile-database requirement, so it can run before any generated
-files exist. It is fast enough (~1–2 ms in the benchmark project) to run on
-every build.
-
----
 
 ## clangd module
 
-Build it against your clangd as described in [BUILD.md](BUILD.md), then add one
-flag to clangd:
+Build the module as described in [BUILD.md](BUILD.md), then pass it to clangd:
 
 ```sh
 clangd --load=/absolute/path/to/libc-autotmpl.so
 ```
 
-For Neovim with `nvim-lspconfig`:
+On `didOpen` and `didChange`, the module scans the unsaved text, writes missing
+blocks before clangd parses the file, and prunes unused blocks after its
+background workspace scan finishes. It can also find a type's declaring header
+through the AST when the text index has no answer.
 
-```lua
-require("lspconfig").clangd.setup({
-  cmd = {
-    "clangd",
-    "--load=/home/you/Projects/c-autotmpl/build/libc-autotmpl.so",
-    "--background-index",
-  },
-})
-```
-
-That is the whole editor-side setup. Restart clangd after changing the module.
-
-On `didOpen` and `didChange`, the plugin:
-
-- scans the unsaved buffer for usages;
-- writes missing blocks before clangd parses the file;
-- finds user-defined type guards via a text index and the clang AST;
-- prunes unused blocks once the background workspace scan completes;
-- reloads generated headers you edit externally.
-
-A compile database is not required for generation, but clangd still needs
-correct include paths and defines to parse your project.
-
-### Environment variables
+Environment variables:
 
 | Variable | Effect |
 | --- | --- |
-| `C_AUTOTMPL_ROOT` | Force the workspace root instead of auto-discovery. |
-| `C_AUTOTMPL_TIMING=1` | Log phase timings to clangd's stderr. |
-| `C_AUTOTMPL_TEST_VERBOSE=1` | Print plugin log lines from `lsp-check`. |
+| `C_AUTOTMPL_ROOT` | Force the workspace root. |
+| `C_AUTOTMPL_TIMING=1` | Log phase timings. |
+| `C_AUTOTMPL_TEST_VERBOSE=1` | Show plugin logs in `lsp-check`. |
 
-Run clangd with `--log=verbose` to see normal plugin activity:
+A compile database is not needed for generation, but clangd still needs correct
+include paths and defines to parse the project.
 
-```text
-[c-autotmpl] scanning /project, found 2 template(s)
-[c-autotmpl] generated List(int) in /project/gen/list.h
-[c-autotmpl] workspace scan complete
-[c-autotmpl] removed /* c-autotmpl: List(Foo) */ from /project/gen/list.h
+## Template headers
+
+A template is a normal header with a decorator:
+
+```c
+// -- template List(T)
+#define List_IMPL(T) List_##T
+#define List(T) List_IMPL(T)
+
+#ifndef T
+typedef int T;
+#endif
+typedef struct { T value; } List_IMPL(T);
+#undef T
 ```
 
----
+`// -- template type Box(T)` is also accepted. The two forms behave the same.
+The name in the decorator chooses the generated file: `tmpl/list.h` maps to
+`gen/list.h`, and other directories get a sibling `gen/` directory.
 
-## Generated files
+Use two levels of macro indirection so the argument expands before pasting.
+A single-level `List_##T` breaks for argument macros.
 
-Generated headers live in a sibling `gen/` directory. They are normal C headers
-with include guards and marker comments. You can commit them for reproducible
-builds, or add them to `.gitignore` and regenerate.
+For a usage such as `List(float)`, the generated block looks like this:
 
-Do not remove the `/* c-autotmpl: ... */` markers if you want pruning to work.
-Hand-written blocks are tolerated, but marked blocks are the canonical format.
+```c
+/* c-autotmpl: List(float) */
+#ifndef C_AUTOTMPL_LIST_FLOAT_...
+#define C_AUTOTMPL_LIST_FLOAT_...
+#define T float
+#include "../tmpl/list.h"
+#undef T
+#endif
+```
 
-For nested types, include generated headers in dependency order:
+The marker is used for idempotency and pruning. The `C_AUTOTMPL_...` macro lets
+the same nested instantiation appear in more than one generated header without
+duplicate definitions.
+
+Hand-written `#define T ... / #include / #undef T` blocks are recognized, so
+older generated files do not immediately gain duplicate copies.
+
+## Type guards
+
+Builtin and fixed-width scalar types are emitted without a type guard. For any
+other type, the generated block needs a traditional guard:
+
+```c
+#ifndef FOO_H
+#define FOO_H
+
+typedef struct { int x; } Foo;
+
+#endif
+```
+
+`#if !defined(FOO_H)` followed by `#define FOO_H` also works. The guard must be
+near the top of the header. `#pragma once` has no macro that generated code can
+test, so it is skipped.
+
+The plugin can also find a declaring header through the clang AST. The CLI only
+uses a text index, so keep guards traditional if you use the CLI.
+
+## Nested types
+
+Nested applications are expanded inside out:
+
+```c
+List(Box(int))
+```
+
+First `Box(int)` becomes `Box_int`. Then `List(Box_int)` is emitted, with the
+whole block wrapped in `GEN_BOX_H`:
+
+```c
+/* c-autotmpl: List(Box_int) */
+#ifndef C_AUTOTMPL_LIST_BOX_INT_...
+#ifdef GEN_BOX_H
+#define C_AUTOTMPL_LIST_BOX_INT_...
+#define T Box_int
+#include "../tmpl/list.h"
+#undef T
+#endif
+#endif
+```
+
+The source must include the dependency generated header first:
 
 ```c
 #include "gen/box.h"
 #include "gen/list.h"
 ```
 
-See [TEMPLATES.md](TEMPLATES.md) for the complete nested-type policy.
+If the order is reversed, `GEN_BOX_H` is undefined and the nested block is
+skipped. c-autotmpl does not insert dependency includes for you.
 
----
+No call-site alias macros are generated. Write `List(Box(int))` or
+`List(Box_int)` directly.
 
-## Performance expectations
+Deeper chains such as `List(Box(List(int)))` are flattened into the outermost
+generated header in dependency order. Inner blocks are also mirrored into their
+own headers, and the presence macros make the copies harmless.
 
-- CLI no-op/cold generation: about 1–2 ms even with thousands of unrelated
-  headers.
-- Plugin first-open work: a few tenths of a millisecond in the benchmark
-  project; clangd parse overhead is within noise.
-- Workspace scanning runs on a background thread so keystrokes do not wait.
+## Generated files
 
-Run `make bench` to reproduce the measurements on your machine.
+Generated headers are ordinary C headers in `gen/`. You can commit them or
+regenerate them. Keep the `/* c-autotmpl: ... */` markers if you want plugin
+pruning to work. The plugin reloads a generated header when its mtime or size
+changes, so direct edits are not overwritten from a stale cache.
+
+If something goes wrong, start with [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
