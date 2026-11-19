@@ -213,5 +213,5 @@ Run `make bench` to reproduce these numbers.
 
 <p align="center">
   <a href="LICENSE.md">MIT licensed</a> &bull;
-  <a href="https://github.com/elias-michaias/c-autotmpl/issues">Report an issue</a> &bull;
+  <a href="https://github.com/elias-michaias/c-autotmpl/issues">Report an issue</a>
 </p>
