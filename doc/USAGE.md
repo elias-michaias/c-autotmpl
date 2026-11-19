@@ -110,14 +110,7 @@ its arguments, so the extra macro forces `T` to expand first.
 
 Further reading:
 
-- [C preprocessor overview](https://en.cppreference.com/w/c/preprocessor.html)
-- [Token pasting with `##`](https://gcc.gnu.org/onlinedocs/cpp/Concatenation.html)
-- [Argument prescan](https://gcc.gnu.org/onlinedocs/cpp/Argument-Prescan.html),
-  which explains the two-level macro trick
-- [Include guards](https://gcc.gnu.org/onlinedocs/cpp/Include-Guards.html),
-  needed for user-defined type arguments
-- [X macros](https://en.wikipedia.org/wiki/X_macro), a related way to generate
-  repeated C declarations
+- [Writing Generic Code in C (Template Headers)](https://katelyndoucette.com/articles/writing_generics_in_c) explains the pattern c-autotmpl automates, including name mangling with `##`.
 
 ## Template headers
 

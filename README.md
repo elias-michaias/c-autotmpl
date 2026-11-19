@@ -40,8 +40,7 @@ the CLI is additive and idempotent for scripts.
 Template-style headers are a preprocessor pattern: define `T`, re-include a
 header that pastes `T` into names, then undefine `T`. c-autotmpl writes those
 re-include blocks for you. [doc/USAGE.md](doc/USAGE.md#what-the-pattern-does)
-explains the pattern with a small example and links to the relevant C
-preprocessor docs.
+explains the pattern with a small example and links to practical guides.
 
 ## Generated output
 
