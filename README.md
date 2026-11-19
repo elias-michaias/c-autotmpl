@@ -4,6 +4,8 @@ c-autotmpl generates C template-style re-include headers. It runs as a small,
 fast ISO C99 command line tool, or as a clangd plugin that works while you write
 C code.
 
+![c-autotmpl generating headers live in Neovim](assets/demo.gif)
+
 Given this:
 
 ```c
@@ -118,6 +120,7 @@ src/plugin/   clangd feature module and its C++ core
 tools/        Python integration checks and benchmark harness
 test/         small C23 fixture project
 doc/          build, usage, and troubleshooting guides
+assets/       demo GIF used in this README
 .github/      CLI build and release workflow
 ```
 

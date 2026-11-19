@@ -42,40 +42,81 @@ file to a GitHub release. The workflow is `.github/workflows/cli-build.yml`.
 
 ## clangd plugin
 
-### What you need
+> **Upstream note.** clangd's feature module interface is now in LLVM. When
+> distributions expose that interface in their normal clangd development
+> packages, this module should be buildable against the system clangd instead of
+> a private source tree. It still uses clangd internals today, so the headers
+> must match your clangd binary. That packaging gap is the main thing likely to
+> improve.
 
-- The LLVM source tree used to build your clangd, including `clang`, `llvm`,
-  and `clang-tools-extra`.
-- The configured LLVM build tree that generated clangd's headers.
-- `llvm-config` from that build tree.
-- A C++17 compiler compatible with the one used for clangd.
-- Python 3 if you want to run the integration checks.
-
-Check which clangd you are actually running:
+Check which clangd you actually run:
 
 ```sh
 clangd --version
 which clangd
 ```
 
-A packaged clangd may not come with matching sources. In that case, build
-clangd yourself from a known revision and use that binary in your editor.
+Before cloning anything, see whether your package manager already shipped the
+needed headers:
+
+```sh
+find /usr/include /usr/local/include /usr/lib /usr/local/lib \
+  -path '*/clangd/FeatureModule.h' 2>/dev/null | head
+find /usr/bin /usr/local/bin /usr/lib /usr/local/lib \
+  -name 'llvm-config*' -type f 2>/dev/null | head
+```
+
+If both are present and match your clangd version, point `LLVM_SRC`,
+`LLVM_BUILD`, `CLANGD_SRC`, and `LLVM_CONFIG` at that installation. The Makefile
+expects a source-tree layout, so you may need to adjust `INCLUDES`. If the
+headers are missing, use the shallow clone below.
+
+### What you need today
+
+- The LLVM source tree used to build your clangd. Only `llvm`, `clang`, and
+  `clang-tools-extra` matter here.
+- The configured LLVM build tree that generated clangd's headers.
+- `llvm-config` from that build tree.
+- Git, CMake, Ninja, and a C++17 compiler compatible with clangd.
+- Python 3 if you want to run the integration checks.
 
 ### Get a matching LLVM tree
 
-If you need to build one:
+A partial, shallow, sparse checkout is enough. This skips history and projects
+such as mlir, libc, and flang. If you want to match a packaged clangd, use its
+LLVM release tag from `clangd --version`, for example `llvmorg-20.1.8`:
 
 ```sh
-git clone --depth 1 https://github.com/llvm/llvm-project.git
+git clone --depth 1 --single-branch --filter=blob:none --sparse \
+  --branch llvmorg-20.1.8 \
+  https://github.com/llvm/llvm-project.git llvm-project
 cd llvm-project
+git sparse-checkout set llvm clang clang-tools-extra
+```
 
+If you are building clangd yourself from current LLVM, omit the `--branch` line.
+If your Git or remote does not support blob filtering, drop
+`--filter=blob:none`. The depth, single-branch, and sparse settings still help.
+
+Then configure and build only what is needed for matching headers:
+
+```sh
 cmake -S llvm -B build -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DLLVM_ENABLE_PROJECTS="clang;clang-tools-extra" \
-  -DLLVM_TARGETS_TO_BUILD=Native
+  -DLLVM_TARGETS_TO_BUILD=Native \
+  -DLLVM_ENABLE_EH=OFF \
+  -DLLVM_ENABLE_RTTI=OFF \
+  -DLLVM_INCLUDE_BENCHMARKS=OFF \
+  -DLLVM_INCLUDE_EXAMPLES=OFF \
+  -DLLVM_INCLUDE_TESTS=OFF
 
 cmake --build build --target clangd llvm-config
 ```
+
+You still build clangd today because the generated headers must match the
+binary you load the module into. Once system packages ship those headers, this
+step should go away.
 
 This gives the layout the Makefile expects:
 
@@ -217,6 +258,10 @@ C_AUTOTMPL_TEST_VERBOSE=1 make lsp-check
    `LLVM_ABI`.
 4. Run `make selftest` and `make lsp-check`.
 5. Restart the editor.
+
+Once distributions ship the clangd module headers, steps 1 and 2 should go away.
+You should only need the system clangd development package and a rebuild of this
+small module.
 
 ### Build errors
 
