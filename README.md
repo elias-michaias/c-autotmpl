@@ -4,8 +4,6 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/CLI-ISO%20C99-brightgreen" alt="ISO C99 CLI">
-  <img src="https://img.shields.io/badge/editor-clangd%20module-blue" alt="clangd module">
   <a href="LICENSE.md"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
   <a href="https://github.com/elias-michaias/c-autotmpl/actions/workflows/cli-build.yml"><img src="https://github.com/elias-michaias/c-autotmpl/actions/workflows/cli-build.yml/badge.svg" alt="CI status"></a>
   <a href="https://github.com/elias-michaias/c-autotmpl/releases"><img src="https://img.shields.io/github/v/release/elias-michaias/c-autotmpl?display_name=tag" alt="Latest release"></a>
@@ -20,15 +18,6 @@
   <a href="doc/USAGE.md">Usage</a> &bull;
   <a href="doc/BUILD.md">Build</a> &bull;
   <a href="#benchmarks">Benchmarks</a>
-</p>
-
-<p align="center">
-  <a href="https://katelyndoucette.com/articles/writing_generics_in_c#gh-dark-mode-only" target="_blank" rel="noopener noreferrer">
-    <img src="doc/assets/article-button-dark.svg" width="280" height="60" alt="Read about template headers">
-  </a>
-  <a href="https://katelyndoucette.com/articles/writing_generics_in_c#gh-light-mode-only" target="_blank" rel="noopener noreferrer">
-    <img src="doc/assets/article-button-light.svg" width="280" height="60" alt="Read about template headers">
-  </a>
 </p>
 
 ---
@@ -50,7 +39,7 @@ C code.
 | **Nested generics** | `List(Box(int))` and deeper chains, with dependency guards. |
 | **Idempotent output** | Additive writes and stable markers make reruns safe in build scripts. |
 | **Type-aware guards** | User types use real include guards; scalar types are emitted bare. |
-| **Prebuilt binaries** | CI builds the CLI for macOS ARM64, Linux x86-64, and Windows x86-64. |
+
 
 ## Example
 
@@ -159,7 +148,7 @@ make LLVM_SRC=/path/to/llvm-project LLVM_BUILD=/path/to/llvm-project/build
 clangd --load=/absolute/path/to/build/libc-autotmpl.so
 ```
 
-For Neovim, adding that `--load` flag to the clangd command is the only setup.
+For most editors, adding that `--load` flag to the clangd command is the only setup.
 The plugin is C++17 built against clangd internals, so rebuild it when clangd
 changes. Full instructions are in [doc/BUILD.md](doc/BUILD.md).
 
