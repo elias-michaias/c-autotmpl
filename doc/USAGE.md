@@ -110,7 +110,8 @@ its arguments, so the extra macro forces `T` to expand first.
 
 Further reading:
 
-- [Writing Generic Code in C (Template Headers)](https://katelyndoucette.com/articles/writing_generics_in_c) explains the pattern c-autotmpl automates, including name mangling with `##`.
+- [David Priver - Templates in C](https://www.davidpriver.com/ctemplates.html)
+- [Katelyn Doucette - Writing Generic Code in C (Template Headers)](https://katelyndoucette.com/articles/writing_generics_in_c)
 
 ## Template headers
 
