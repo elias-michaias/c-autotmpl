@@ -1,12 +1,58 @@
-# c-autotmpl
+<p align="center">
+  <h1 align="center">c-autotmpl</h1>
+  <p align="center">C template-style generic headers, generated from your editor or your build.</p>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/CLI-ISO%20C99-brightgreen" alt="ISO C99 CLI">
+  <img src="https://img.shields.io/badge/editor-clangd%20module-blue" alt="clangd module">
+  <a href="LICENSE.md"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
+  <a href="https://github.com/elias-michaias/c-autotmpl/actions/workflows/cli-build.yml"><img src="https://github.com/elias-michaias/c-autotmpl/actions/workflows/cli-build.yml/badge.svg" alt="CI status"></a>
+  <a href="https://github.com/elias-michaias/c-autotmpl/releases"><img src="https://img.shields.io/github/v/release/elias-michaias/c-autotmpl?display_name=tag" alt="Latest release"></a>
+  <a href="https://github.com/elias-michaias/c-autotmpl"><img src="https://img.shields.io/github/stars/elias-michaias/c-autotmpl?style=social" alt="GitHub stars"></a>
+</p>
+
+<p align="center">
+  <a href="#features">Features</a> &bull;
+  <a href="#example">Example</a> &bull;
+  <a href="#generated-output">Generated output</a> &bull;
+  <a href="#get-started">Get started</a> &bull;
+  <a href="doc/USAGE.md">Usage</a> &bull;
+  <a href="doc/BUILD.md">Build</a> &bull;
+  <a href="#benchmarks">Benchmarks</a>
+</p>
+
+<p align="center">
+  <a href="https://katelyndoucette.com/articles/writing_generics_in_c#gh-dark-mode-only" target="_blank" rel="noopener noreferrer">
+    <img src="doc/assets/article-button-dark.svg" width="280" height="60" alt="Read about template headers">
+  </a>
+  <a href="https://katelyndoucette.com/articles/writing_generics_in_c#gh-light-mode-only" target="_blank" rel="noopener noreferrer">
+    <img src="doc/assets/article-button-light.svg" width="280" height="60" alt="Read about template headers">
+  </a>
+</p>
+
+---
+
+<p align="center">
+  <img src="assets/demo.gif" alt="c-autotmpl generating headers live in Neovim">
+</p>
 
 c-autotmpl generates C template-style re-include headers. It runs as a small,
 fast ISO C99 command line tool, or as a clangd plugin that works while you write
 C code.
 
-![c-autotmpl generating headers live in Neovim](assets/demo.gif)
+## Features
 
-Given this:
+| Feature | Description |
+| --- | --- |
+| **Single-file CLI** | One ISO C99 source. No LLVM, libclang, clang headers, C++ runtime, or compile database. |
+| **Editor integration** | clangd feature module generates from unsaved buffers and prunes stale blocks. |
+| **Nested generics** | `List(Box(int))` and deeper chains, with dependency guards. |
+| **Idempotent output** | Additive writes and stable markers make reruns safe in build scripts. |
+| **Type-aware guards** | User types use real include guards; scalar types are emitted bare. |
+| **Prebuilt binaries** | CI builds the CLI for macOS ARM64, Linux x86-64, and Windows x86-64. |
+
+## Example
 
 ```c
 #include "point.h"
@@ -119,11 +165,11 @@ changes. Full instructions are in [doc/BUILD.md](doc/BUILD.md).
 
 ## Documentation
 
-- [doc/BUILD.md](doc/BUILD.md): CLI build, clangd plugin build, loading, tests,
-  and build errors. This is the longer guide.
-- [doc/USAGE.md](doc/USAGE.md): CLI options, template authoring, guards, nested
-  types, and runtime behavior.
-- [doc/TROUBLESHOOTING.md](doc/TROUBLESHOOTING.md): common failures and fixes.
+| Document | Description |
+| --- | --- |
+| [**Build guide**](doc/BUILD.md) | CLI build, clangd plugin build, loading, tests, and build errors. |
+| [**Usage guide**](doc/USAGE.md) | CLI options, template authoring, guards, nested types, and runtime behavior. |
+| [**Troubleshooting**](doc/TROUBLESHOOTING.md) | Common failures and fixes. |
 
 ## Repository layout
 
@@ -131,7 +177,6 @@ changes. Full instructions are in [doc/BUILD.md](doc/BUILD.md).
 src/cli/      one self-contained C99 CLI source file
 src/plugin/   clangd feature module and its C++ core
 tools/        Python integration checks and benchmark harness
-test/         small C23 fixture project
 doc/          build, usage, and troubleshooting guides
 assets/       demo GIF used in this README
 .github/      CLI build and release workflow
@@ -176,3 +221,11 @@ Run `make bench` to reproduce these numbers.
 - The CLI does not see usages created only by macro expansion.
 - Nested blocks depend on include order in the source file.
 - The clangd module must be rebuilt against a matching clangd version.
+
+---
+
+<p align="center">
+  <a href="LICENSE.md">MIT licensed</a> &bull;
+  <a href="https://github.com/elias-michaias/c-autotmpl/issues">Report an issue</a> &bull;
+  <a href="https://github.com/elias-michaias/c-autotmpl/releases">Download binaries</a>
+</p>

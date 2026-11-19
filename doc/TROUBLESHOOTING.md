@@ -30,3 +30,7 @@ line.
 Run `make selftest`, `make lsp-check`, and `make standalone-check` to separate
 core generation problems from clangd integration problems. Add
 `C_AUTOTMPL_TEST_VERBOSE=1` to see plugin logs from `lsp-check`.
+
+---
+
+[README](../README.md) &bull; [Build](BUILD.md) &bull; [Usage](USAGE.md) &bull; [Troubleshooting](TROUBLESHOOTING.md)

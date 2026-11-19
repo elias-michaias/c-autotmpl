@@ -224,3 +224,7 @@ pruning to work. The plugin reloads a generated header when its mtime or size
 changes, so direct edits are not overwritten from a stale cache.
 
 If something goes wrong, start with [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+
+---
+
+[README](../README.md) &bull; [Build](BUILD.md) &bull; [Usage](USAGE.md) &bull; [Troubleshooting](TROUBLESHOOTING.md)

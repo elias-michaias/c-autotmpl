@@ -274,3 +274,7 @@ small module.
 | Plugin loads but logs nothing | Use an absolute `--load` path and restart clangd. |
 
 More runtime problems are covered in [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+
+---
+
+[README](../README.md) &bull; [Build](BUILD.md) &bull; [Usage](USAGE.md) &bull; [Troubleshooting](TROUBLESHOOTING.md)
