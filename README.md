@@ -6,8 +6,6 @@
 <p align="center">
   <a href="LICENSE.md"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
   <a href="https://github.com/elias-michaias/c-autotmpl/actions/workflows/cli-build.yml"><img src="https://github.com/elias-michaias/c-autotmpl/actions/workflows/cli-build.yml/badge.svg" alt="CI status"></a>
-  <a href="https://github.com/elias-michaias/c-autotmpl/releases"><img src="https://img.shields.io/github/v/release/elias-michaias/c-autotmpl?display_name=tag" alt="Latest release"></a>
-  <a href="https://github.com/elias-michaias/c-autotmpl"><img src="https://img.shields.io/github/stars/elias-michaias/c-autotmpl?style=social" alt="GitHub stars"></a>
 </p>
 
 <p align="center">
