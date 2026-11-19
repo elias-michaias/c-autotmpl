@@ -9,8 +9,16 @@ C code.
 Given this:
 
 ```c
-List(int) xs;
-List(Box(int)) nested;
+#include "point.h"
+#include "gen/box.h"
+#include "gen/list.h"
+
+int main(void) {
+    Box(Point) p = {{3}};
+    List(int) xs = {7};
+    List(Box(int)) nested = {{9}};
+    return p.value.x + xs.value + nested.value.value;
+}
 ```
 
 c-autotmpl finds the matching template header and writes the instantiations into
@@ -28,6 +36,12 @@ There are two ways to use it:
 
 Both paths write the same generated headers. The plugin adds editor features;
 the CLI is additive and idempotent for scripts.
+
+Template-style headers are a preprocessor pattern: define `T`, re-include a
+header that pastes `T` into names, then undefine `T`. c-autotmpl writes those
+re-include blocks for you. [doc/USAGE.md](doc/USAGE.md#what-the-pattern-does)
+explains the pattern with a small example and links to the relevant C
+preprocessor docs.
 
 ## Generated output
 

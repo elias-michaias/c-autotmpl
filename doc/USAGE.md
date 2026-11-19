@@ -64,6 +64,61 @@ Environment variables:
 A compile database is not needed for generation, but clangd still needs correct
 include paths and defines to parse the project.
 
+## What the pattern does
+
+A template-style header is an ordinary C header that is included once per type.
+The generated block defines `T`, includes the header, then undefines `T`. The
+header pastes `T` into identifiers, so one header can produce `Stack_int`,
+`Stack_float`, and so on. This is preprocessor metaprogramming, not C++
+templates.
+
+A minimal version looks like this:
+
+```c
+/* tmpl/stack.h */
+// -- template Stack(T)
+#define STACK_NAME_I(T) Stack_##T
+#define STACK_NAME(T) STACK_NAME_I(T)
+
+#ifndef T
+typedef int T;
+#endif
+typedef struct { T *data; int len; } STACK_NAME(T);
+#undef T
+```
+
+```c
+/* gen/stack.h */
+#ifndef GEN_STACK_H
+#define GEN_STACK_H
+
+#define T int
+#include "../tmpl/stack.h"
+#undef T
+
+#endif
+```
+
+```c
+#include "gen/stack.h"
+
+Stack_int stack = {0};
+```
+
+The inner `STACK_NAME_I` layer matters. Token pasting with `##` does not expand
+its arguments, so the extra macro forces `T` to expand first.
+
+Further reading:
+
+- [C preprocessor overview](https://en.cppreference.com/w/c/preprocessor.html)
+- [Token pasting with `##`](https://gcc.gnu.org/onlinedocs/cpp/Concatenation.html)
+- [Argument prescan](https://gcc.gnu.org/onlinedocs/cpp/Argument-Prescan.html),
+  which explains the two-level macro trick
+- [Include guards](https://gcc.gnu.org/onlinedocs/cpp/Include-Guards.html),
+  needed for user-defined type arguments
+- [X macros](https://en.wikipedia.org/wiki/X_macro), a related way to generate
+  repeated C declarations
+
 ## Template headers
 
 A template is a normal header with a decorator:
