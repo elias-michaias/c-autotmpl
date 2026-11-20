@@ -223,6 +223,11 @@ The shorter slotted form below uses three registration slots. A template header
 turns each `Register(T)` usage into one registration, so adding a type is the
 same edit as adding a container instantiation.
 
+> **Standard dependency:** This approach needs C11 or later because `_Generic`
+> is a C11 keyword. The example uses `-std=gnu11`; `-std=c11` also works. There
+> is no C99 version of this exact macro. CC and the article's counter variant
+> build on the same C11 feature.
+
 ```c
 /* hash.h */
 #ifndef HASH_H
@@ -352,6 +357,15 @@ impl from the same `T`.
 
 Copy `trait.h` from c-trait into the project root. No `dynamic(Self)` marker is
 used, so dispatch is static and there is no vtable.
+
+> **Compiler support:** c-trait's ISO C23 mode is fully standard and works with
+> GCC, Clang, Intel C Compiler, and other conforming C23 compilers. Its GNU99
+> and GNU11 modes use GNU extensions and work with GCC and Clang, plus compilers
+> such as Intel C Compiler when they accept those GNU extensions. Use
+> `-std=c23` for ISO C23 or `-std=gnu99` for GNU99. With a strict compiler that
+> rejects `$` as an identifier, define `TraitCustomDispatch` and alias
+> `trait_dispatch_call` to a plain name. See
+> [c-trait compatibility](https://github.com/elias-michaias/c-trait#compatibility).
 
 ```c
 /* point.h */
