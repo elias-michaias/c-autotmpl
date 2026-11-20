@@ -4,14 +4,14 @@
 </p>
 
 <p align="center">
-  <a href="LICENSE.md"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
+  <a href="../LICENSE.md"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
   <a href="https://github.com/elias-michaias/c-autotmpl/actions/workflows/cli-build.yml"><img src="https://github.com/elias-michaias/c-autotmpl/actions/workflows/cli-build.yml/badge.svg" alt="CI status"></a>
 </p>
 
 <p align="center">
-  <a href="README.md">Home</a> &bull;
-  <a href="doc/USAGE.md">Usage</a> &bull;
-  <a href="doc/BUILD.md">Build</a> &bull;
+  <a href="../README.md">Home</a> &bull;
+  <a href="USAGE.md">Usage</a> &bull;
+  <a href="BUILD.md">Build</a> &bull;
   <a href="#checked-constraints-and-generated-functions">Constraints</a> &bull;
   <a href="#extendible-generic-dispatch">Dispatch</a> &bull;
   <a href="#c-trait-generic-impls">Traits</a>
@@ -767,7 +767,7 @@ passes the link check.
 ---
 
 <p align="center">
-  <a href="README.md">Home</a> &bull;
-  <a href="doc/USAGE.md">Usage</a> &bull;
+  <a href="../README.md">Home</a> &bull;
+  <a href="USAGE.md">Usage</a> &bull;
   <a href="https://github.com/elias-michaias/c-autotmpl/issues">Report an issue</a>
 </p>
