@@ -14,6 +14,7 @@
   <a href="#generated-output">Generated output</a> &bull;
   <a href="#get-started">Get started</a> &bull;
   <a href="doc/USAGE.md">Usage</a> &bull;
+  <a href="POLYMORPHISM.md">Polymorphism</a> &bull;
   <a href="doc/BUILD.md">Build</a> &bull;
   <a href="#benchmarks">Benchmarks</a>
 </p>
@@ -156,6 +157,7 @@ changes. Full instructions are in [doc/BUILD.md](doc/BUILD.md).
 | --- | --- |
 | [**Build guide**](doc/BUILD.md) | CLI build, clangd plugin build, loading, tests, and build errors. |
 | [**Usage guide**](doc/USAGE.md) | CLI options, template authoring, guards, nested types, and runtime behavior. |
+| [**Polymorphism**](POLYMORPHISM.md) | Checked constraints, extendible `_Generic`, and c-trait impls. |
 | [**Troubleshooting**](doc/TROUBLESHOOTING.md) | Common failures and fixes. |
 
 ## Repository layout
