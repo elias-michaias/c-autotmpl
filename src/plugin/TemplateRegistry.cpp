@@ -114,6 +114,22 @@ std::string genHeaderPath(StringRef TemplateHeader, StringRef Name) {
   return std::string(GenDir);
 }
 
+std::string genImplPath(StringRef TemplateHeader, StringRef Name) {
+  SmallString<256> Parent(sys::path::parent_path(TemplateHeader));
+  StringRef ParentName = sys::path::filename(Parent);
+  SmallString<256> ImplDir;
+  if (ParentName == "tmpl" || ParentName == "templates") {
+    ImplDir = sys::path::parent_path(Parent);
+  } else {
+    ImplDir = Parent;
+  }
+  sys::path::append(ImplDir, "gen");
+  sys::path::append(ImplDir, "impl");
+  sys::path::append(ImplDir, lowerCopy(Name) + ".c");
+  sys::path::remove_dots(ImplDir, /*remove_dot_dot=*/true);
+  return std::string(ImplDir);
+}
+
 StringRef readMacroName(StringRef S) {
   S = S.ltrim();
   size_t I = 0;
@@ -154,6 +170,30 @@ bool definesMacroSoon(StringRef Rest, StringRef Macro) {
     if (!S.consume_front("#define"))
       continue;
     if (readMacroName(S) == Macro)
+      return true;
+  }
+  return false;
+}
+
+bool hasTmplHeaderGuard(StringRef Buffer) {
+  bool InBlockComment = false;
+  while (!Buffer.empty()) {
+    StringRef Line;
+    std::tie(Line, Buffer) = Buffer.split('\n');
+    StringRef S = Line.ltrim();
+    if (InBlockComment) {
+      if (S.contains("*/"))
+        InBlockComment = false;
+      continue;
+    }
+    if (S.starts_with("//"))
+      continue;
+    if (S.starts_with("/*")) {
+      if (!S.contains("*/"))
+        InBlockComment = true;
+      continue;
+    }
+    if (guardMacroFromLine(Line) == "TMPL_HEADER")
       return true;
   }
   return false;
@@ -216,6 +256,7 @@ void TemplateRegistry::scanTree(StringRef Dir) {
     if (!BufferOrErr)
       continue;
     StringRef Buffer = (*BufferOrErr)->getBuffer();
+    bool HasGuard = hasTmplHeaderGuard(Buffer);
 
     auto Def = std::make_unique<TemplateDef>();
     bool Found = false;
@@ -232,8 +273,13 @@ void TemplateRegistry::scanTree(StringRef Dir) {
 
     Def->Header = makeAbsolute(It->path());
     Def->GeneratedHeader = genHeaderPath(Def->Header, Def->Name);
+    Def->GeneratedImplSource = genImplPath(Def->Header, Def->Name);
+    Def->HasTmplHeaderGuard = HasGuard;
     Def->IncludeFromGenDir =
         computeRelativePath(sys::path::parent_path(Def->GeneratedHeader),
+                            Def->Header);
+    Def->IncludeFromImplDir =
+        computeRelativePath(sys::path::parent_path(Def->GeneratedImplSource),
                             Def->Header);
 
     const TemplateDef *Ptr = Def.get();

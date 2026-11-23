@@ -143,7 +143,7 @@ bool findBlockAt(ArrayRef<LineInfo> Lines, size_t Index,
   int Depth = 0;
   size_t UndefIndex = StringRef::npos;
   size_t LastLine = StringRef::npos;
-  size_t Last = std::min(Index + 18 + 4 * Count, Lines.size());
+  size_t Last = std::min(Index + 20 + 5 * Count, Lines.size());
   SmallVector<bool, 4> SeenUndef(Count, false);
   for (size_t I = Index + 1; I < Last; ++I) {
     StringRef Line = Lines[I].Text.trim();
@@ -159,7 +159,9 @@ bool findBlockAt(ArrayRef<LineInfo> Lines, size_t Index,
         break;
       }
     }
-    if (lineIncludes(Line, Template.IncludeFromGenDir))
+    if (lineIncludes(Line, Template.IncludeFromGenDir) ||
+        (!Template.IncludeFromImplDir.empty() &&
+         lineIncludes(Line, Template.IncludeFromImplDir)))
       SawInclude = true;
     bool AllUndef = true;
     for (size_t J = 0; J < Count; ++J) {
@@ -250,7 +252,9 @@ std::string instantiationMarker(StringRef TemplateName, StringRef TypeSpelling) 
 
 /// A per-instantiation macro makes duplicate definitions harmless even when
 /// the same nested type is emitted in more than one generated header.
-std::string presenceMacro(StringRef TemplateName, StringRef TypeSpelling) {
+static std::string presenceMacroWithPrefix(StringRef Prefix,
+                                           StringRef TemplateName,
+                                           StringRef TypeSpelling) {
   std::string Name = TemplateName.str() + "_" + TypeSpelling.str();
   uint32_t Hash = 2166136261u;
   for (unsigned char C : Name) {
@@ -258,7 +262,7 @@ std::string presenceMacro(StringRef TemplateName, StringRef TypeSpelling) {
     Hash *= 16777619u;
   }
 
-  std::string Out = "C_AUTOTMPL_";
+  std::string Out = Prefix.str();
   for (unsigned char C : Name) {
     if (C >= 'a' && C <= 'z')
       Out += static_cast<char>(C - 'a' + 'A');
@@ -272,6 +276,16 @@ std::string presenceMacro(StringRef TemplateName, StringRef TypeSpelling) {
   for (int Shift = 28; Shift >= 0; Shift -= 4)
     Out += Hex[(Hash >> Shift) & 0xF];
   return Out;
+}
+
+std::string presenceMacro(StringRef TemplateName, StringRef TypeSpelling) {
+  return presenceMacroWithPrefix("C_AUTOTMPL_", TemplateName, TypeSpelling);
+}
+
+std::string implPresenceMacro(StringRef TemplateName,
+                              StringRef TypeSpelling) {
+  return presenceMacroWithPrefix("C_AUTOTMPL_IMPL_", TemplateName,
+                                 TypeSpelling);
 }
 
 std::string makeInstantiationBlock(
@@ -327,9 +341,13 @@ std::string makeInstantiationBlock(
     Out += Args[I];
     Out += '\n';
   }
+  if (Template.HasTmplHeaderGuard)
+    Out += "#define TMPL_HEADER 1\n";
   Out += "#include \"";
   Out += Template.IncludeFromGenDir;
   Out += "\"\n";
+  if (Template.HasTmplHeaderGuard)
+    Out += "#undef TMPL_HEADER\n";
   for (size_t I = Count; I > 0; --I) {
     Out += "#undef ";
     Out += paramName(Template, I - 1);
@@ -340,6 +358,191 @@ std::string makeInstantiationBlock(
   Out += "#endif\n";
   Out += '\n';
   return Out;
+}
+
+std::string makeImplInstantiationBlock(const TemplateDef &Template,
+                                       StringRef TypeSpelling,
+                                       ArrayRef<std::string> Args,
+                                       ArrayRef<std::string> GuardMacros) {
+  size_t Count = paramCount(Template);
+  SmallVector<std::string, 4> ActualArgs;
+  if (Args.size() == Count)
+    for (const std::string &Arg : Args)
+      ActualArgs.push_back(Arg);
+  else if (!splitExplicitArgs(TypeSpelling, Template, ActualArgs) ||
+           ActualArgs.size() != Count)
+    return {};
+
+  std::string Out;
+  Out.reserve(128 + Template.IncludeFromImplDir.size() + TypeSpelling.size());
+  Out += instantiationMarker(Template.Name, TypeSpelling);
+  Out += '\n';
+
+  const std::string Presence = implPresenceMacro(Template.Name, TypeSpelling);
+  Out += "#ifndef ";
+  Out += Presence;
+  Out += '\n';
+  for (const std::string &Guard : GuardMacros) {
+    if (Guard.empty())
+      continue;
+    Out += "#ifdef ";
+    Out += Guard;
+    Out += '\n';
+  }
+  Out += "#define ";
+  Out += Presence;
+  Out += '\n';
+
+  for (size_t I = 0; I < Count; ++I) {
+    Out += "#define ";
+    Out += paramName(Template, I);
+    Out += ' ';
+    Out += ActualArgs[I];
+    Out += '\n';
+  }
+  Out += "#include \"";
+  Out += Template.IncludeFromImplDir;
+  Out += "\"\n";
+  for (size_t I = Count; I > 0; --I) {
+    Out += "#undef ";
+    Out += paramName(Template, I - 1);
+    Out += '\n';
+  }
+  for (size_t I = GuardMacros.size(); I > 0; --I) {
+    if (!GuardMacros[I - 1].empty())
+      Out += "#endif\n";
+  }
+  Out += "#endif\n\n";
+  return Out;
+}
+
+namespace {
+
+bool fileHasLine(StringRef Content, StringRef Line) {
+  StringRef Wanted = Line.trim();
+  for (const LineInfo &Info : splitLines(Content))
+    if (Info.Text.trim() == Wanted)
+      return true;
+  return false;
+}
+
+std::string makeImplPrologue(ArrayRef<std::string> IncludeLines) {
+  std::string Out = "/* Generated by c-autotmpl. Do not edit. */\n";
+  Out += "#undef TMPL_HEADER\n";
+  llvm::StringSet<> Seen;
+  for (const std::string &Line : IncludeLines) {
+    if (Line.empty() || !Seen.insert(Line).second)
+      continue;
+    Out += Line;
+    Out += '\n';
+  }
+  Out += '\n';
+  return Out;
+}
+
+bool writeTextFile(StringRef Path, StringRef Content, std::string &Error) {
+  SmallString<256> Dir(sys::path::parent_path(Path));
+  if (!Dir.empty() && !sys::fs::is_directory(Dir)) {
+    std::error_code DCEC = sys::fs::create_directories(Dir);
+    if (DCEC) {
+      Error = DCEC.message();
+      return false;
+    }
+  }
+
+  std::error_code EC;
+  raw_fd_ostream OS(Path, EC, sys::fs::CD_CreateAlways);
+  if (EC) {
+    Error = EC.message();
+    return false;
+  }
+  OS << Content;
+  OS.close();
+  if (OS.has_error()) {
+    Error = "failed writing " + Path.str();
+    return false;
+  }
+  return true;
+}
+
+} // namespace
+
+InstantiationResult Instantiator::instantiateImpl(
+    const TemplateDef &Template, StringRef TypeSpelling,
+    ArrayRef<std::string> Args, ArrayRef<std::string> GuardMacros,
+    ArrayRef<std::string> IncludeLines, std::string &GenPath,
+    std::string &Error) {
+  if (Template.GeneratedImplSource.empty()) {
+    Error = "template " + Template.Name + " has no implementation source";
+    return InstantiationResult::Error;
+  }
+  if (Args.size() != paramCount(Template)) {
+    Error = "expected " + std::to_string(paramCount(Template)) +
+            " type argument(s) for " + Template.Name;
+    return InstantiationResult::Error;
+  }
+
+  const std::string Block =
+      makeImplInstantiationBlock(Template, TypeSpelling, Args, GuardMacros);
+  if (Block.empty()) {
+    Error = "cannot build implementation block for " + Template.Name + "(" +
+            TypeSpelling.str() + ")";
+    return InstantiationResult::Error;
+  }
+
+  std::lock_guard<std::mutex> Lock(Mutex);
+  GenPath = Template.GeneratedImplSource;
+  FileState &State = getState(GenPath);
+  const std::string Marker = instantiationMarker(Template.Name, TypeSpelling);
+  if (State.Markers.contains(Marker) ||
+      hasManualInstantiation(State.Content, Template, TypeSpelling))
+    return InstantiationResult::Existing;
+
+  std::string NewContent;
+  if (State.Content.empty()) {
+    NewContent = makeImplPrologue(IncludeLines);
+  } else if (!fileHasLine(State.Content, "#undef TMPL_HEADER")) {
+    NewContent = makeImplPrologue(IncludeLines);
+    NewContent += State.Content;
+  } else {
+    llvm::StringSet<> Seen;
+    std::string Missing;
+    for (const std::string &Line : IncludeLines) {
+      if (Line.empty() || !Seen.insert(Line).second)
+        continue;
+      if (!fileHasLine(State.Content, Line)) {
+        Missing += Line;
+        Missing += '\n';
+      }
+    }
+
+    size_t Insert = StringRef::npos;
+    for (const LineInfo &Info : splitLines(State.Content))
+      if (Info.Text.trim() == "#undef TMPL_HEADER") {
+        Insert = Info.End;
+        break;
+      }
+
+    NewContent = State.Content;
+    if (Insert == StringRef::npos) {
+      NewContent = makeImplPrologue(IncludeLines);
+      NewContent += State.Content;
+    } else if (!Missing.empty()) {
+      NewContent.insert(Insert, Missing);
+    }
+  }
+
+  if (!NewContent.empty() && NewContent.back() != '\n')
+    NewContent += '\n';
+  NewContent += Block;
+
+  if (!writeTextFile(GenPath, NewContent, Error))
+    return InstantiationResult::Error;
+
+  State.Content = std::move(NewContent);
+  State.Stamp = stampFor(GenPath);
+  State.Markers.insert(Marker);
+  return InstantiationResult::Added;
 }
 
 void Instantiator::loadState(FileState &State, StringRef Path,

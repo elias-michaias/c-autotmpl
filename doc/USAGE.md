@@ -2,8 +2,9 @@
 
 Use the CLI for build scripts and reproducible generation. Use the clangd module
 for generation from unsaved buffers, type lookup through the AST, and pruning.
-Both write the same generated headers. Their rules are the same, except that the
-CLI does not prune.
+Both write the same public headers, implementation sources, and makefile fragment
+for split templates. Their scanner rules are the same, except that the CLI does
+not prune.
 
 Build instructions are in [BUILD.md](BUILD.md).
 
@@ -38,7 +39,13 @@ A simple build rule:
 .PHONY: gen
 gen:
 	autotmpl --root . src include
+
+-include gen/impl/c-autotmpl.mk
 ```
+
+The fragment appends generated implementation sources to
+`C_AUTOTMPL_IMPL_SRCS`. Add that variable to your link step when you use split
+templates.
 
 ## clangd module
 
@@ -49,9 +56,10 @@ clangd --load=/absolute/path/to/libc-autotmpl.so
 ```
 
 On `didOpen` and `didChange`, the module scans the unsaved text, writes missing
-blocks before clangd parses the file, and prunes unused blocks after its
-background workspace scan finishes. It can also find a type's declaring header
-through the AST when the text index has no answer.
+public headers, implementation sources, and makefile fragments before clangd
+parses the file, and prunes unused blocks after its background workspace scan
+finishes. It can also find a type's declaring header through the AST when the
+text index has no answer.
 
 Environment variables:
 
@@ -159,6 +167,56 @@ duplicate definitions.
 
 Hand-written `#define T ... / #include / #undef T` blocks are recognized, so
 older generated files do not immediately gain duplicate copies.
+
+## Split implementations
+
+A template can put implementation code in the `#ifndef TMPL_HEADER` branch and
+public declarations in the `#else` branch. The first branch is active when the
+template file is opened directly, so the implementation stays visible.
+
+```c
+/* tmpl/list.h */
+// -- template List(T)
+#ifndef TMPL_HEADER
+#define LIST_CAT_I(A, B) A##B
+#define LIST_CAT(A, B) LIST_CAT_I(A, B)
+#define List(T) LIST_CAT(List_, T)
+T list_get(List(T) *p) { return p->value; }
+#else
+#define LIST_CAT_I(A, B) A##B
+#define LIST_CAT(A, B) LIST_CAT_I(A, B)
+#define List(T) LIST_CAT(List_, T)
+typedef struct { T value; } List(T);
+T list_get(List(T) *p);
+#endif
+```
+
+Keep helper macros and internal types in the first branch. Public names used by
+callers belong in the second branch.
+
+The public block wraps the re-include with the marker:
+
+```c
+/* c-autotmpl: List(int) */
+#ifndef C_AUTOTMPL_LIST_INT_...
+#define C_AUTOTMPL_LIST_INT_...
+#define T int
+#define TMPL_HEADER 1
+#include "../tmpl/list.h"
+#undef TMPL_HEADER
+#undef T
+#endif
+```
+
+Both generators write one grouped source per split template under
+`gen/impl/list.c`. It starts with `#undef TMPL_HEADER`, includes the required
+user headers, then adds one marked block per specialization. Each block
+re-includes the template with `TMPL_HEADER` undefined. The fragment shown in the
+build rule above adds that source to `C_AUTOTMPL_IMPL_SRCS`.
+
+Headers without `#ifndef TMPL_HEADER` keep the original behavior. Both
+generators ignore generated implementation sources during scans, so re-includes
+are never fed back into either scanner.
 
 ## Function templates
 
@@ -320,10 +378,13 @@ No call-site alias macros are generated. Write `List(Box(int))` or
 
 ## Generated files
 
-Generated headers are ordinary C headers in `gen/`. You can commit them or
-regenerate them. Keep the `/* c-autotmpl: ... */` markers if you want plugin
-pruning to work. The plugin reloads a generated header when its mtime or size
-changes, so direct edits are not overwritten from a stale cache.
+Generated headers are ordinary C headers in `gen/`. Split templates also get a
+grouped source in `gen/impl/` and a shared `gen/impl/c-autotmpl.mk` fragment.
+You can commit generated files or regenerate them. Keep the
+`/* c-autotmpl: ... */` markers in headers if you want plugin pruning to work.
+The plugin reloads a generated header when its mtime or size changes, so direct
+edits are not overwritten from a stale cache. It applies the same pruning and
+fragment update pass to generated implementation sources.
 
 If something goes wrong, start with [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 

@@ -966,6 +966,27 @@ static char *find_guard_in_buffer(const char *buffer) {
   return xstrdup("");
 }
 
+static int has_tmpl_header_guard(const char *buffer) {
+  char *clean = strip_comments_literals(buffer);
+  const char *rest = clean;
+  int found = 0;
+  while (*rest) {
+    const char *end = strchr(rest, '\n');
+    size_t n = end ? (size_t)(end - rest) : strlen(rest);
+    char *line = xstrdup_n(rest, n);
+    char *macro = guard_macro_from_line(line);
+    if (strcmp(macro, "TMPL_HEADER") == 0)
+      found = 1;
+    free(macro);
+    free(line);
+    if (found || !end)
+      break;
+    rest = end + 1;
+  }
+  free(clean);
+  return found;
+}
+
 static char *upper_macro(const char *a, const char *b) {
   Str out;
   str_init(&out);
@@ -1017,6 +1038,9 @@ typedef struct {
   char *header;
   char *generated;
   char *include;
+  char *impl;             /* grouped implementation TU, when split */
+  char *impl_include;     /* template header relative to impl TU */
+  int has_tmpl_header;
 } TemplateDef;
 
 typedef struct {
@@ -1114,6 +1138,24 @@ static char *generated_header_path(const char *header, const char *name) {
   free(dir_name);
   free(base);
   free(gen_dir);
+  free(lower);
+  free(file);
+  free(path);
+  return abs;
+}
+
+static char *generated_impl_path(const char *header, const char *name) {
+  char *generated = generated_header_path(header, name);
+  char *gen_dir = path_dirname(generated);
+  char *impl_dir = path_join(gen_dir, "impl");
+  char *lower = lower_copy(name);
+  char *file = (char *)xmalloc(strlen(lower) + 3);
+  sprintf(file, "%s.c", lower);
+  char *path = path_join(impl_dir, file);
+  char *abs = path_absolute(path);
+  free(generated);
+  free(gen_dir);
+  free(impl_dir);
   free(lower);
   free(file);
   free(path);
@@ -1233,6 +1275,7 @@ static int visit_template_file(const char *path, void *ctx) {
       break;
     rest = end + 1;
   }
+  def.has_tmpl_header = has_tmpl_header_guard(content);
   free(content);
   if (!ok || !def.name[0]) {
     free(def.name);
@@ -1242,9 +1285,17 @@ static int visit_template_file(const char *path, void *ctx) {
 
   def.header = path_absolute(path);
   def.generated = generated_header_path(def.header, def.name);
+  def.impl = def.has_tmpl_header
+                 ? generated_impl_path(def.header, def.name)
+                 : NULL;
   char *gen_dir = path_dirname(def.generated);
   def.include = path_relative(gen_dir, def.header);
   free(gen_dir);
+  if (def.impl) {
+    char *impl_dir = path_dirname(def.impl);
+    def.impl_include = path_relative(impl_dir, def.header);
+    free(impl_dir);
+  }
 
   TemplateDef *owned = (TemplateDef *)xmalloc(sizeof(TemplateDef));
   *owned = def;
@@ -1277,6 +1328,7 @@ static void registry_scan(Registry *reg, const char *root) {
 
 typedef struct {
   Map guards;
+  Map guard_headers; /* guard macro -> declaring header path */
 } TypeIndex;
 
 static int is_keyword_token(const Token *t) {
@@ -1385,6 +1437,11 @@ static int visit_type_header(const char *path, void *ctx) {
     return 0;
   }
   index_header(scan->idx, buffer, guard);
+  if (!map_get(&scan->idx->guard_headers, guard)) {
+    char *abs = path_absolute(path);
+    map_set(&scan->idx->guard_headers, guard, abs);
+    free(abs);
+  }
   free(guard);
   free(buffer);
   return scan->wanted->len > 0 && all_wanted_found(scan->idx, scan->wanted);
@@ -1957,6 +2014,12 @@ typedef struct {
   Map files;
 } EmitCtx;
 
+typedef struct {
+  const TemplateDef *tmpl;
+  Vec usages;
+  Set includes;
+} ImplGroup;
+
 /* Generated headers are queried once per distinct usage type, not once per
  * call site. This is the hot path for dry-run/no-op build-script invocations. */
 static const char *cached_file(EmitCtx *ctx, const char *path) {
@@ -1980,7 +2043,8 @@ static char *instantiation_marker(const char *name, const char *type) {
   return str_take(&out);
 }
 
-static char *presence_macro(const char *name, const char *type) {
+static char *presence_macro_prefixed(const char *prefix, const char *name,
+                                     const char *type) {
   Str key;
   str_init(&key);
   str_append(&key, name);
@@ -1993,7 +2057,7 @@ static char *presence_macro(const char *name, const char *type) {
   }
   Str out;
   str_init(&out);
-  str_append(&out, "C_AUTOTMPL_");
+  str_append(&out, prefix);
   for (size_t i = 0; i < key.len; ++i) {
     unsigned char c = (unsigned char)key.data[i];
     char upper;
@@ -2011,6 +2075,14 @@ static char *presence_macro(const char *name, const char *type) {
   str_append(&out, hex);
   str_free(&key);
   return str_take(&out);
+}
+
+static char *presence_macro(const char *name, const char *type) {
+  return presence_macro_prefixed("C_AUTOTMPL_", name, type);
+}
+
+static char *impl_presence_macro(const char *name, const char *type) {
+  return presence_macro_prefixed("C_AUTOTMPL_IMPL_", name, type);
 }
 
 static int starts_with_word(const char *line, const char *word) {
@@ -2143,7 +2215,7 @@ static int has_manual_block(const char *content, const TemplateDef *tmpl,
       memset(seen_def, 0, count);
       memset(seen_undef, 0, count);
       int saw_include = 0;
-      for (int i = 0; i < 12 + 4 * (int)count && *q; ++i) {
+      for (int i = 0; i < 14 + 5 * (int)count && *q; ++i) {
         char *body = xstrdup_n(q, (size_t)(next_line(q) - q));
         if (include_matches(body, tmpl->include))
           saw_include = 1;
@@ -2265,10 +2337,14 @@ static char *make_block(Usage *usage, Set *guards) {
     str_append(&out, (char *)usage->args.items[i]);
     str_append_char(&out, '\n');
   }
+  if (tmpl->has_tmpl_header)
+    str_append(&out, "#define TMPL_HEADER 1\n");
   str_append(&out, "#include \"");
   str_append(&out, tmpl->include);
   str_append_char(&out, '"');
   str_append_char(&out, '\n');
+  if (tmpl->has_tmpl_header)
+    str_append(&out, "#undef TMPL_HEADER\n");
   for (size_t i = count; i > 0; --i) {
     str_append(&out, "#undef ");
     str_append(&out, param_name(tmpl, i - 1));
@@ -2329,6 +2405,272 @@ static int append_block(const char *path, const char *block, EmitCtx *ctx) {
   if (rc == 0)
     map_set(&ctx->files, path, out.data ? out.data : "");
   str_free(&out);
+  return rc;
+}
+
+/* ------------------------- implementation TUs --------------------------- */
+
+static char *make_impl_block(Usage *usage, Set *guards) {
+  const TemplateDef *tmpl = usage->tmpl;
+  Str out;
+  str_init(&out);
+  char *marker = instantiation_marker(tmpl->name, usage->type);
+  char *presence = impl_presence_macro(tmpl->name, usage->type);
+  str_append(&out, marker);
+  str_append_char(&out, '\n');
+  str_append(&out, "#ifndef ");
+  str_append(&out, presence);
+  str_append_char(&out, '\n');
+  for (size_t i = 0; i < guards->len; ++i) {
+    str_append(&out, "#ifdef ");
+    str_append(&out, (char *)guards->items[i]);
+    str_append_char(&out, '\n');
+  }
+  str_append(&out, "#define ");
+  str_append(&out, presence);
+  str_append_char(&out, '\n');
+  size_t count = param_count(tmpl);
+  for (size_t i = 0; i < count; ++i) {
+    str_append(&out, "#define ");
+    str_append(&out, param_name(tmpl, i));
+    str_append_char(&out, ' ');
+    str_append(&out, (char *)usage->args.items[i]);
+    str_append_char(&out, '\n');
+  }
+  str_append(&out, "#include \"");
+  str_append(&out, tmpl->impl_include);
+  str_append_char(&out, '"');
+  str_append_char(&out, '\n');
+  for (size_t i = count; i > 0; --i) {
+    str_append(&out, "#undef ");
+    str_append(&out, param_name(tmpl, i - 1));
+    str_append_char(&out, '\n');
+  }
+  for (size_t i = guards->len; i > 0; --i)
+    str_append(&out, "#endif\n");
+  str_append(&out, "#endif\n\n");
+  free(marker);
+  free(presence);
+  return str_take(&out);
+}
+
+static void collect_impl_include_arg(const char *spelling, EmitCtx *ctx,
+                                     Set *includes) {
+  if (!needs_guard(spelling) || is_constructor_arg(spelling, ctx->reg))
+    return;
+  char *type = strip_qualifiers(spelling);
+  const char *arg;
+  if (registry_match_mangled(ctx->reg, type, &arg)) {
+    collect_impl_include_arg(arg, ctx, includes);
+    free(type);
+    return;
+  }
+  char *name = last_identifier(type);
+  const char *guard = map_get(&ctx->idx->guards, name);
+  if (guard) {
+    const char *header = map_get(&ctx->idx->guard_headers, guard);
+    if (header)
+      set_add(includes, header);
+  }
+  free(name);
+  free(type);
+}
+
+static void collect_impl_includes(Usage *usage, EmitCtx *ctx, Set *includes) {
+  for (size_t i = 0; i < usage->args.len; ++i)
+    collect_impl_include_arg((char *)usage->args.items[i], ctx, includes);
+}
+
+static char *build_impl_prologue(const TemplateDef *tmpl, Set *includes) {
+  char *impl_dir = path_dirname(tmpl->impl);
+  Str out;
+  str_init(&out);
+  str_append(&out, "/* Generated by c-autotmpl. Do not edit. */\n");
+  str_append(&out, "#undef TMPL_HEADER\n");
+  for (size_t i = 0; i < includes->len; ++i) {
+    char *rel = path_relative(impl_dir, (char *)includes->items[i]);
+    str_append(&out, "#include \"");
+    str_append(&out, rel);
+    str_append_char(&out, '"');
+    str_append_char(&out, '\n');
+    free(rel);
+  }
+  str_append_char(&out, '\n');
+  free(impl_dir);
+  return str_take(&out);
+}
+
+static int ensure_impl_file(const TemplateDef *tmpl, Set *includes,
+                            EmitCtx *ctx) {
+  char *dir = path_dirname(tmpl->impl);
+  make_dir(dir);
+  free(dir);
+
+  char *prologue = build_impl_prologue(tmpl, includes);
+  const char *content = cached_file(ctx, tmpl->impl);
+  Str out;
+  str_init(&out);
+  int changed = 0;
+
+  if (!content[0]) {
+    str_append(&out, prologue);
+    changed = 1;
+  } else if (!strstr(content, "#undef TMPL_HEADER")) {
+    str_append(&out, prologue);
+    str_append(&out, content);
+    changed = 1;
+  } else {
+    Str missing;
+    str_init(&missing);
+    const char *p = prologue;
+    while (*p) {
+      char *line = xstrdup_n(p, (size_t)(next_line(p) - p));
+      char *trimmed = trim_copy(line);
+      if (strncmp(trimmed, "#include", 8) == 0 &&
+          !strstr(content, line))
+        str_append(&missing, line);
+      free(trimmed);
+      free(line);
+      p = next_line(p);
+    }
+    int inserted = 0;
+    p = content;
+    while (*p) {
+      char *line = xstrdup_n(p, (size_t)(next_line(p) - p));
+      char *trimmed = trim_copy(line);
+      str_append(&out, line);
+      if (!inserted && strcmp(trimmed, "#undef TMPL_HEADER") == 0) {
+        if (missing.len) {
+          str_append(&out, missing.data);
+          changed = 1;
+        }
+        inserted = 1;
+      }
+      free(trimmed);
+      free(line);
+      p = next_line(p);
+    }
+    if (!inserted) {
+      str_clear(&out);
+      str_append(&out, prologue);
+      str_append(&out, content);
+      changed = 1;
+    }
+    str_free(&missing);
+  }
+
+  if (ctx->dry_run || !changed || !out.data) {
+    free(prologue);
+    str_free(&out);
+    return 0;
+  }
+  int rc = write_file(tmpl->impl, out.data, out.len);
+  if (rc == 0)
+    map_set(&ctx->files, tmpl->impl, out.data);
+  free(prologue);
+  str_free(&out);
+  return rc;
+}
+
+static int append_impl_block(const char *path, const char *block, EmitCtx *ctx) {
+  char *dir = path_dirname(path);
+  make_dir(dir);
+  free(dir);
+  if (ctx->dry_run)
+    return 0;
+  const char *content = cached_file(ctx, path);
+  Str out;
+  str_init(&out);
+  str_append(&out, content);
+  if (content[0] && out.data && out.data[out.len - 1] != '\n')
+    str_append_char(&out, '\n');
+  str_append(&out, block);
+  int rc = write_file(path, out.data ? out.data : "", out.len);
+  if (rc == 0)
+    map_set(&ctx->files, path, out.data ? out.data : "");
+  str_free(&out);
+  return rc;
+}
+
+static int emit_impl_usage(Usage *usage, EmitCtx *ctx) {
+  const TemplateDef *tmpl = usage->tmpl;
+  if (has_instantiation(tmpl->impl, tmpl, usage, ctx))
+    return 0;
+
+  Set guards;
+  guards.items = NULL;
+  guards.len = guards.cap = 0;
+  if (collect_guards(usage, ctx, &guards)) {
+    for (size_t i = 0; i < guards.len; ++i)
+      free(guards.items[i]);
+    free(guards.items);
+    return 0;
+  }
+
+  char *block = make_impl_block(usage, &guards);
+  if (append_impl_block(tmpl->impl, block, ctx) != 0) {
+    fprintf(stderr, "error: failed writing %s\n", tmpl->impl);
+    free(block);
+    for (size_t i = 0; i < guards.len; ++i)
+      free(guards.items[i]);
+    free(guards.items);
+    return -1;
+  }
+  ++ctx->added;
+  if (ctx->verbose)
+    printf("%s impl %s(%s) in %s\n", ctx->dry_run ? "would generate" : "generated",
+           tmpl->name, usage->type, tmpl->impl);
+  free(block);
+  for (size_t i = 0; i < guards.len; ++i)
+    free(guards.items[i]);
+  free(guards.items);
+  return 0;
+}
+
+static char *impl_makefile_path(const char *root) {
+  char *gen = path_join(root, "gen");
+  char *impl = path_join(gen, "impl");
+  char *path = path_join(impl, "c-autotmpl.mk");
+  free(gen);
+  free(impl);
+  return path_absolute(path);
+}
+
+static int write_impl_makefile(const char *root, Vec *groups, EmitCtx *ctx) {
+  if (!groups->len)
+    return 0;
+  char *path = impl_makefile_path(root);
+  char *dir = path_dirname(path);
+  make_dir(dir);
+  free(dir);
+
+  Str out;
+  str_init(&out);
+  str_append(&out, "# Generated by c-autotmpl. Do not edit.\n");
+  for (size_t i = 0; i < groups->len; ++i) {
+    ImplGroup *group = (ImplGroup *)groups->items[i];
+    if (!group->usages.len)
+      continue;
+    char *rel = path_relative(root, group->tmpl->impl);
+    str_append(&out, "C_AUTOTMPL_IMPL_SRCS += ");
+    str_append(&out, rel);
+    str_append_char(&out, '\n');
+    free(rel);
+  }
+
+  char *old = read_file(path, NULL);
+  int changed = !old || strcmp(old, out.data ? out.data : "") != 0;
+  free(old);
+  if (ctx->verbose && changed)
+    printf("%s makefile fragment %s\n",
+           ctx->dry_run ? "would generate" : "generated", path);
+  int rc = 0;
+  if (changed && !ctx->dry_run)
+    rc = write_file(path, out.data ? out.data : "", out.len);
+  free(path);
+  str_free(&out);
+  if (rc != 0)
+    fprintf(stderr, "error: failed writing makefile fragment\n");
   return rc;
 }
 
@@ -2546,6 +2888,15 @@ typedef struct {
   Vec usages;
 } FileUsages;
 
+static ImplGroup *find_impl_group(Vec *groups, const TemplateDef *tmpl) {
+  for (size_t i = 0; i < groups->len; ++i) {
+    ImplGroup *group = (ImplGroup *)groups->items[i];
+    if (group->tmpl == tmpl)
+      return group;
+  }
+  return NULL;
+}
+
 int main(int argc, char **argv) {
   Options opt;
   int parsed = parse_args(argc, argv, &opt);
@@ -2599,11 +2950,15 @@ int main(int argc, char **argv) {
     return 0;
   }
 
-  Set generated_headers;
-  generated_headers.items = NULL;
-  generated_headers.len = generated_headers.cap = 0;
-  for (size_t i = 0; i < reg.items.len; ++i)
-    set_add(&generated_headers, ((TemplateDef *)reg.items.items[i])->generated);
+  Set generated_outputs;
+  generated_outputs.items = NULL;
+  generated_outputs.len = generated_outputs.cap = 0;
+  for (size_t i = 0; i < reg.items.len; ++i) {
+    TemplateDef *def = (TemplateDef *)reg.items.items[i];
+    set_add(&generated_outputs, def->generated);
+    if (def->impl)
+      set_add(&generated_outputs, def->impl);
+  }
 
   Vec file_usages;
   file_usages.items = NULL;
@@ -2614,7 +2969,7 @@ int main(int argc, char **argv) {
 
   for (size_t i = 0; i < files.len; ++i) {
     char *path = (char *)files.items[i];
-    if (set_has(&generated_headers, path))
+    if (set_has(&generated_outputs, path))
       continue;
     char *content = read_file(path, NULL);
     if (!content)
@@ -2633,6 +2988,8 @@ int main(int argc, char **argv) {
   TypeIndex idx;
   idx.guards.items = NULL;
   idx.guards.len = idx.guards.cap = 0;
+  idx.guard_headers.items = NULL;
+  idx.guard_headers.len = idx.guard_headers.cap = 0;
   if (wanted_names.len)
     type_index_scan(&idx, root, &wanted_names);
 
@@ -2667,6 +3024,46 @@ int main(int argc, char **argv) {
       }
     }
   }
+
+  Vec impl_groups;
+  impl_groups.items = NULL;
+  impl_groups.len = impl_groups.cap = 0;
+  for (size_t i = 0; i < reg.items.len; ++i) {
+    TemplateDef *def = (TemplateDef *)reg.items.items[i];
+    if (!def->impl)
+      continue;
+    ImplGroup *group = (ImplGroup *)xmalloc(sizeof(ImplGroup));
+    group->tmpl = def;
+    group->usages.items = NULL;
+    group->usages.len = group->usages.cap = 0;
+    group->includes.items = NULL;
+    group->includes.len = group->includes.cap = 0;
+    vec_push(&impl_groups, group);
+  }
+  for (size_t f = 0; f < file_usages.len; ++f) {
+    FileUsages *fu = (FileUsages *)file_usages.items[f];
+    for (size_t i = 0; i < fu->usages.len; ++i) {
+      Usage *usage = (Usage *)fu->usages.items[i];
+      ImplGroup *group = find_impl_group(&impl_groups, usage->tmpl);
+      if (group)
+        vec_push(&group->usages, usage);
+    }
+  }
+  for (size_t i = 0; i < impl_groups.len; ++i) {
+    ImplGroup *group = (ImplGroup *)impl_groups.items[i];
+    if (!group->usages.len)
+      continue;
+    for (size_t j = 0; j < group->usages.len; ++j)
+      collect_impl_includes((Usage *)group->usages.items[j], &emit,
+                            &group->includes);
+    if (ensure_impl_file(group->tmpl, &group->includes, &emit) != 0)
+      return 1;
+    for (size_t j = 0; j < group->usages.len; ++j)
+      if (emit_impl_usage((Usage *)group->usages.items[j], &emit) != 0)
+        return 1;
+  }
+  if (write_impl_makefile(root, &impl_groups, &emit) != 0)
+    return 1;
 
   if (opt.verbose)
     printf("templates=%zu added=%u skipped=%u\n", reg.items.len, emit.added,

@@ -53,6 +53,15 @@ public:
       llvm::ArrayRef<DependencyGuard> ExtraGuards = {},
       llvm::StringRef OutputHeader = {});
 
+  /// Writes one block into the template's grouped implementation source.
+  /// IncludeLines are already relative to the implementation source directory.
+  InstantiationResult instantiateImpl(
+      const TemplateDef &Template, llvm::StringRef TypeSpelling,
+      llvm::ArrayRef<std::string> Args,
+      llvm::ArrayRef<std::string> GuardMacros,
+      llvm::ArrayRef<std::string> IncludeLines, std::string &GenPath,
+      std::string &Error);
+
 private:
   struct FileState {
     std::string Content;
@@ -77,6 +86,19 @@ std::string makeInstantiationBlock(
     const TemplateDef &Template, llvm::StringRef TypeSpelling,
     llvm::StringRef GuardMacro,
     llvm::ArrayRef<DependencyGuard> ExtraGuards = {});
+
+/// Presence macro used by generated implementation sources. It deliberately
+/// uses a different prefix from public headers so the two block sets cannot
+/// collide.
+std::string implPresenceMacro(llvm::StringRef TemplateName,
+                              llvm::StringRef TypeSpelling);
+
+/// Builds one grouped implementation block. Args are the canonical individual
+/// template arguments; GuardMacros are traditional include guards to wrap it.
+std::string makeImplInstantiationBlock(
+    const TemplateDef &Template, llvm::StringRef TypeSpelling,
+    llvm::ArrayRef<std::string> Args,
+    llvm::ArrayRef<std::string> GuardMacros);
 
 } // namespace c_autotmpl
 

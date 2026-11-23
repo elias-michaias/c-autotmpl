@@ -41,18 +41,22 @@ bool isKeyword(StringRef S) {
   return false;
 }
 
-void addDeclaredName(StringMap<std::string> &Guards, StringRef Name,
-                     StringRef Guard) {
+void addDeclaredName(StringMap<std::string> &Guards,
+                     StringMap<std::string> &Headers, StringRef Name,
+                     StringRef Guard, StringRef Header) {
   if (Name.empty() || !isIdentStart(Name.front()) || Guard.empty())
     return;
   if (isKeyword(Name) || isBuiltinTypeName(Name))
     return;
-  if (!Guards.count(Name))
+  if (!Guards.count(Name)) {
     Guards[Name] = Guard.str();
+    Headers[Name] = Header.str();
+  }
 }
 
-void indexHeader(StringRef Buffer, StringRef Guard,
-                 StringMap<std::string> &Guards) {
+void indexHeader(StringRef Buffer, StringRef Guard, StringRef Header,
+                 StringMap<std::string> &Guards,
+                 StringMap<std::string> &Headers) {
   std::string Clean = stripCommentsAndLiterals(Buffer);
   SmallVector<Token, 128> Tokens;
   tokenize(Clean, Tokens);
@@ -62,7 +66,7 @@ void indexHeader(StringRef Buffer, StringRef Guard,
 
     if ((T == "struct" || T == "union" || T == "enum" || T == "class") &&
         I + 1 < Tokens.size()) {
-      addDeclaredName(Guards, Tokens[I + 1].Text, Guard);
+      addDeclaredName(Guards, Headers, Tokens[I + 1].Text, Guard, Header);
       continue;
     }
 
@@ -72,7 +76,7 @@ void indexHeader(StringRef Buffer, StringRef Guard,
     int BraceDepth = 0;
     StringRef LastName;
     auto flush = [&]() {
-      addDeclaredName(Guards, LastName, Guard);
+      addDeclaredName(Guards, Headers, LastName, Guard, Header);
       LastName = {};
     };
 
@@ -105,6 +109,7 @@ void indexHeader(StringRef Buffer, StringRef Guard,
 
 void TypeIndex::scan(StringRef Root, ArrayRef<std::string> TypeNames) {
   Guards.clear();
+  Headers.clear();
   std::error_code EC;
   if (!sys::fs::is_directory(Root))
     return;
@@ -152,7 +157,7 @@ void TypeIndex::scan(StringRef Root, ArrayRef<std::string> TypeNames) {
         continue;
     }
 
-    indexHeader(Buffer, Guard, Guards);
+    indexHeader(Buffer, Guard, makeAbsolute(It->path()), Guards, Headers);
 
     if (Filtered) {
       SmallVector<std::string, 8> Found;
@@ -171,6 +176,14 @@ std::string TypeIndex::guardForType(StringRef TypeSpelling) const {
     return {};
   auto It = Guards.find(Name);
   return It == Guards.end() ? std::string() : It->second;
+}
+
+std::string TypeIndex::headerForType(StringRef TypeSpelling) const {
+  StringRef Name = lastIdentifier(TypeSpelling);
+  if (Name.empty() || isBuiltinTypeName(Name))
+    return {};
+  auto It = Headers.find(Name);
+  return It == Headers.end() ? std::string() : It->second;
 }
 
 } // namespace c_autotmpl

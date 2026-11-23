@@ -37,6 +37,7 @@ C code.
 | **Editor integration** | clangd feature module generates from unsaved buffers and prunes stale blocks. |
 | **Nested generics** | `List(Box(int))` and deeper chains, flattened into one header. |
 | **Function templates** | `convert(int, float)(x)` and `select(int, Foo)(a, b)` from explicit call-site arguments. |
+| **Split implementations** | `#ifndef TMPL_HEADER` selects implementation code or public declarations, with generated object sources. |
 | **Lexical HKTs** | Pass a template name as an argument, as in `User(Option, int)`. |
 | **Idempotent output** | Additive writes and stable markers make reruns safe in build scripts. |
 | **Type-aware guards** | User types use real include guards; scalar types are emitted bare. |
@@ -71,8 +72,9 @@ There are two ways to use it:
   headers are generated from unsaved buffers. The module also uses the AST to
   find type guards and prunes unused blocks when usages disappear.
 
-Both paths write the same generated headers. The plugin adds editor features;
-the CLI is additive and idempotent for scripts.
+Both paths write the same public headers, grouped implementation sources, and
+makefile fragment for split templates. The plugin adds editor features and
+prunes unused blocks; the CLI is additive and idempotent for scripts.
 
 Template-style headers are a preprocessor pattern: define `T`, re-include a
 header that pastes `T` into names, then undefine `T`. c-autotmpl writes those
@@ -122,6 +124,22 @@ that needs them. A source therefore includes only the outermost header:
 The inner block is also mirrored into its own header, so direct use still works.
 No call-site alias macros are generated. See [doc/USAGE.md](doc/USAGE.md) for the
 full rules.
+
+A template header can put implementation code under `#ifndef TMPL_HEADER` and
+public declarations in its `#else` branch. The generated public block defines
+`TMPL_HEADER` before the include and undefines it afterward. Both generators
+write one grouped implementation source per such template under `gen/impl/`.
+Each source includes the required user headers, then re-includes the template
+with `TMPL_HEADER` undefined. Both also write the fixed fragment to compile
+them:
+
+```make
+-include gen/impl/c-autotmpl.mk
+```
+
+Both generators ignore generated implementation sources during scans, so editor
+generation never feeds re-includes back into the scanner. Headers without
+`#ifndef TMPL_HEADER` keep the original single-file behavior.
 
 Function templates use a `function` decorator and spell every argument at the
 call site. For `// -- template function convert(From, To)`, a usage of

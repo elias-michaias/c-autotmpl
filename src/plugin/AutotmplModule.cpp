@@ -51,6 +51,7 @@
 #include "llvm/Support/Process.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -297,6 +298,8 @@ struct UsageFile {
   uint64_t Stamp = 0;
   // Generated-header path -> instantiation markers used by this file.
   llvm::StringMap<llvm::StringSet<>> Wanted;
+  // Implementation-source path -> instantiation markers used by this file.
+  llvm::StringMap<llvm::StringSet<>> ImplWanted;
 };
 
 /// Shared state, surviving across AST builds and listener instances.
@@ -317,11 +320,13 @@ struct SharedState {
   llvm::StringMap<std::string> GuardCache;
   llvm::StringSet<> Warned;
   llvm::StringSet<> GeneratedHeaders;
+  llvm::StringSet<> GeneratedImplSources;
 
   std::mutex UsageMutex;
   std::string Root;
   llvm::StringMap<UsageFile> UsageCache;
   llvm::StringMap<llvm::StringSet<>> Wanted;
+  llvm::StringMap<llvm::StringSet<>> WantedImpl;
   bool UsageScanned = false;
   std::chrono::steady_clock::time_point LastUsageScan;
   // Latest unsaved text from LSP notifications, keyed by absolute path.
@@ -348,8 +353,11 @@ struct SharedState {
     Registry.scanPreferTemplateDirs(Root);
     // Type guards are indexed lazily from the types actually used in the open
     // buffer. Scanning every unrelated header here would delay first parse.
-    for (const auto &Def : Registry.templates())
+    for (const auto &Def : Registry.templates()) {
       GeneratedHeaders.insert(Def->GeneratedHeader);
+      if (!Def->GeneratedImplSource.empty())
+        GeneratedImplSources.insert(Def->GeneratedImplSource);
+    }
 
     Scanned.store(true, std::memory_order_release);
     std::string Msg = "scanning " + Root + ", found " +
@@ -419,7 +427,9 @@ struct SharedState {
   }
 
   void collectUsages(StringRef Text, StringRef Path,
-                     llvm::StringMap<llvm::StringSet<>> &Out) const {
+                     llvm::StringMap<llvm::StringSet<>> &Out,
+                     llvm::StringMap<llvm::StringSet<>> *ImplOut = nullptr)
+      const {
     SmallVector<FoundUsage, 32> Usages;
     scanUsages(Text, Registry, Usages);
     for (size_t I = 0; I < Usages.size(); ++I) {
@@ -436,7 +446,11 @@ struct SharedState {
         Out[Usage.Template->GeneratedHeader].insert(Marker);
         // A nested chain is also flattened into the outermost header, so that
         // header owns these markers for pruning too.
-        Out[OutputHeader].insert(std::move(Marker));
+        Out[OutputHeader].insert(Marker);
+        if (ImplOut && Usage.Template->HasTmplHeaderGuard &&
+            !Usage.Template->GeneratedImplSource.empty())
+          (*ImplOut)[Usage.Template->GeneratedImplSource].insert(
+              std::move(Marker));
       }
     }
     (void)Path;
@@ -445,10 +459,15 @@ struct SharedState {
   // Requires UsageMutex.
   void rebuildWanted() {
     Wanted.clear();
-    for (const auto &File : UsageCache)
+    WantedImpl.clear();
+    for (const auto &File : UsageCache) {
       for (const auto &Entry : File.second.Wanted)
         for (const auto &Marker : Entry.second)
           Wanted[Entry.getKey()].insert(Marker.getKey());
+      for (const auto &Entry : File.second.ImplWanted)
+        for (const auto &Marker : Entry.second)
+          WantedImpl[Entry.getKey()].insert(Marker.getKey());
+    }
   }
 
   // Requires UsageMutex. Open files use their unsaved buffers; other files are
@@ -477,7 +496,7 @@ struct SharedState {
 
     UsageFile Entry;
     Entry.Stamp = Stamp;
-    collectUsages(Text, Path, Entry.Wanted);
+    collectUsages(Text, Path, Entry.Wanted, &Entry.ImplWanted);
     UsageCache[Path] = std::move(Entry);
   }
 
@@ -501,7 +520,8 @@ struct SharedState {
         continue;
 
       std::string Path = makeAbsolute(It->path());
-      if (GeneratedHeaders.contains(Path))
+      if (GeneratedHeaders.contains(Path) ||
+          GeneratedImplSources.contains(Path))
         continue;
       Seen.insert(Path);
       updateUsageLocked(Path);
@@ -587,6 +607,8 @@ struct SharedState {
     ensureScanned(Path);
     if (Registry.templates().empty())
       return;
+    if (GeneratedImplSources.contains(makeAbsolute(Path)))
+      return;
 
     auto AfterScan = std::chrono::steady_clock::now();
     bool ReadyForPrune = false;
@@ -605,6 +627,7 @@ struct SharedState {
       pruneAll();
     auto AfterPrune = std::chrono::steady_clock::now();
     generateFromText(Text, nullptr);
+    writeImplMakefile();
     auto End = std::chrono::steady_clock::now();
 
     if (timingEnabled()) {
@@ -623,11 +646,13 @@ struct SharedState {
   void pruneAll() {
     static const llvm::StringSet<> Empty;
     llvm::StringMap<llvm::StringSet<>> Snapshot;
+    llvm::StringMap<llvm::StringSet<>> ImplSnapshot;
     {
       std::lock_guard<std::mutex> Lock(UsageMutex);
       if (!PruningReady)
         return;
       Snapshot = Wanted;
+      ImplSnapshot = WantedImpl;
     }
 
     SmallVector<const TemplateDef *, 8> Templates;
@@ -652,6 +677,92 @@ struct SharedState {
         log("removed " + Marker + " from " + Header.str());
       }
     }
+
+    for (const auto &Entry : GeneratedImplSources) {
+      StringRef Path = Entry.getKey();
+      const TemplateDef *Owner = nullptr;
+      for (const TemplateDef *Template : Templates) {
+        if (Template->GeneratedImplSource == Path) {
+          Owner = Template;
+          break;
+        }
+      }
+      if (!Owner)
+        continue;
+      auto KeepIt = ImplSnapshot.find(Path);
+      const llvm::StringSet<> &Keep =
+          KeepIt == ImplSnapshot.end() ? Empty : KeepIt->second;
+      Removed.clear();
+      Error.clear();
+      SmallVector<const TemplateDef *, 1> Single{Owner};
+      if (!Inst.prune(Single, Path, Keep, Removed, Error)) {
+        if (!Error.empty())
+          log(std::string("prune failed: ") + Error);
+        continue;
+      }
+      for (const std::string &Marker : Removed)
+        log("removed " + Marker + " from " + Path.str());
+    }
+  }
+
+  void writeImplMakefile() {
+    if (GeneratedImplSources.empty())
+      return;
+
+    llvm::StringMap<llvm::StringSet<>> Snapshot;
+    {
+      std::lock_guard<std::mutex> Lock(UsageMutex);
+      Snapshot = WantedImpl;
+    }
+
+    std::vector<std::string> Paths;
+    for (const auto &Entry : Snapshot)
+      if (!Entry.second.empty())
+        Paths.push_back(Entry.getKey().str());
+    std::sort(Paths.begin(), Paths.end());
+
+    SmallString<256> Dir(Root);
+    sys::path::append(Dir, "gen");
+    sys::path::append(Dir, "impl");
+    if (!sys::fs::is_directory(Dir)) {
+      std::error_code EC = sys::fs::create_directories(Dir);
+      if (EC) {
+        log(std::string("failed creating ") + std::string(Dir.str()) + ": " +
+            EC.message());
+        return;
+      }
+    }
+
+    SmallString<256> Path(Dir);
+    sys::path::append(Path, "c-autotmpl.mk");
+
+    std::string Content = "# Generated by c-autotmpl. Do not edit.\n";
+    for (const std::string &Source : Paths) {
+      Content += "C_AUTOTMPL_IMPL_SRCS += ";
+      Content += computeRelativePath(Root, Source);
+      Content += '\n';
+    }
+
+    std::string Old;
+    if (auto Buffer = MemoryBuffer::getFile(Path, /*IsText=*/true))
+      Old = (*Buffer)->getBuffer().str();
+    if (Old == Content)
+      return;
+
+    std::error_code EC;
+    raw_fd_ostream OS(Path, EC, sys::fs::CD_CreateAlways);
+    if (EC) {
+      log(std::string("failed writing ") + std::string(Path.str()) + ": " +
+          EC.message());
+      return;
+    }
+    OS << Content;
+    OS.close();
+    if (OS.has_error()) {
+      log(std::string("failed writing ") + std::string(Path.str()));
+      return;
+    }
+    log(std::string("generated makefile fragment ") + std::string(Path.str()));
   }
 
   void generateFromText(StringRef Text, clang::CompilerInstance *CI) {
@@ -665,6 +776,7 @@ struct SharedState {
   /// dependent types cannot be separated by include order.
   void generateUsages(ArrayRef<FoundUsage> Usages,
                       clang::CompilerInstance *CI) {
+    generateImplUsages(Usages, CI);
     for (size_t I = 0; I < Usages.size(); ++I) {
       if (Usages[I].IsNested)
         continue;
@@ -784,6 +896,100 @@ struct SharedState {
     return true;
   }
 
+  /// Like collectTypeGuard, but also records the header that declared the
+  /// type. Implementation TUs include those headers before re-including the
+  /// template so trait declarations are visible to the definition branch.
+  bool collectImplArg(StringRef Spelling, clang::CompilerInstance *CI,
+                      unsigned Depth, llvm::StringSet<> &SeenGuards,
+                      llvm::StringSet<> &SeenHeaders,
+                      SmallVectorImpl<std::string> &Guards,
+                      SmallVectorImpl<std::string> &Headers) {
+    if (Depth > 16 || !needsIncludeGuard(Spelling) ||
+        isTemplateConstructorArgument(Spelling, Registry))
+      return true;
+
+    StringRef Type = stripTypeQualifiers(Spelling);
+    StringRef Arg;
+    if (Registry.matchMangled(Type, Arg))
+      return collectImplArg(Arg, CI, Depth + 1, SeenGuards, SeenHeaders,
+                            Guards, Headers);
+
+    std::string Guard;
+    std::string Header;
+    {
+      std::lock_guard<std::mutex> Lock(TypesMutex);
+      Guard = Types.guardForType(Type);
+      Header = Types.headerForType(Type);
+    }
+    if (Guard.empty() && CI) {
+      for (const std::string &Candidate : definingHeaderPaths(*CI, Type)) {
+        std::string Found = guardForPath(Candidate);
+        if (!Found.empty()) {
+          Guard = std::move(Found);
+          Header = Candidate;
+          break;
+        }
+      }
+    }
+    if (Guard.empty())
+      return false;
+    if (SeenGuards.insert(Guard).second)
+      Guards.push_back(std::move(Guard));
+    if (!Header.empty() && SeenHeaders.insert(Header).second)
+      Headers.push_back(std::move(Header));
+    return true;
+  }
+
+  void generateImplUsages(ArrayRef<FoundUsage> Usages,
+                          clang::CompilerInstance *CI) {
+    for (const FoundUsage &Usage : Usages) {
+      const TemplateDef &Template = *Usage.Template;
+      if (!Template.HasTmplHeaderGuard ||
+          !GeneratedImplSources.contains(Template.GeneratedImplSource))
+        continue;
+      if (Inst.has(Template, Usage.TypeSpelling, Template.GeneratedImplSource))
+        continue;
+
+      llvm::StringSet<> SeenGuards;
+      llvm::StringSet<> SeenHeaders;
+      SmallVector<std::string, 4> Guards;
+      SmallVector<std::string, 4> Headers;
+      bool MissingGuard = false;
+      for (const std::string &Arg : Usage.Args)
+        MissingGuard |=
+            !collectImplArg(Arg, CI, 0, SeenGuards, SeenHeaders, Guards,
+                            Headers);
+      if (MissingGuard) {
+        warnNoGuardOnce(Template.Name, Usage.TypeSpelling);
+        continue;
+      }
+
+      std::string ImplDir =
+          sys::path::parent_path(Template.GeneratedImplSource).str();
+      llvm::StringSet<> SeenIncludes;
+      SmallVector<std::string, 4> IncludeLines;
+      for (const std::string &Header : Headers) {
+        std::string Include = "#include \"" +
+                              computeRelativePath(ImplDir, Header) + "\"";
+        if (SeenIncludes.insert(Include).second)
+          IncludeLines.push_back(std::move(Include));
+      }
+
+      std::string GenPath;
+      std::string Error;
+      InstantiationResult Result =
+          Inst.instantiateImpl(Template, Usage.TypeSpelling, Usage.Args, Guards,
+                               IncludeLines, GenPath, Error);
+      if (Result == InstantiationResult::Error) {
+        log(std::string("failed: ") + Error);
+        continue;
+      }
+      if (Result == InstantiationResult::Added)
+        log("generated implementation " + Template.Name + "(" +
+            Usage.TypeSpelling + ") in " + GenPath);
+    }
+  }
+
   void dependencyGuards(const FoundUsage &Usage, StringRef OutputHeader,
                         ArrayRef<const FoundUsage *> Chain,
                         SmallVectorImpl<DependencyGuard> &Guards) {
@@ -876,6 +1082,8 @@ public:
 
     std::string GenPath;
     State->generateChain(Chain, CI, &GenPath);
+    State->generateImplUsages(Usages, CI);
+    State->writeImplMakefile();
     addIncludeFix(SM, Outer.Template->Name, GenPath, D);
   }
 

@@ -24,6 +24,9 @@ line.
 | HKT argument is treated as a type | The argument must be a bare registered template name, such as `Option`. The generated parameter is a macro name and has no include guard. |
 | Usage produced only by a macro expansion | The CLI cannot see it. Use the plugin, which has an AST diagnostic fallback, or spell the usage directly. |
 | Two identical blocks in a generated header | The hand-written block used a different macro parameter name, or its `C_AUTOTMPL_...` macro was removed. |
+| Split template produces no object file | Include `gen/impl/c-autotmpl.mk` and link `C_AUTOTMPL_IMPL_SRCS`. Both the CLI and plugin write that fragment when a split template has usages. |
+| Editor generation creates no `gen/impl/` | The template needs a lexical `#ifndef TMPL_HEADER` and a scanned usage. Open a source that uses it, then check the `[c-autotmpl]` log for `generated implementation`. |
+| Duplicate types in an implementation source | Put public declarations in the `#else` branch. Keep only implementation code under `#ifndef TMPL_HEADER`. |
 | Nested block exists but is inactive | Include the outermost generated header. Its flattened chain defines the inner blocks first. |
 | `GEN_BOX_H` is undefined | Harmless when using the flattened chain. It still guards copies emitted into `gen/box.h`. |
 | Unused blocks are not removed | Wait for `workspace scan complete`. The CLI never prunes. |

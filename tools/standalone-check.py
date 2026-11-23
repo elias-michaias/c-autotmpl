@@ -124,6 +124,24 @@ typedef struct { F(Payload) email; } User(F, Payload);
 typedef struct { F(int) value; } Wrap(F);
 #undef F
 """)
+        write(os.path.join(root, "tmpl", "split.h"), """\
+// -- template Split(T)
+#ifndef TMPL_HEADER
+#define SPLIT_CAT_I(A, B) A##B
+#define SPLIT_CAT(A, B) SPLIT_CAT_I(A, B)
+#define Split(T) SPLIT_CAT(Split_, T)
+#define SPLIT_GET(T) SPLIT_CAT(Split(T), _get)
+typedef struct { T value; } Split(T);
+T SPLIT_GET(T)(Split(T) *p) { return p->value; }
+#else
+#define SPLIT_CAT_I(A, B) A##B
+#define SPLIT_CAT(A, B) SPLIT_CAT_I(A, B)
+#define Split(T) SPLIT_CAT(Split_, T)
+#define SPLIT_GET(T) SPLIT_CAT(Split(T), _get)
+typedef struct { T value; } Split(T);
+T SPLIT_GET(T)(Split(T) *p);
+#endif
+""")
         write(os.path.join(root, "pragma.h"), """\
 #pragma once
 typedef struct { int y; } Pragma;
@@ -146,6 +164,7 @@ typedef struct { int y; } Pragma;
 #include "gen/apply.h"
 #include "gen/box.h"
 #include "gen/select.h"
+#include "gen/split.h"
 #include "gen/sum.h"
 #include "gen/thing.h"
 #include "gen/user.h"
@@ -170,8 +189,11 @@ int main(void) {
   int g = user.email.valid ? user.email.value : 1;
   Wrap(Option) wrap = { { 9, 1 } };
   int h = wrap.value.valid ? wrap.value.value : 1;
+  Split(int) sp = {10};
+  Split(Foo) sf = {{11}};
   return f.value + u.value.x + p.value.y + n.value.value +
-         (deep != 0) + a + b + c + (int)d + e + f + g + h;
+         (deep != 0) + a + b + c + (int)d + e + f + g + h +
+         sp.value + sf.value.x;
 }
 """)
         write(os.path.join(root, "raw.c"), """\
@@ -205,6 +227,11 @@ int raw(void) {
                        "generated Option(int)",
                        "generated User(Option, int)",
                        "generated Wrap(Option)",
+                       "generated Split(int)",
+                       "generated Split(Foo)",
+                       "generated impl Split(int)",
+                       "generated impl Split(Foo)",
+                       "generated makefile fragment",
                        "skipping Thing(Pragma): no traditional include guard"):
             require(needle in output, "missing output: " + needle, output)
         for needle in ("select(impl", "apply(impl", "select(First, Second)",
@@ -315,6 +342,67 @@ int raw(void) {
                     "missing generated single-argument HKT text: " + needle,
                     wrap_content)
 
+        with open(os.path.join(root, "gen", "split.h")) as f:
+            split_content = f.read()
+        for needle in ("/* c-autotmpl: Split(int) */",
+                       "/* c-autotmpl: Split(Foo) */",
+                       "#define TMPL_HEADER 1",
+                       "#undef TMPL_HEADER\n#undef T",
+                       "#ifdef FOO_H"):
+            require(needle in split_content,
+                    "missing split public text: " + needle, split_content)
+
+        split_impl = os.path.join(root, "gen", "impl", "split.c")
+        with open(split_impl) as f:
+            split_impl_content = f.read()
+        for needle in ("#undef TMPL_HEADER",
+                       '#include "../../foo.h"',
+                       "/* c-autotmpl: Split(int) */",
+                       "/* c-autotmpl: Split(Foo) */",
+                       "#ifndef C_AUTOTMPL_IMPL_SPLIT_INT_",
+                       "#define T int",
+                       "#define T Foo"):
+            require(needle in split_impl_content,
+                    "missing split implementation text: " + needle,
+                    split_impl_content)
+        require("#define TMPL_HEADER" not in split_impl_content,
+                "implementation TU defined TMPL_HEADER", split_impl_content)
+        require('#include "../split.h"' not in split_impl_content,
+                "implementation TU included the public header",
+                split_impl_content)
+
+        with open(os.path.join(root, "gen", "impl", "c-autotmpl.mk")) as f:
+            fragment = f.read()
+        require("C_AUTOTMPL_IMPL_SRCS += gen/impl/split.c" in fragment,
+                "makefile fragment omitted split implementation", fragment)
+
+        write(os.path.join(root, "impl_main.c"), """\
+#include "foo.h"
+#include "gen/split.h"
+
+int main(void) {
+  Split(int) a = {10};
+  Split(Foo) b = {{11}};
+  return SPLIT_GET(int)(&a) + SPLIT_GET(Foo)(&b).x == 21 ? 0 : 1;
+}
+""")
+        compiler = os.environ.get("CC") or next(
+            (name for name in ("cc", "gcc", "clang") if shutil.which(name)),
+            None,
+        )
+        if compiler:
+            built = subprocess.run(
+                [compiler, "-std=c99", "-Wall", "-Wextra", "-Werror",
+                 "impl_main.c", "gen/impl/split.c", "-o", "split-demo"],
+                cwd=root, capture_output=True, text=True,
+            )
+            build_output = built.stdout + built.stderr
+            require(built.returncode == 0,
+                    "generated implementation source did not compile",
+                    build_output)
+            ran = subprocess.run([os.path.join(root, "split-demo")], cwd=root)
+            require(ran.returncode == 0, "generated implementation did not link")
+
         # A second run must take the cheap existing-instantiation path.
         noop = subprocess.run(
             [cli, "--root", root, "--dry-run", "--verbose"] + sources,
@@ -328,8 +416,9 @@ int raw(void) {
         require("added=0" in noop_output,
                 "no-op run did not report zero additions", noop_output)
 
-        # Dry-run reports changes without touching the file.
+        # Dry-run reports changes without touching the files.
         write(gen_path, baseline)
+        os.remove(split_impl)
         dry = subprocess.run(
             [cli, "--root", root, "--dry-run", "--verbose"] + sources,
             cwd=root, capture_output=True, text=True,
@@ -337,9 +426,13 @@ int raw(void) {
         dry_output = dry.stdout + dry.stderr
         require(dry.returncode == 0, "dry-run exited with error", dry_output)
         require("would generate Thing(float)" in dry_output,
-                "dry-run did not report changes", dry_output)
+                "dry-run did not report header changes", dry_output)
+        require("would generate impl Split(int)" in dry_output,
+                "dry-run did not report implementation changes", dry_output)
         with open(gen_path) as f:
             require(f.read() == baseline, "dry-run modified generated header")
+        require(not os.path.exists(split_impl),
+                "dry-run created an implementation source")
 
         print("standalone-check OK")
         return 0

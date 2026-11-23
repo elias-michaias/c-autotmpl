@@ -22,10 +22,14 @@ public:
 
   std::string guardForType(llvm::StringRef TypeSpelling) const;
 
+  /// Absolute path of the guarded header that declared this type.
+  std::string headerForType(llvm::StringRef TypeSpelling) const;
+
   bool empty() const { return Guards.empty(); }
 
 private:
   llvm::StringMap<std::string> Guards;
+  llvm::StringMap<std::string> Headers;
 };
 
 } // namespace c_autotmpl

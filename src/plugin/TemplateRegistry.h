@@ -25,6 +25,9 @@ struct TemplateDef {
   std::string Header;                          // absolute tmpl/list.h
   std::string GeneratedHeader;                 // absolute gen/list.h
   std::string IncludeFromGenDir;               // "../tmpl/list.h"
+  std::string GeneratedImplSource;             // absolute gen/impl/list.c
+  std::string IncludeFromImplDir;              // "../../tmpl/list.h"
+  bool HasTmplHeaderGuard = false;             // has `#ifndef TMPL_HEADER`
 };
 
 /// Owns template definitions and answers hot-path lookups with StringRefs.
