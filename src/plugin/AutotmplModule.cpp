@@ -374,12 +374,14 @@ struct SharedState {
     std::lock_guard<std::mutex> Lock(TypesMutex);
     bool Added = false;
     for (const FoundUsage &Usage : Usages) {
-      if (!needsIncludeGuard(Usage.TypeSpelling) ||
-          isGeneratedType(Usage.TypeSpelling))
-        continue;
-      StringRef Name = lastIdentifier(Usage.TypeSpelling);
-      if (!Name.empty())
-        Added |= TypeNamesRequested.insert(Name.str()).second;
+      for (const std::string &Arg : Usage.Args) {
+        if (!needsIncludeGuard(Arg) || isGeneratedType(Arg) ||
+            isTemplateConstructorArgument(Arg, Registry))
+          continue;
+        StringRef Name = lastIdentifier(Arg);
+        if (!Name.empty())
+          Added |= TypeNamesRequested.insert(Name.str()).second;
+      }
     }
     if (!Added)
       return;
@@ -686,13 +688,13 @@ struct SharedState {
       *GenPathOut = OutputHeader;
     bool Added = false;
     for (const FoundUsage *Usage : Chain) {
-      Added |= generateInto(*Usage, OutputHeader, CI);
+      Added |= generateInto(*Usage, OutputHeader, CI, Chain);
       // Keep the dependency's own generated header up to date as well. The
       // presence macro makes the two copies harmless, and it guarantees the
       // header exists for sources that include it before this one.
       if (Usage != Chain.back() &&
           Usage->Template->GeneratedHeader != OutputHeader)
-        Added |= generateInto(*Usage, Usage->Template->GeneratedHeader, CI);
+        Added |= generateInto(*Usage, Usage->Template->GeneratedHeader, CI, {});
     }
     return Added;
   }
@@ -700,23 +702,35 @@ struct SharedState {
   /// Writes one usage block into OutputHeader, which may belong to an outer
   /// template when this is a nested dependency.
   bool generateInto(const FoundUsage &Usage, StringRef OutputHeader,
-                    clang::CompilerInstance *CI) {
+                    clang::CompilerInstance *CI,
+                    ArrayRef<const FoundUsage *> Chain) {
     if (Inst.has(*Usage.Template, Usage.TypeSpelling, OutputHeader))
       return false;
 
     SmallVector<DependencyGuard, 2> Guards;
-    dependencyGuards(Usage, OutputHeader, Guards);
+    dependencyGuards(Usage, OutputHeader, Chain, Guards);
 
-    std::string Guard = guardForType(Usage.TypeSpelling, CI);
-    if (needsIncludeGuard(Usage.TypeSpelling) &&
-        !isGeneratedType(Usage.TypeSpelling) && Guard.empty()) {
+    SmallVector<std::string, 4> TypeGuards;
+    llvm::StringSet<> SeenTypeGuards;
+    bool MissingGuard = false;
+    for (const std::string &Arg : Usage.Args)
+      MissingGuard |= !collectTypeGuard(Arg, CI, 0, SeenTypeGuards, TypeGuards);
+    if (MissingGuard) {
       warnNoGuardOnce(Usage.Template->Name, Usage.TypeSpelling);
       return false;
+    }
+    for (const std::string &Guard : TypeGuards) {
+      bool Seen = false;
+      for (const DependencyGuard &Dep : Guards)
+        if (Dep.Guard == Guard)
+          Seen = true;
+      if (!Seen)
+        Guards.push_back({Guard});
     }
 
     std::string GenPath, Error;
     InstantiationResult Result =
-        Inst.instantiate(*Usage.Template, Usage.TypeSpelling, Guard, GenPath,
+        Inst.instantiate(*Usage.Template, Usage.TypeSpelling, "", GenPath,
                          Error, /*DryRun=*/false, Guards, OutputHeader);
     if (Result == InstantiationResult::Error) {
       log(std::string("failed: ") + Error);
@@ -736,48 +750,57 @@ struct SharedState {
     return Registry.matchMangled(Type, Arg) != nullptr;
   }
 
-  std::string guardForType(StringRef Spelling, clang::CompilerInstance *CI) {
-    return guardForTypeImpl(Spelling, CI, 0);
-  }
-
-  std::string guardForTypeImpl(StringRef Spelling, clang::CompilerInstance *CI,
-                               unsigned Depth) {
-    if (Depth > 16 || !needsIncludeGuard(Spelling))
-      return {};
+  /// Adds the include guard needed by one type argument, if any. Generated
+  /// template arguments recurse into their own arguments, e.g. Box_Foo needs
+  /// FOO_H. Returns false when a user-defined type has no known guard.
+  bool collectTypeGuard(StringRef Spelling, clang::CompilerInstance *CI,
+                        unsigned Depth, llvm::StringSet<> &Seen,
+                        SmallVectorImpl<std::string> &Guards) {
+    if (Depth > 16 || !needsIncludeGuard(Spelling) ||
+        isTemplateConstructorArgument(Spelling, Registry))
+      return true;
 
     StringRef Type = stripTypeQualifiers(Spelling);
     StringRef Arg;
-    if (Registry.matchMangled(Type, Arg)) {
-      // A generated template instantiation needs whatever guard its type
-      // arguments need, e.g. List(Box(Foo)) is guarded by FOO_H.
-      return guardForTypeImpl(Arg, CI, Depth + 1);
-    }
+    if (Registry.matchMangled(Type, Arg))
+      return collectTypeGuard(Arg, CI, Depth + 1, Seen, Guards);
 
     std::string Guard;
     {
       std::lock_guard<std::mutex> Lock(TypesMutex);
       Guard = Types.guardForType(Type);
     }
-    if (!Guard.empty())
-      return Guard;
-
-    if (CI) {
+    if (Guard.empty() && CI) {
       for (const std::string &Header : definingHeaderPaths(*CI, Type)) {
         Guard = guardForPath(Header);
         if (!Guard.empty())
-          return Guard;
+          break;
       }
     }
-    return {};
+    if (Guard.empty())
+      return false;
+    if (Seen.insert(Guard).second)
+      Guards.push_back(std::move(Guard));
+    return true;
   }
 
   void dependencyGuards(const FoundUsage &Usage, StringRef OutputHeader,
+                        ArrayRef<const FoundUsage *> Chain,
                         SmallVectorImpl<DependencyGuard> &Guards) {
     llvm::StringSet<> Seen;
     for (const UsageDep &Dep : Usage.DependsOn) {
-      // Dependencies in the same generated header are emitted in this chain
-      // before the block that needs them, so they need no cross-header guard.
+      // Dependencies emitted earlier in this chain are already present in the
+      // output header, so they need no cross-header guard.
       if (Dep.Template->GeneratedHeader == OutputHeader)
+        continue;
+      bool InChain = false;
+      for (const FoundUsage *Member : Chain)
+        if (Member->Template == Dep.Template &&
+            Member->TypeSpelling == Dep.TypeSpelling) {
+          InChain = true;
+          break;
+        }
+      if (InChain)
         continue;
       std::string Guard =
           generatedHeaderFileGuard(Dep.Template->GeneratedHeader);

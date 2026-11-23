@@ -11,11 +11,15 @@
 
 namespace c_autotmpl {
 
+enum class TemplateKind { Type, Function };
+
 /// A template header discovered from a decorator such as:
 ///
 ///   // -- template List(T)
 ///   // -- template type Box(T)
+///   // -- template function select(First, Second)
 struct TemplateDef {
+  TemplateKind Kind = TemplateKind::Type;
   std::string Name;                            // "List"
   llvm::SmallVector<std::string, 2> Params;    // {"T"}
   std::string Header;                          // absolute tmpl/list.h
@@ -43,6 +47,11 @@ public:
   const TemplateDef *matchMangled(llvm::StringRef Mangled,
                                   llvm::StringRef &TypeSpelling) const {
     for (const TemplateDef *Def : ByLength) {
+      // Mangled-name lookup is for type arguments only. Function templates use
+      // the explicit `name(Type, ...)` spelling so helper identifiers such as
+      // `name_impl` are not treated as instantiations.
+      if (Def->Kind == TemplateKind::Function)
+        continue;
       llvm::StringRef Prefix(Def->Name);
       if (Mangled.size() <= Prefix.size() + 1 || Mangled[Prefix.size()] != '_')
         continue;

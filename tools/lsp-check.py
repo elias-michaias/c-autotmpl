@@ -114,7 +114,9 @@ def no_template_errors(diags):
         text = d.get("message", "")
         if any(name in text for name in
                ("Thing_float", "Thing_Foo", "Thing_Bar", "Thing_Box",
-                "Box_float", "Box_Thing_float", "Thing_Box_Thing_float")):
+                "Box_float", "Box_Thing_float", "Thing_Box_Thing_float",
+                "select_int__Foo", "select_int__float", "sum_int",
+               "Option_int", "User_Option")):
             return False
     return True
 
@@ -165,6 +167,49 @@ typedef int T;
 typedef struct { T value; } BOX_CAT_(Box_, T);
 #undef T
 """)
+        write(os.path.join(root, "tmpl", "select.h"), """\
+// -- template function select(First, Second)
+#define SELECT_CAT3_IMPL_(A, B, C) A##B##C
+#define SELECT_CAT3_(A, B, C) SELECT_CAT3_IMPL_(A, B, C)
+#define select(First, Second) SELECT_CAT3_(select_, First, Second)
+static inline First select(First, Second)(First a, Second b) {
+  (void)b;
+  return a;
+}
+""")
+        write(os.path.join(root, "tmpl", "sum.h"), """\
+// -- template function sum(Item)
+#define SUM_CAT_IMPL_(A, B) A##B
+#define SUM_CAT_(A, B) SUM_CAT_IMPL_(A, B)
+#define sum(Item) SUM_CAT_(sum_, Item)
+static inline Item sum(Item)(Thing(Item) *xs) { return xs->value; }
+""")
+        write(os.path.join(root, "tmpl", "option.h"), """\
+// -- template type Option(T)
+#ifndef OPTION_CAT_DEFINED
+#define OPTION_CAT_DEFINED
+#define OPTION_CAT_IMPL_(A, B) A##B
+#define OPTION_CAT_(A, B) OPTION_CAT_IMPL_(A, B)
+#define Option(T) OPTION_CAT_(Option_, T)
+#endif
+typedef struct { T value; int valid; } Option(T);
+#undef T
+""")
+        write(os.path.join(root, "tmpl", "user.h"), """\
+// -- template type User(F, Payload)
+#ifndef F
+#define F Option
+#endif
+#ifndef Payload
+typedef int Payload;
+#endif
+#define USER_CAT_IMPL_(A, B) A##B
+#define USER_CAT_(A, B) USER_CAT_IMPL_(A, B)
+#define User(F, Payload) USER_CAT_(User_, F)
+typedef struct { F(Payload) email; } User(F, Payload);
+#undef Payload
+#undef F
+""")
         write(os.path.join(root, "bar.h"), """\
 #ifndef BAR_H
 #define BAR_H
@@ -176,6 +221,9 @@ typedef struct { int z; } Bar;
 typedef struct { int y; } Pragma;
 """)
         generated = os.path.join(root, "gen", "thing.h")
+        select_generated = os.path.join(root, "gen", "select.h")
+        sum_generated = os.path.join(root, "gen", "sum.h")
+        user_generated = os.path.join(root, "gen", "user.h")
         # A pre-existing hand-written block for Thing(float). The plugin must
         # treat it as already present rather than appending a second copy.
         manual_float = (
@@ -206,7 +254,10 @@ int main(void) { return 0; }
 #include "foo.h"
 #include "pragma.h"
 #include "gen/box.h"
+#include "gen/select.h"
+#include "gen/sum.h"
 #include "gen/thing.h"
+#include "gen/user.h"
 
 int main(void) {
   Thing(float) f = {12};
@@ -214,7 +265,15 @@ int main(void) {
   Thing(Pragma) p = {{56}};
   Thing(Box(float)) n = {{{78}}};
   Thing(Box(Thing(float))) *deep = 0;
-  return f.value + u.value.x + p.value.y + n.value.value + (deep != 0);
+  Foo foo = {34};
+  int a = select(int, Foo)(7, foo);
+  int b = select(int, float)(9, 1.5f);
+  Thing(int) si = {7};
+  int c = sum(int)(&si);
+  User(Option, int) user = { { 7, 1 } };
+  int d = user.email.valid ? user.email.value : 1;
+  return f.value + u.value.x + p.value.y + n.value.value +
+         (deep != 0) + a + b + c + d;
 }
 """
         text2 = """\
@@ -290,7 +349,6 @@ int other(void) {
                     "#ifdef FOO_H" in c and
                     "/* c-autotmpl: Thing(Box_float) */" in c and
                     '#ifndef C_AUTOTMPL_BOX_FLOAT_' in c and
-                    '#ifdef GEN_BOX_H' in c and
                     '#define T Box_float' in c and
                     '/* c-autotmpl: Box(Thing_float) */' in c and
                     '/* c-autotmpl: Thing(Box_Thing_float) */' in c and
@@ -306,6 +364,55 @@ int other(void) {
                     print("plugin duplicated an existing hand-written block",
                           file=sys.stderr)
                     print(content, file=sys.stderr)
+                    return 1
+
+                select_content = wait_for_content(select_generated, lambda c: (
+                    "/* c-autotmpl: select(int, Foo) */" in c and
+                    "/* c-autotmpl: select(int, float) */" in c and
+                    "#ifndef C_AUTOTMPL_SELECT_INT__FOO_" in c and
+                    "#ifdef FOO_H" in c and
+                    "#define First int" in c and
+                    "#define Second Foo" in c and
+                    "#undef Second\n#undef First" in c
+                ))
+                if select_content is None:
+                    print("timed out waiting for function-template generation",
+                          file=sys.stderr)
+                    with open(log_path, errors="replace") as f:
+                        print(f.read()[-4000:], file=sys.stderr)
+                    return 1
+                if "select(impl" in select_content:
+                    print("plugin treated a helper name as a function template",
+                          file=sys.stderr)
+                    print(select_content, file=sys.stderr)
+                    return 1
+
+                sum_content = wait_for_content(sum_generated, lambda c: (
+                    "/* c-autotmpl: Thing(int) */" in c and
+                    "/* c-autotmpl: sum(int) */" in c and
+                    "#define Item int" in c and
+                    "#ifdef GEN_THING_H" not in c
+                ))
+                if sum_content is None:
+                    print("timed out waiting for header function dependencies",
+                          file=sys.stderr)
+                    with open(log_path, errors="replace") as f:
+                        print(f.read()[-4000:], file=sys.stderr)
+                    return 1
+
+                user_content = wait_for_content(user_generated, lambda c: (
+                    "/* c-autotmpl: Option(int) */" in c and
+                    "/* c-autotmpl: User(Option, int) */" in c and
+                    "#define F Option" in c and
+                    "#define Payload int" in c and
+                    "#undef Payload\n#undef F" in c and
+                    "#ifdef GEN_OPTION_H" not in c
+                ))
+                if user_content is None:
+                    print("timed out waiting for lexical HKT generation",
+                          file=sys.stderr)
+                    with open(log_path, errors="replace") as f:
+                        print(f.read()[-4000:], file=sys.stderr)
                     return 1
 
                 diags = wait_for_diagnostics(
@@ -409,6 +516,39 @@ int other(void) {
                         print(f.read()[-4000:], file=sys.stderr)
                     return 1
 
+                pruned_select = wait_for_content(select_generated, lambda c: (
+                    "/* c-autotmpl: select(int, Foo) */" not in c and
+                    "/* c-autotmpl: select(int, float) */" not in c
+                ), timeout=10) is not None
+                if not pruned_select:
+                    print("plugin did not prune unused function-template blocks",
+                          file=sys.stderr)
+                    with open(log_path, errors="replace") as f:
+                        print(f.read()[-4000:], file=sys.stderr)
+                    return 1
+
+                pruned_sum = wait_for_content(sum_generated, lambda c: (
+                    "/* c-autotmpl: Thing(int) */" not in c and
+                    "/* c-autotmpl: sum(int) */" not in c
+                ), timeout=10) is not None
+                if not pruned_sum:
+                    print("plugin did not prune header-derived dependencies",
+                          file=sys.stderr)
+                    with open(log_path, errors="replace") as f:
+                        print(f.read()[-4000:], file=sys.stderr)
+                    return 1
+
+                pruned_user = wait_for_content(user_generated, lambda c: (
+                    "/* c-autotmpl: Option(int) */" not in c and
+                    "/* c-autotmpl: User(Option, int) */" not in c
+                ), timeout=10) is not None
+                if not pruned_user:
+                    print("plugin did not prune lexical HKT blocks",
+                          file=sys.stderr)
+                    with open(log_path, errors="replace") as f:
+                        print(f.read()[-4000:], file=sys.stderr)
+                    return 1
+
                 diags = wait_for_diagnostics(
                     stdout_path, uri, 2, no_template_errors, timeout=10)
                 if diags is None:
@@ -425,10 +565,22 @@ int other(void) {
                                "[c-autotmpl] generated Thing(Box_float)",
                                "[c-autotmpl] generated Box(Thing_float)",
                                "[c-autotmpl] generated Thing(Box_Thing_float)",
+                               "[c-autotmpl] generated select(int, Foo)",
+                               "[c-autotmpl] generated select(int, float)",
+                               "[c-autotmpl] generated sum(int)",
+                               "[c-autotmpl] generated Thing(int)",
+                               "[c-autotmpl] generated Option(int)",
+                               "[c-autotmpl] generated User(Option, int)",
                                "removed /* c-autotmpl: Thing(Foo) */",
                                "removed /* c-autotmpl: Thing(Box_float) */",
                                "removed /* c-autotmpl: Box(Thing_float) */",
-                               "removed /* c-autotmpl: Thing(Box_Thing_float) */"):
+                               "removed /* c-autotmpl: Thing(Box_Thing_float) */",
+                               "removed /* c-autotmpl: select(int, Foo) */",
+                               "removed /* c-autotmpl: select(int, float) */",
+                               "removed /* c-autotmpl: sum(int) */",
+                               "removed /* c-autotmpl: Thing(int) */",
+                               "removed /* c-autotmpl: Option(int) */",
+                               "removed /* c-autotmpl: User(Option, int) */"):
                     if needle not in log_text:
                         print("plugin did not log: " + needle, file=sys.stderr)
                         print(log_text[-4000:], file=sys.stderr)

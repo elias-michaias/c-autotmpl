@@ -3,6 +3,7 @@
 
 #include "TemplateRegistry.h"
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 
@@ -23,6 +24,9 @@ struct UsageDep {
 struct FoundUsage {
   const TemplateDef *Template;
   std::string TypeSpelling;
+  /// Canonical individual type arguments. Function templates use one entry
+  /// per declared parameter; legacy type templates use the whole spelling.
+  llvm::SmallVector<std::string, 2> Args;
   /// Inner template instantiations that must exist before this block can be
   /// emitted, e.g. `Box(int)` for `List(Box(int))`.
   llvm::SmallVector<UsageDep, 2> DependsOn;
@@ -54,7 +58,8 @@ std::string canonicalizeType(llvm::StringRef Type,
 /// than a whole buffer.
 void scanTemplateUsage(const TemplateDef &Template, llvm::StringRef RawType,
                        const TemplateRegistry &Registry,
-                       llvm::SmallVectorImpl<FoundUsage> &Out);
+                       llvm::SmallVectorImpl<FoundUsage> &Out,
+                       bool ScanHeaders = true);
 
 /// Finds `List(int)` and raw `List_int` usages in already-decorated source.
 /// Nested template applications in type arguments are expanded and their
@@ -65,6 +70,21 @@ void scanUsages(llvm::StringRef Code, const TemplateRegistry &Registry,
 llvm::StringRef lastIdentifier(llvm::StringRef Spelling);
 bool isBuiltinTypeName(llvm::StringRef Name);
 bool needsIncludeGuard(llvm::StringRef TypeSpelling);
+
+/// True when Spelling is a bare registered type-template name. Such arguments
+/// are lexical constructors, not concrete types, and need no type guard.
+bool isTemplateConstructorArgument(llvm::StringRef Spelling,
+                                   const TemplateRegistry &Registry);
+
+/// Splits a call's argument text into canonical top-level arguments. For a
+/// type template this is one argument (the whole spelling). For a function
+/// template it must match the decorator's parameter count exactly.
+bool splitExplicitArgs(llvm::StringRef Raw, const TemplateDef &Template,
+                       llvm::SmallVectorImpl<std::string> &Out);
+
+/// Joins explicit arguments into the spelling used by markers and presence
+/// macros, e.g. `int, Foo`.
+std::string joinExplicitArgs(llvm::ArrayRef<std::string> Args);
 
 } // namespace c_autotmpl
 

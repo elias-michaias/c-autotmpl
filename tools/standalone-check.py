@@ -63,6 +63,67 @@ typedef int T;
 typedef struct { T value; } BOX_CAT_(Box_, T);
 #undef T
 """)
+        write(os.path.join(root, "tmpl", "select.h"), """\
+// -- template function select(First, Second)
+#define SELECT_CAT3_IMPL_(A, B, C) A##B##C
+#define SELECT_CAT3_(A, B, C) SELECT_CAT3_IMPL_(A, B, C)
+#define select(First, Second) SELECT_CAT3_(select_, First, Second)
+static inline First select(First, Second)(First a, Second b) {
+  (void)b;
+  return a;
+}
+""")
+        write(os.path.join(root, "tmpl", "apply.h"), """\
+// -- template function apply(T)
+#define APPLY_CAT_IMPL_(A, B) A##B
+#define APPLY_CAT_(A, B) APPLY_CAT_IMPL_(A, B)
+#define apply(T) APPLY_CAT_(apply_, T)
+static inline T apply(T)(T value) { return value; }
+""")
+        write(os.path.join(root, "tmpl", "sum.h"), """\
+// -- template function sum(Item)
+#define SUM_CAT_IMPL_(A, B) A##B
+#define SUM_CAT_(A, B) SUM_CAT_IMPL_(A, B)
+#define sum(Item) SUM_CAT_(sum_, Item)
+static inline Item sum(Item)(Thing(Item) *xs) { return xs->value; }
+""")
+        write(os.path.join(root, "tmpl", "option.h"), """\
+// -- template type Option(T)
+#ifndef OPTION_CAT_DEFINED
+#define OPTION_CAT_DEFINED
+#define OPTION_CAT_IMPL_(A, B) A##B
+#define OPTION_CAT_(A, B) OPTION_CAT_IMPL_(A, B)
+#define Option(T) OPTION_CAT_(Option_, T)
+#endif
+typedef struct { T value; int valid; } Option(T);
+#undef T
+""")
+        write(os.path.join(root, "tmpl", "user.h"), """\
+// -- template type User(F, Payload)
+#ifndef F
+#define F Option
+#endif
+#ifndef Payload
+typedef int Payload;
+#endif
+#define USER_CAT_IMPL_(A, B) A##B
+#define USER_CAT_(A, B) USER_CAT_IMPL_(A, B)
+#define User(F, Payload) USER_CAT_(User_, F)
+typedef struct { F(Payload) email; } User(F, Payload);
+#undef Payload
+#undef F
+""")
+        write(os.path.join(root, "tmpl", "wrap.h"), """\
+// -- template type Wrap(F)
+#ifndef F
+#define F Option
+#endif
+#define WRAP_CAT_IMPL_(A, B) A##B
+#define WRAP_CAT_(A, B) WRAP_CAT_IMPL_(A, B)
+#define Wrap(F) WRAP_CAT_(Wrap_, F)
+typedef struct { F(int) value; } Wrap(F);
+#undef F
+""")
         write(os.path.join(root, "pragma.h"), """\
 #pragma once
 typedef struct { int y; } Pragma;
@@ -82,8 +143,13 @@ typedef struct { int y; } Pragma;
         write(os.path.join(root, "main.c"), """\
 #include "foo.h"
 #include "pragma.h"
+#include "gen/apply.h"
 #include "gen/box.h"
+#include "gen/select.h"
+#include "gen/sum.h"
 #include "gen/thing.h"
+#include "gen/user.h"
+#include "gen/wrap.h"
 
 int main(void) {
   Thing(float) f = {12};
@@ -91,18 +157,35 @@ int main(void) {
   Thing(Pragma) p = {{56}};
   Thing(Box(float)) n = {{{78}}};
   Thing(Box(Thing(float))) *deep = 0;
-  return f.value + u.value.x + p.value.y + n.value.value + (deep != 0);
+  Foo foo = {34};
+  int a = select(int, Foo)(7, foo);
+  int b = select(int, float)(9, 1.5f);
+  int c = apply(int)(5);
+  float d = apply(float)(2.5f);
+  Box(int) box = {3};
+  int e = select(Box(int), float)(box, 1.5f).value;
+  Thing(int) sum_input = {1};
+  int f = sum(int)(&sum_input);
+  User(Option, int) user = { { 7, 1 } };
+  int g = user.email.valid ? user.email.value : 1;
+  Wrap(Option) wrap = { { 9, 1 } };
+  int h = wrap.value.valid ? wrap.value.value : 1;
+  return f.value + u.value.x + p.value.y + n.value.value +
+         (deep != 0) + a + b + c + (int)d + e + f + g + h;
 }
 """)
         write(os.path.join(root, "raw.c"), """\
 int raw(void) {
-  return Thing_double;
+  return Thing_double + select_impl(1, 2) + apply_impl(3) +
+         select(int)(1, 2) + select(int, float, char)(1, 2, 3) +
+         apply(int, int)(1, 2);
 }
 """)
+        sources = [os.path.join(root, name) for name in
+                   ("main.c", "raw.c", "tmpl/apply.h", "tmpl/select.h")]
 
         proc = subprocess.run(
-            [cli, "--root", root, "--verbose",
-             os.path.join(root, "main.c"), os.path.join(root, "raw.c")],
+            [cli, "--root", root, "--verbose"] + sources,
             cwd=root, capture_output=True, text=True,
         )
         output = proc.stdout + proc.stderr
@@ -113,8 +196,24 @@ int raw(void) {
                        "generated Thing(Box_float)",
                        "generated Box(Thing_float)",
                        "generated Thing(Box_Thing_float)",
+                       "generated select(int, Foo)",
+                       "generated select(int, float)",
+                       "generated select(Box_int, float)",
+                       "generated apply(int)",
+                       "generated apply(float)",
+                       "generated sum(int)",
+                       "generated Option(int)",
+                       "generated User(Option, int)",
+                       "generated Wrap(Option)",
                        "skipping Thing(Pragma): no traditional include guard"):
             require(needle in output, "missing output: " + needle, output)
+        for needle in ("select(impl", "apply(impl", "select(First, Second)",
+                       "apply(T)", "Thing(T)", "User(F, Payload)", "Wrap(F)",
+                       "select(int)", "select(int, float, char)",
+                       "apply(int, int)"):
+            require(needle not in output,
+                    "helper, placeholder, or wrong arity was scanned: " + needle,
+                    output)
 
         with open(gen_path) as f:
             content = f.read()
@@ -125,7 +224,6 @@ int raw(void) {
                        "/* c-autotmpl: Thing(double) */",
                        "/* c-autotmpl: Thing(Box_float) */",
                        '#ifndef C_AUTOTMPL_BOX_FLOAT_',
-                       '#ifdef GEN_BOX_H',
                        "#define T Box_float",
                        "/* c-autotmpl: Box(Thing_float) */",
                        "/* c-autotmpl: Thing(Box_Thing_float) */"):
@@ -138,14 +236,88 @@ int raw(void) {
             box_content = f.read()
         for needle in ("/* c-autotmpl: Box(float) */",
                        "/* c-autotmpl: Box(Thing_float) */",
-                       "#ifdef GEN_THING_H"):
+                       "#ifndef C_AUTOTMPL_BOX_THING_FLOAT_"):
             require(needle in box_content,
                     "missing generated box text: " + needle, box_content)
 
+        with open(os.path.join(root, "gen", "select.h")) as f:
+            select_content = f.read()
+        for needle in ("/* c-autotmpl: select(int, Foo) */",
+                       "/* c-autotmpl: select(int, float) */",
+                       "/* c-autotmpl: select(Box_int, float) */",
+                       "#ifndef C_AUTOTMPL_SELECT_INT__FOO_",
+                       "#ifndef C_AUTOTMPL_SELECT_BOX_INT__FLOAT_",
+                       "#ifndef C_AUTOTMPL_BOX_INT_",
+                       "#ifdef FOO_H",
+                       "#define First int",
+                       "#define Second Foo",
+                       "#define First Box_int",
+                       "#define Second float",
+                       "#undef Second",
+                       "#undef First"):
+            require(needle in select_content,
+                    "missing generated select text: " + needle,
+                    select_content)
+        for needle in ("select(impl", "select(First, Second)"):
+            require(needle not in select_content,
+                    "helper or placeholder was emitted as a function instantiation",
+                    select_content)
+
+        with open(os.path.join(root, "gen", "apply.h")) as f:
+            apply_content = f.read()
+        for needle in ("/* c-autotmpl: apply(int) */",
+                       "/* c-autotmpl: apply(float) */",
+                       "#ifndef C_AUTOTMPL_APPLY_INT_",
+                       "#define T int",
+                       "#define T float",
+                       "#undef T"):
+            require(needle in apply_content,
+                    "missing generated apply text: " + needle, apply_content)
+        require("apply(T)" not in apply_content,
+                "placeholder was emitted as a function instantiation",
+                apply_content)
+
+        with open(os.path.join(root, "gen", "sum.h")) as f:
+            sum_content = f.read()
+        for needle in ("/* c-autotmpl: Thing(int) */",
+                       "/* c-autotmpl: sum(int) */",
+                       "#ifndef C_AUTOTMPL_SUM_INT_",
+                       "#define Item int",
+                       "#undef Item"):
+            require(needle in sum_content,
+                    "missing generated sum text: " + needle, sum_content)
+        require("#ifdef GEN_THING_H" not in sum_content,
+                "header dependency guard leaked into the flattened chain",
+                sum_content)
+
+        with open(os.path.join(root, "gen", "user.h")) as f:
+            user_content = f.read()
+        for needle in ("/* c-autotmpl: Option(int) */",
+                       "/* c-autotmpl: User(Option, int) */",
+                       "#ifndef C_AUTOTMPL_USER_OPTION__INT_",
+                       "#define F Option",
+                       "#define Payload int",
+                       "#undef Payload\n#undef F"):
+            require(needle in user_content,
+                    "missing generated HKT text: " + needle, user_content)
+        require("#ifdef GEN_OPTION_H" not in user_content,
+                "constructor dependency guard leaked into the flattened chain",
+                user_content)
+
+        with open(os.path.join(root, "gen", "wrap.h")) as f:
+            wrap_content = f.read()
+        for needle in ("/* c-autotmpl: Option(int) */",
+                       "/* c-autotmpl: Wrap(Option) */",
+                       "#ifndef C_AUTOTMPL_WRAP_OPTION_",
+                       "#define F Option",
+                       "#undef F"):
+            require(needle in wrap_content,
+                    "missing generated single-argument HKT text: " + needle,
+                    wrap_content)
+
         # A second run must take the cheap existing-instantiation path.
         noop = subprocess.run(
-            [cli, "--root", root, "--dry-run", "--verbose",
-             os.path.join(root, "main.c"), os.path.join(root, "raw.c")],
+            [cli, "--root", root, "--dry-run", "--verbose"] + sources,
             cwd=root, capture_output=True, text=True,
         )
         noop_output = noop.stdout + noop.stderr
@@ -159,8 +331,7 @@ int raw(void) {
         # Dry-run reports changes without touching the file.
         write(gen_path, baseline)
         dry = subprocess.run(
-            [cli, "--root", root, "--dry-run", "--verbose",
-             os.path.join(root, "main.c"), os.path.join(root, "raw.c")],
+            [cli, "--root", root, "--dry-run", "--verbose"] + sources,
             cwd=root, capture_output=True, text=True,
         )
         dry_output = dry.stdout + dry.stderr

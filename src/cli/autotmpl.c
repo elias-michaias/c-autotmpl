@@ -1007,7 +1007,10 @@ static char *generated_header_guard(const char *path) {
 
 /* ------------------------------ registry ------------------------------- */
 
+typedef enum { TEMPLATE_TYPE, TEMPLATE_FUNCTION } TemplateKind;
+
 typedef struct {
+  TemplateKind kind;
   char *name;
   char **params;
   size_t nparams;
@@ -1029,6 +1032,25 @@ static TemplateDef *registry_find(const Registry *r, const char *name) {
   return NULL;
 }
 
+/* A bare registered type-template name is a lexical constructor argument, not
+ * a concrete type. It is passed through to the generated block as a macro name
+ * and must not trigger a user-type include guard. */
+static int is_constructor_arg(const char *spelling, const Registry *reg) {
+  char *trimmed = trim_copy(spelling);
+  if (!trimmed[0]) {
+    free(trimmed);
+    return 0;
+  }
+  for (size_t i = 0; trimmed[i]; ++i)
+    if (!is_ident_char(trimmed[i])) {
+      free(trimmed);
+      return 0;
+    }
+  TemplateDef *def = registry_find(reg, trimmed);
+  free(trimmed);
+  return def && def->kind == TEMPLATE_TYPE;
+}
+
 static TemplateDef *registry_match_mangled(const Registry *r, const char *text,
                                            const char **arg_out) {
   TemplateDef *best = NULL;
@@ -1037,6 +1059,11 @@ static TemplateDef *registry_match_mangled(const Registry *r, const char *text,
   for (size_t i = 0; i < r->items.len; ++i) {
     TemplateDef *d = (TemplateDef *)r->items.items[i];
     size_t n = strlen(d->name);
+    /* Mangled-name scanning is for type arguments only. Function templates use
+     * the explicit `name(Type)` call spelling so helper names such as
+     * `name_impl` are not mistaken for instantiations. */
+    if (d->kind == TEMPLATE_FUNCTION)
+      continue;
     if (strlen(text) <= n + 1 || text[n] != '_' || strncmp(text, d->name, n))
       continue;
     if (best && n <= best_len)
@@ -1112,11 +1139,24 @@ static int parse_decorator(const char *line, TemplateDef *out) {
   s += 8;
   while (is_space(*s))
     ++s;
-  if (strncmp(s, "type", 4) == 0 && (s[4] == '\0' || is_space(s[4]))) {
+
+  TemplateKind kind = TEMPLATE_TYPE;
+  size_t word = 0;
+  while (is_ident_char(s[word]))
+    ++word;
+  if (word == 4 && strncmp(s, "type", 4) == 0 &&
+      (!s[4] || is_space(s[4]))) {
     s += 4;
     while (is_space(*s))
       ++s;
+  } else if (word == 8 && strncmp(s, "function", 8) == 0 &&
+             (!s[8] || is_space(s[8]))) {
+    kind = TEMPLATE_FUNCTION;
+    s += 8;
+    while (is_space(*s))
+      ++s;
   }
+
   size_t begin = 0;
   while (is_ident_char(s[begin]))
     ++begin;
@@ -1124,6 +1164,7 @@ static int parse_decorator(const char *line, TemplateDef *out) {
     return 0;
   free(out->name);
   out->name = xstrdup_n(s, begin);
+  out->kind = kind;
   s += begin;
   while (is_space(*s))
     ++s;
@@ -1365,8 +1406,9 @@ typedef struct {
 
 typedef struct {
   const TemplateDef *tmpl;
-  char *type;
-  Vec deps; /* Dep* */
+  char *type;      /* canonical "A, B" spelling used by markers */
+  Vec args;       /* canonical individual arguments */
+  Vec deps;       /* Dep* */
   int nested;
 } Usage;
 
@@ -1375,16 +1417,6 @@ static Dep *dep_new(const TemplateDef *tmpl, const char *type) {
   d->tmpl = tmpl;
   d->type = xstrdup(type);
   return d;
-}
-
-static Usage *usage_new(const TemplateDef *tmpl, const char *type) {
-  Usage *u = (Usage *)xmalloc(sizeof(Usage));
-  u->tmpl = tmpl;
-  u->type = xstrdup(type);
-  u->deps.items = NULL;
-  u->deps.len = u->deps.cap = 0;
-  u->nested = 0;
-  return u;
 }
 
 static void split_type_arg(const char *s, size_t n, size_t *arg_len,
@@ -1407,6 +1439,22 @@ static void split_type_arg(const char *s, size_t n, size_t *arg_len,
   *next = n;
 }
 
+static void split_type_args(const char *s, Vec *out) {
+  while (*s) {
+    size_t n = strlen(s);
+    size_t len, next;
+    split_type_arg(s, n, &len, &next);
+    char *arg = trim_copy_n(s, len);
+    if (arg[0])
+      vec_push(out, arg);
+    else
+      free(arg);
+    if (next >= n)
+      break;
+    s += next;
+  }
+}
+
 static char *join_strings(Vec *items, const char *sep) {
   Str out;
   str_init(&out);
@@ -1416,6 +1464,50 @@ static char *join_strings(Vec *items, const char *sep) {
     str_append(&out, (char *)items->items[i]);
   }
   return str_take(&out);
+}
+
+static Usage *usage_new_with_args(const TemplateDef *tmpl, Vec *args) {
+  Usage *u = (Usage *)xmalloc(sizeof(Usage));
+  u->tmpl = tmpl;
+  u->type = join_strings(args, ", ");
+  u->args.items = NULL;
+  u->args.len = u->args.cap = 0;
+  for (size_t i = 0; i < args->len; ++i)
+    vec_push(&u->args, xstrdup((char *)args->items[i]));
+  u->deps.items = NULL;
+  u->deps.len = u->deps.cap = 0;
+  u->nested = 0;
+  return u;
+}
+
+static Usage *usage_new(const TemplateDef *tmpl, const char *type) {
+  Vec args;
+  args.items = NULL;
+  args.len = args.cap = 0;
+  if (tmpl->kind == TEMPLATE_FUNCTION ||
+      (tmpl->kind == TEMPLATE_TYPE && tmpl->nparams > 1))
+    split_type_args(type, &args);
+  else
+    vec_push(&args, xstrdup(type));
+  Usage *u = usage_new_with_args(tmpl, &args);
+  for (size_t i = 0; i < args.len; ++i)
+    free(args.items[i]);
+  free(args.items);
+  return u;
+}
+
+static void usage_free(Usage *u) {
+  for (size_t i = 0; i < u->args.len; ++i)
+    free(u->args.items[i]);
+  free(u->args.items);
+  for (size_t i = 0; i < u->deps.len; ++i) {
+    Dep *d = (Dep *)u->deps.items[i];
+    free(d->type);
+    free(d);
+  }
+  free(u->deps.items);
+  free(u->type);
+  free(u);
 }
 
 static void copy_deps(Vec *out, Vec *expanded, size_t begin) {
@@ -1470,7 +1562,7 @@ static char *canonicalize_type(const char *type, Registry *reg, Vec *expanded) {
     while (rest < n && is_space(clean[rest]))
       ++rest;
     TemplateDef *def = registry_find(reg, word);
-    if (!def || depth != 0 || rest != n) {
+    if (!def || def->kind == TEMPLATE_FUNCTION || depth != 0 || rest != n) {
       free(word);
       break;
     }
@@ -1562,27 +1654,230 @@ static char *canonicalize_type(const char *type, Registry *reg, Vec *expanded) {
   return out;
 }
 
-static void scan_template_usage(const TemplateDef *tmpl, const char *raw,
-                                Registry *reg, Vec *out) {
-  Vec expanded;
-  expanded.items = NULL;
-  expanded.len = expanded.cap = 0;
-  char *canon = canonicalize_type(raw, reg, &expanded);
-  for (size_t i = 0; i < expanded.len; ++i)
-    ((Usage *)expanded.items[i])->nested = 1;
-  for (size_t i = 0; i < expanded.len; ++i)
-    vec_push(out, expanded.items[i]);
-  Usage *outer = usage_new(tmpl, canon);
-  for (size_t i = 0; i < expanded.len; ++i) {
-    Usage *dep = (Usage *)expanded.items[i];
+static void scan_usages_impl(const char *code, Registry *reg, Vec *out,
+                             int scan_headers);
+
+static void scan_usages(const char *code, Registry *reg, Vec *out) {
+  scan_usages_impl(code, reg, out, 1);
+}
+
+static void scan_header_deps(const TemplateDef *tmpl, Vec *args, Registry *reg,
+                             Vec *out);
+
+static void push_usage_chain(const TemplateDef *tmpl, Vec *canon_args,
+                             Vec *expanded, Vec *out) {
+  for (size_t i = 0; i < expanded->len; ++i)
+    ((Usage *)expanded->items[i])->nested = 1;
+  for (size_t i = 0; i < expanded->len; ++i)
+    vec_push(out, expanded->items[i]);
+  Usage *outer = usage_new_with_args(tmpl, canon_args);
+  for (size_t i = 0; i < expanded->len; ++i) {
+    Usage *dep = (Usage *)expanded->items[i];
     vec_push(&outer->deps, dep_new(dep->tmpl, dep->type));
   }
   vec_push(out, outer);
-  free(canon);
+}
+
+static int is_declared_param(const TemplateDef *tmpl, const char *arg);
+
+static void scan_template_usage(const TemplateDef *tmpl, const char *raw,
+                                Registry *reg, Vec *out, int scan_headers) {
+  Vec expanded;
+  expanded.items = NULL;
+  expanded.len = expanded.cap = 0;
+  Vec canon_args;
+  canon_args.items = NULL;
+  canon_args.len = canon_args.cap = 0;
+  Vec raw_args;
+  raw_args.items = NULL;
+  raw_args.len = raw_args.cap = 0;
+  char *single_canon = NULL;
+  int single_pushed = 0;
+
+  if (tmpl->nparams > 1) {
+    split_type_args(raw, &raw_args);
+    if (raw_args.len != tmpl->nparams)
+      goto cleanup;
+    /* The template header spells its own parameters, e.g. User(F, Payload). */
+    int placeholders = 1;
+    for (size_t i = 0; i < raw_args.len; ++i)
+      if (!is_declared_param(tmpl, (char *)raw_args.items[i]))
+        placeholders = 0;
+    if (placeholders)
+      goto cleanup;
+    for (size_t i = 0; i < raw_args.len; ++i) {
+      char *canon = canonicalize_type((char *)raw_args.items[i], reg, &expanded);
+      if (!canon[0]) {
+        free(canon);
+        goto cleanup;
+      }
+      vec_push(&canon_args, canon);
+    }
+  } else {
+    char *trimmed = trim_copy(raw);
+    if (is_declared_param(tmpl, trimmed)) {
+      free(trimmed);
+      goto cleanup;
+    }
+    free(trimmed);
+    single_canon = canonicalize_type(raw, reg, &expanded);
+    single_pushed = single_canon[0] != 0;
+    if (single_pushed)
+      vec_push(&canon_args, single_canon);
+  }
+  for (size_t i = 0; i < raw_args.len; ++i)
+    free(raw_args.items[i]);
+  free(raw_args.items);
+
+  if (scan_headers)
+    scan_header_deps(tmpl, &canon_args, reg, &expanded);
+  push_usage_chain(tmpl, &canon_args, &expanded, out);
+  for (size_t i = 0; i < canon_args.len; ++i)
+    free(canon_args.items[i]);
+  free(canon_args.items);
+  if (single_canon && !single_pushed)
+    free(single_canon);
+  free(expanded.items);
+  return;
+
+cleanup:
+  for (size_t i = 0; i < canon_args.len; ++i)
+    free(canon_args.items[i]);
+  free(canon_args.items);
+  if (single_canon && !single_pushed)
+    free(single_canon);
+  for (size_t i = 0; i < raw_args.len; ++i)
+    free(raw_args.items[i]);
+  free(raw_args.items);
+  for (size_t i = 0; i < expanded.len; ++i)
+    usage_free((Usage *)expanded.items[i]);
   free(expanded.items);
 }
 
-static void scan_usages(const char *code, Registry *reg, Vec *out) {
+static int is_declared_param(const TemplateDef *tmpl, const char *arg) {
+  for (size_t i = 0; i < tmpl->nparams; ++i)
+    if (strcmp(tmpl->params[i], arg) == 0)
+      return 1;
+  return 0;
+}
+
+static void scan_function_usage(const TemplateDef *tmpl, const char *raw,
+                                Registry *reg, Vec *out, int scan_headers) {
+  Vec raw_args;
+  raw_args.items = NULL;
+  raw_args.len = raw_args.cap = 0;
+  split_type_args(raw, &raw_args);
+  size_t expected = tmpl->nparams ? tmpl->nparams : 1;
+  if (raw_args.len != expected)
+    goto done;
+
+  /* The function definition inside a template header spells its own macro
+   * parameters, e.g. `my_func(T)(T value)`. Those are not instantiations. */
+  int placeholders = 1;
+  for (size_t i = 0; i < raw_args.len; ++i)
+    if (!is_declared_param(tmpl, (char *)raw_args.items[i]))
+      placeholders = 0;
+  if (placeholders)
+    goto done;
+
+  Vec expanded;
+  expanded.items = NULL;
+  expanded.len = expanded.cap = 0;
+  Vec canon_args;
+  canon_args.items = NULL;
+  canon_args.len = canon_args.cap = 0;
+  for (size_t i = 0; i < raw_args.len; ++i) {
+    char *canon = canonicalize_type((char *)raw_args.items[i], reg, &expanded);
+    if (!canon[0]) {
+      free(canon);
+      goto cleanup;
+    }
+    vec_push(&canon_args, canon);
+  }
+  if (scan_headers)
+    scan_header_deps(tmpl, &canon_args, reg, &expanded);
+  push_usage_chain(tmpl, &canon_args, &expanded, out);
+  free(canon_args.items);
+  free(expanded.items);
+  goto done;
+
+cleanup:
+  for (size_t i = 0; i < canon_args.len; ++i)
+    free(canon_args.items[i]);
+  free(canon_args.items);
+  for (size_t i = 0; i < expanded.len; ++i)
+    usage_free((Usage *)expanded.items[i]);
+  free(expanded.items);
+done:
+  for (size_t i = 0; i < raw_args.len; ++i)
+    free(raw_args.items[i]);
+  free(raw_args.items);
+}
+
+static char *substitute_params(const char *code, const TemplateDef *tmpl,
+                               Vec *args) {
+  Str out;
+  str_init(&out);
+  for (size_t i = 0; code[i];) {
+    if (is_ident_start(code[i])) {
+      size_t start = i++;
+      while (code[i] && is_ident_char(code[i]))
+        ++i;
+      size_t len = i - start;
+      const char *replacement = NULL;
+      for (size_t p = 0; p < tmpl->nparams && p < args->len; ++p) {
+        size_t plen = strlen(tmpl->params[p]);
+        if (plen == len && memcmp(code + start, tmpl->params[p], plen) == 0) {
+          replacement = (char *)args->items[p];
+          break;
+        }
+      }
+      if (replacement)
+        str_append(&out, replacement);
+      else
+        str_append_n(&out, code + start, len);
+      continue;
+    }
+    str_append_char(&out, code[i++]);
+  }
+  return str_take(&out);
+}
+
+static void scan_header_deps(const TemplateDef *tmpl, Vec *args, Registry *reg,
+                             Vec *out) {
+  if (!tmpl->header || !args->len)
+    return;
+  char *code = read_file(tmpl->header, NULL);
+  if (!code)
+    return;
+  char *substituted = substitute_params(code, tmpl, args);
+  Vec found;
+  found.items = NULL;
+  found.len = found.cap = 0;
+  scan_usages_impl(substituted, reg, &found, 0);
+
+  char *self = join_strings(args, ", ");
+  for (size_t i = 0; i < found.len;) {
+    Usage *u = (Usage *)found.items[i];
+    if (u->tmpl == tmpl && strcmp(u->type, self) == 0) {
+      usage_free(u);
+      for (size_t j = i + 1; j < found.len; ++j)
+        found.items[j - 1] = found.items[j];
+      --found.len;
+    } else {
+      ++i;
+    }
+  }
+  for (size_t i = 0; i < found.len; ++i)
+    vec_push(out, found.items[i]);
+  free(found.items);
+  free(self);
+  free(substituted);
+  free(code);
+}
+
+static void scan_usages_impl(const char *code, Registry *reg, Vec *out,
+                             int scan_headers) {
   if (!registry_may_contain(reg, code))
     return;
   char *clean = strip_comments_literals(code);
@@ -1624,8 +1919,12 @@ static void scan_usages(const char *code, Registry *reg, Vec *out) {
         if (depth == 0 && close > begin) {
           char *raw = xstrdup_n(clean + begin, close - begin - 1);
           char *type = trim_copy(raw);
-          if (type[0])
-            scan_template_usage(def, type, reg, out);
+          if (type[0]) {
+            if (def->kind == TEMPLATE_FUNCTION)
+              scan_function_usage(def, type, reg, out, scan_headers);
+            else
+              scan_template_usage(def, type, reg, out, scan_headers);
+          }
           free(type);
           free(raw);
           i = close;
@@ -1637,7 +1936,7 @@ static void scan_usages(const char *code, Registry *reg, Vec *out) {
       const char *arg;
       TemplateDef *mangled = registry_match_mangled(reg, ident, &arg);
       if (mangled)
-        scan_template_usage(mangled, arg, reg, out);
+        scan_template_usage(mangled, arg, reg, out, scan_headers);
     }
     free(ident);
     i = end;
@@ -1772,26 +2071,54 @@ static const char *next_line(const char *p) {
   return nl ? nl + 1 : p + strlen(p);
 }
 
+static size_t param_count(const TemplateDef *tmpl) {
+  if (tmpl->nparams)
+    return tmpl->nparams;
+  return 1;
+}
+
+static const char *param_name(const TemplateDef *tmpl, size_t i) {
+  if (i < tmpl->nparams)
+    return tmpl->params[i];
+  return "T";
+}
+
+static int all_seen(const char *seen, size_t n) {
+  for (size_t i = 0; i < n; ++i)
+    if (!seen[i])
+      return 0;
+  return 1;
+}
+
 static int has_manual_block(const char *content, const TemplateDef *tmpl,
-                            const char *type) {
-  const char *param = tmpl->nparams ? tmpl->params[0] : "T";
+                            Vec *args) {
+  size_t count = param_count(tmpl);
+  if (args->len < count)
+    return 0;
+  const char *param = param_name(tmpl, 0);
+  const char *type = (char *)args->items[0];
   const char *p = content;
   while (*p) {
     char *line = xstrdup_n(p, (size_t)(next_line(p) - p));
     char *trimmed = trim_copy(line);
     if (trimmed[0] == '/' && trimmed[1] == '*' &&
         strstr(trimmed, "c-autotmpl:") != NULL) {
-      /* Skip a generated block so its `#define T ...` is not mistaken for a
-         hand-written instantiation. */
+      /* Skip a generated block so its own `#define ...` lines are not
+         mistaken for a hand-written instantiation. */
+      char *seen = (char *)xmalloc(count);
+      memset(seen, 0, count);
       const char *q = next_line(p);
       while (*q) {
         char *body = xstrdup_n(q, (size_t)(next_line(q) - q));
-        int done = undef_matches(body, param);
+        for (size_t i = 0; i < count; ++i)
+          if (undef_matches(body, param_name(tmpl, i)))
+            seen[i] = 1;
         free(body);
         q = next_line(q);
-        if (done)
+        if (all_seen(seen, count))
           break;
       }
+      free(seen);
       while (*q) {
         char *body = xstrdup_n(q, (size_t)(next_line(q) - q));
         char *body_trim = trim_copy(body);
@@ -1811,22 +2138,38 @@ static int has_manual_block(const char *content, const TemplateDef *tmpl,
     char *defined = define_type_from_line(trimmed, param);
     if (defined && strcmp(defined, type) == 0) {
       const char *q = next_line(p);
-      int saw_include = 0, saw_undef = 0;
-      for (int i = 0; i < 12 && *q; ++i) {
+      char *seen_def = (char *)xmalloc(count);
+      char *seen_undef = (char *)xmalloc(count);
+      memset(seen_def, 0, count);
+      memset(seen_undef, 0, count);
+      int saw_include = 0;
+      for (int i = 0; i < 12 + 4 * (int)count && *q; ++i) {
         char *body = xstrdup_n(q, (size_t)(next_line(q) - q));
         if (include_matches(body, tmpl->include))
           saw_include = 1;
-        if (undef_matches(body, param))
-          saw_undef = 1;
+        for (size_t j = 0; j < count; ++j) {
+          const char *name = param_name(tmpl, j);
+          char *line_define = define_type_from_line(body, name);
+          if (line_define && strcmp(line_define, (char *)args->items[j]) == 0)
+            seen_def[j] = 1;
+          free(line_define);
+          if (undef_matches(body, name))
+            seen_undef[j] = 1;
+        }
         free(body);
-        if (saw_include && saw_undef)
+        if (saw_include && all_seen(seen_def, count) &&
+            all_seen(seen_undef, count))
           break;
         q = next_line(q);
       }
+      int manual = saw_include && all_seen(seen_def, count) &&
+                   all_seen(seen_undef, count);
+      free(seen_def);
+      free(seen_undef);
       free(defined);
       free(trimmed);
       free(line);
-      if (saw_include && saw_undef)
+      if (manual)
         return 1;
       p = next_line(p);
       continue;
@@ -1840,24 +2183,24 @@ static int has_manual_block(const char *content, const TemplateDef *tmpl,
 }
 
 static int has_instantiation(const char *path, const TemplateDef *tmpl,
-                             const char *type, EmitCtx *ctx) {
+                             Usage *usage, EmitCtx *ctx) {
   const char *content = cached_file(ctx, path);
-  char *marker = instantiation_marker(tmpl->name, type);
+  char *marker = instantiation_marker(tmpl->name, usage->type);
   int found = strstr(content, marker) != NULL;
   if (!found)
-    found = has_manual_block(content, tmpl, type);
+    found = has_manual_block(content, tmpl, &usage->args);
   free(marker);
   return found;
 }
 
-static char *guard_for_type(const char *spelling, EmitCtx *ctx) {
-  if (!needs_guard(spelling))
+static char *guard_for_arg(const char *spelling, EmitCtx *ctx) {
+  if (!needs_guard(spelling) || is_constructor_arg(spelling, ctx->reg))
     return xstrdup("");
   char *type = strip_qualifiers(spelling);
   const char *arg;
   TemplateDef *def = registry_match_mangled(ctx->reg, type, &arg);
   if (def) {
-    char *guard = guard_for_type(arg, ctx);
+    char *guard = guard_for_arg(arg, ctx);
     free(type);
     return guard;
   }
@@ -1877,54 +2220,63 @@ static int is_generated_type(const char *spelling, EmitCtx *ctx) {
   return result;
 }
 
-static char *make_block(const TemplateDef *tmpl, const char *type,
-                        const char *guard, Set *extra_guards) {
+static int collect_guards(Usage *usage, EmitCtx *ctx, Set *guards) {
+  int missing = 0;
+  for (size_t i = 0; i < usage->args.len; ++i) {
+    const char *arg = (char *)usage->args.items[i];
+    if (!needs_guard(arg) || is_constructor_arg(arg, ctx->reg))
+      continue;
+    char *guard = guard_for_arg(arg, ctx);
+    if (guard[0])
+      set_add(guards, guard);
+    else if (!is_generated_type(arg, ctx))
+      missing = 1;
+    free(guard);
+  }
+  return missing;
+}
+
+static char *make_block(Usage *usage, Set *guards) {
+  const TemplateDef *tmpl = usage->tmpl;
   Str out;
   str_init(&out);
-  char *marker = instantiation_marker(tmpl->name, type);
-  char *presence = presence_macro(tmpl->name, type);
+  char *marker = instantiation_marker(tmpl->name, usage->type);
+  char *presence = presence_macro(tmpl->name, usage->type);
   str_append(&out, marker);
   str_append_char(&out, '\n');
   str_append(&out, "#ifndef ");
   str_append(&out, presence);
   str_append_char(&out, '\n');
 
-  Vec guards;
-  guards.items = NULL;
-  guards.len = guards.cap = 0;
-  for (size_t i = 0; i < extra_guards->len; ++i)
-    vec_push(&guards, extra_guards->items[i]);
-  if (guard[0]) {
-    int seen = 0;
-    for (size_t i = 0; i < guards.len; ++i)
-      if (strcmp((char *)guards.items[i], guard) == 0)
-        seen = 1;
-    if (!seen)
-      vec_push(&guards, (void *)guard);
-  }
-  for (size_t i = 0; i < guards.len; ++i) {
+  for (size_t i = 0; i < guards->len; ++i) {
     str_append(&out, "#ifdef ");
-    str_append(&out, (char *)guards.items[i]);
+    str_append(&out, (char *)guards->items[i]);
     str_append_char(&out, '\n');
   }
   str_append(&out, "#define ");
   str_append(&out, presence);
   str_append_char(&out, '\n');
 
-  const char *param = tmpl->nparams ? tmpl->params[0] : "T";
-  str_append(&out, "#define ");
-  str_append(&out, param);
-  str_append_char(&out, ' ');
-  str_append(&out, type);
-  str_append(&out, "\n#include \"");
+  size_t count = param_count(tmpl);
+  for (size_t i = 0; i < count; ++i) {
+    str_append(&out, "#define ");
+    str_append(&out, param_name(tmpl, i));
+    str_append_char(&out, ' ');
+    str_append(&out, (char *)usage->args.items[i]);
+    str_append_char(&out, '\n');
+  }
+  str_append(&out, "#include \"");
   str_append(&out, tmpl->include);
-  str_append(&out, "\"\n#undef ");
-  str_append(&out, param);
+  str_append_char(&out, '"');
   str_append_char(&out, '\n');
-  for (size_t i = guards.len; i > 0; --i)
+  for (size_t i = count; i > 0; --i) {
+    str_append(&out, "#undef ");
+    str_append(&out, param_name(tmpl, i - 1));
+    str_append_char(&out, '\n');
+  }
+  for (size_t i = guards->len; i > 0; --i)
     str_append(&out, "#endif\n");
   str_append(&out, "#endif\n\n");
-  free(guards.items);
   free(marker);
   free(presence);
   return str_take(&out);
@@ -1980,8 +2332,19 @@ static int append_block(const char *path, const char *block, EmitCtx *ctx) {
   return rc;
 }
 
-static int emit_usage(Usage *usage, const char *output_header, EmitCtx *ctx) {
-  if (has_instantiation(output_header, usage->tmpl, usage->type, ctx))
+static int chain_has_usage(Vec *usages, size_t begin, size_t end,
+                           const Dep *dep) {
+  for (size_t i = begin; i <= end; ++i) {
+    Usage *u = (Usage *)usages->items[i];
+    if (u->tmpl == dep->tmpl && strcmp(u->type, dep->type) == 0)
+      return 1;
+  }
+  return 0;
+}
+
+static int emit_usage(Usage *usage, const char *output_header, EmitCtx *ctx,
+                      Vec *chain, size_t begin, size_t end) {
+  if (has_instantiation(output_header, usage->tmpl, usage, ctx))
     return 0;
 
   Set guards;
@@ -1991,14 +2354,16 @@ static int emit_usage(Usage *usage, const char *output_header, EmitCtx *ctx) {
     Dep *dep = (Dep *)usage->deps.items[i];
     if (strcmp(dep->tmpl->generated, output_header) == 0)
       continue;
+    /* The whole chain is written into this header before the outer block, so
+     * a dependency already in the chain needs no cross-header guard. */
+    if (chain && chain_has_usage(chain, begin, end, dep))
+      continue;
     char *guard = generated_header_guard(dep->tmpl->generated);
     set_add(&guards, guard);
     free(guard);
   }
 
-  char *guard = guard_for_type(usage->type, ctx);
-  if (needs_guard(usage->type) && !is_generated_type(usage->type, ctx) &&
-      !guard[0]) {
+  if (collect_guards(usage, ctx, &guards)) {
     Str key;
     str_init(&key);
     str_append(&key, usage->tmpl->name);
@@ -2011,18 +2376,16 @@ static int emit_usage(Usage *usage, const char *output_header, EmitCtx *ctx) {
       ++ctx->skipped;
     }
     free(k);
-    free(guard);
     for (size_t i = 0; i < guards.len; ++i)
       free(guards.items[i]);
     free(guards.items);
     return 0;
   }
 
-  char *block = make_block(usage->tmpl, usage->type, guard, &guards);
+  char *block = make_block(usage, &guards);
   if (append_block(output_header, block, ctx) != 0) {
     fprintf(stderr, "error: failed writing %s\n", output_header);
     free(block);
-    free(guard);
     for (size_t i = 0; i < guards.len; ++i)
       free(guards.items[i]);
     free(guards.items);
@@ -2033,7 +2396,6 @@ static int emit_usage(Usage *usage, const char *output_header, EmitCtx *ctx) {
     printf("%s %s(%s) in %s\n", ctx->dry_run ? "would generate" : "generated",
            usage->tmpl->name, usage->type, output_header);
   free(block);
-  free(guard);
   for (size_t i = 0; i < guards.len; ++i)
     free(guards.items[i]);
   free(guards.items);
@@ -2044,7 +2406,7 @@ static int emit_usage(Usage *usage, const char *output_header, EmitCtx *ctx) {
  * applications recurse to their innermost argument, so Box(List(int)) asks
  * only for int and does not force a scan of every unrelated header. */
 static void add_wanted_type(const char *spelling, Registry *reg, Set *wanted) {
-  if (!needs_guard(spelling))
+  if (!needs_guard(spelling) || is_constructor_arg(spelling, reg))
     return;
   char *type = strip_qualifiers(spelling);
   const char *arg;
@@ -2058,6 +2420,11 @@ static void add_wanted_type(const char *spelling, Registry *reg, Set *wanted) {
     set_add(wanted, name);
   free(name);
   free(type);
+}
+
+static void add_wanted_usage(Usage *usage, Registry *reg, Set *wanted) {
+  for (size_t i = 0; i < usage->args.len; ++i)
+    add_wanted_type((char *)usage->args.items[i], reg, wanted);
 }
 
 /* -------------------------------- CLI ---------------------------------- */
@@ -2259,8 +2626,7 @@ int main(int argc, char **argv) {
     scan_usages(content, &reg, &fu->usages);
     free(content);
     for (size_t j = 0; j < fu->usages.len; ++j)
-      add_wanted_type(((Usage *)fu->usages.items[j])->type, &reg,
-                      &wanted_names);
+      add_wanted_usage((Usage *)fu->usages.items[j], &reg, &wanted_names);
     vec_push(&file_usages, fu);
   }
 
@@ -2293,10 +2659,10 @@ int main(int argc, char **argv) {
       const char *output = ((Usage *)fu->usages.items[i])->tmpl->generated;
       for (size_t j = begin; j <= i; ++j) {
         Usage *u = (Usage *)fu->usages.items[j];
-        if (emit_usage(u, output, &emit) != 0)
+        if (emit_usage(u, output, &emit, &fu->usages, begin, i) != 0)
           return 1;
         if (j != i && strcmp(u->tmpl->generated, output) != 0 &&
-            emit_usage(u, u->tmpl->generated, &emit) != 0)
+            emit_usage(u, u->tmpl->generated, &emit, NULL, 0, 0) != 0)
           return 1;
       }
     }

@@ -35,7 +35,9 @@ C code.
 | --- | --- |
 | **Single-file CLI** | One ISO C99 source. No LLVM, libclang, clang headers, C++ runtime, or compile database. |
 | **Editor integration** | clangd feature module generates from unsaved buffers and prunes stale blocks. |
-| **Nested generics** | `List(Box(int))` and deeper chains, with dependency guards. |
+| **Nested generics** | `List(Box(int))` and deeper chains, flattened into one header. |
+| **Function templates** | `convert(int, float)(x)` and `select(int, Foo)(a, b)` from explicit call-site arguments. |
+| **Lexical HKTs** | Pass a template name as an argument, as in `User(Option, int)`. |
 | **Idempotent output** | Additive writes and stable markers make reruns safe in build scripts. |
 | **Type-aware guards** | User types use real include guards; scalar types are emitted bare. |
 
@@ -57,7 +59,8 @@ int main(void) {
 
 c-autotmpl finds the matching template header and writes the instantiations into
 a sibling `gen/` directory. It handles `List(int)`, `List_int`,
-`List(Box(int))`, and `List(Box(List(int)))`.
+`List(Box(int))`, and `List(Box(List(int)))`. Function templates use the same
+explicit spelling: `convert(int, float)(x)`.
 
 There are two ways to use it:
 
@@ -108,22 +111,47 @@ User-defined types need a traditional include guard such as `FOO_H`. Builtin and
 fixed-width scalar types are emitted without a guard. `#pragma once` is not
 supported because generated code cannot test it.
 
-Nested dependencies are wrapped in the dependency header's guard:
+Nested dependencies are emitted in the same generated header, before the block
+that needs them. A source therefore includes only the outermost header:
 
 ```c
-/* c-autotmpl: List(Box_int) */
-#ifndef C_AUTOTMPL_LIST_BOX_INT_...
-#ifdef GEN_BOX_H
-#define C_AUTOTMPL_LIST_BOX_INT_...
-#define T Box_int
-#include "../tmpl/list.h"
-#undef T
-#endif
+/* c-autotmpl: Box(float) */
+/* c-autotmpl: List(Box_float) */
+```
+
+The inner block is also mirrored into its own header, so direct use still works.
+No call-site alias macros are generated. See [doc/USAGE.md](doc/USAGE.md) for the
+full rules.
+
+Function templates use a `function` decorator and spell every argument at the
+call site. For `// -- template function convert(From, To)`, a usage of
+`convert(int, float)(x)` produces:
+
+```c
+/* c-autotmpl: convert(int, float) */
+#ifndef C_AUTOTMPL_CONVERT_INT__FLOAT_...
+#define C_AUTOTMPL_CONVERT_INT__FLOAT_...
+#define From int
+#define To float
+#include "../tmpl/convert.h"
+#undef To
+#undef From
 #endif
 ```
 
-No call-site alias macros are generated. The source must include `gen/box.h`
-before `gen/list.h`. See [doc/USAGE.md](doc/USAGE.md) for the full rules.
+Parameters are defined in decorator order and undefined in reverse order. Each
+argument gets its own guard check. Helper names such as `convert_impl` are not
+instantiations; there is no AST deduction.
+
+Function headers are lexed too. After substituting the concrete arguments, a
+function head such as `static inline Item sum(Item)(List(Item) *xs)` adds
+`List(int)` as a dependency automatically.
+
+A bare registered type-template name is a constructor argument. For
+`// -- template type User(F, Payload)`, `User(Option, int)` defines `F` as
+`Option`, lexes the substituted header, and emits `Option(int)` first.
+`User(Result, int)` emits `Result(int)` instead. There is no kind checking,
+only lexical application.
 
 ## Get started
 
@@ -157,7 +185,7 @@ changes. Full instructions are in [doc/BUILD.md](doc/BUILD.md).
 | --- | --- |
 | [**Build guide**](doc/BUILD.md) | CLI build, clangd plugin build, loading, tests, and build errors. |
 | [**Usage guide**](doc/USAGE.md) | CLI options, template authoring, guards, nested types, and runtime behavior. |
-| [**Polymorphism**](doc/POLYMORPHISM.md) | Generated functions, checked constraints, dispatch, and trait impls. |
+| [**Polymorphism**](doc/POLYMORPHISM.md) | Generated functions, function templates, dispatch, and direct trait calls. |
 | [**Troubleshooting**](doc/TROUBLESHOOTING.md) | Common failures and fixes. |
 
 ## Repository layout
@@ -208,6 +236,7 @@ Run `make bench` to reproduce these numbers.
 - Generated headers always live in a sibling `gen/` directory.
 - `#pragma once` headers cannot provide a testable guard.
 - The CLI does not see usages created only by macro expansion.
+- Function templates need explicit type arguments; there is no deduction.
 - Nested blocks depend on include order in the source file.
 - The clangd module must be rebuilt against a matching clangd version.
 

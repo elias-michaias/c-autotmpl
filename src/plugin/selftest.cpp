@@ -51,6 +51,37 @@ int main() {
   }
   {
     std::error_code EC;
+    raw_fd_ostream OS(join(Root, "tmpl/select.h"), EC);
+    OS << "// -- template function select(First, Second)\n"
+          "#define select(First, Second) select_##First##Second\n";
+  }
+  {
+    std::error_code EC;
+    raw_fd_ostream OS(join(Root, "tmpl/sum.h"), EC);
+    OS << "// -- template function sum(Item)\n"
+          "static inline Item sum(Item)(List(Item) *xs);\n";
+  }
+  {
+    std::error_code EC;
+    raw_fd_ostream OS(join(Root, "tmpl/option.h"), EC);
+    OS << "// -- template type Option(T)\n#define Option(T) Option_##T\n";
+  }
+  {
+    std::error_code EC;
+    raw_fd_ostream OS(join(Root, "tmpl/user.h"), EC);
+    OS << "// -- template type User(F, Payload)\n"
+          "#define User(F, Payload) User_##F\n"
+          "typedef struct { F(Payload) email; } User(F, Payload);\n";
+  }
+  {
+    std::error_code EC;
+    raw_fd_ostream OS(join(Root, "tmpl/wrap.h"), EC);
+    OS << "// -- template type Wrap(F)\n"
+          "#define Wrap(F) Wrap_##F\n"
+          "typedef struct { F(int) value; } Wrap(F);\n";
+  }
+  {
+    std::error_code EC;
     raw_fd_ostream OS(join(Root, "other/foo.h"), EC);
     OS << "#ifndef FOO_H\n#define FOO_H\nstruct Foo { int x; };\n#endif\n";
   }
@@ -82,9 +113,29 @@ int main() {
   const c_autotmpl::TemplateDef *MapDef = Registry.findByName("Map");
   assert(MapDef && MapDef->Params.size() == 1 && MapDef->Params[0] == "Elem");
 
+  const c_autotmpl::TemplateDef *SelectDef =
+      Registry.findByName("select");
+  assert(SelectDef && SelectDef->Kind == c_autotmpl::TemplateKind::Function);
+  assert(SelectDef->Params.size() == 2 && SelectDef->Params[0] == "First" &&
+         SelectDef->Params[1] == "Second");
+
+  const c_autotmpl::TemplateDef *SumDef = Registry.findByName("sum");
+  assert(SumDef && SumDef->Kind == c_autotmpl::TemplateKind::Function);
+
+  const c_autotmpl::TemplateDef *OptionDef = Registry.findByName("Option");
+  const c_autotmpl::TemplateDef *UserDef = Registry.findByName("User");
+  assert(OptionDef && OptionDef->Kind == c_autotmpl::TemplateKind::Type);
+  assert(UserDef && UserDef->Params.size() == 2 &&
+         UserDef->Params[0] == "F" && UserDef->Params[1] == "Payload");
+  assert(c_autotmpl::isTemplateConstructorArgument("Option", Registry));
+  assert(!c_autotmpl::isTemplateConstructorArgument("int", Registry));
+
   StringRef Type;
   assert(Registry.matchMangled("List_int", Type) == Def && Type == "int");
   assert(Registry.matchMangled("Nope_int", Type) == nullptr);
+  // Function templates use explicit call-site spellings only; helper names
+  // such as select_impl must not be read as mangled instantiations.
+  assert(Registry.matchMangled("select_int__float", Type) == nullptr);
 
   c_autotmpl::Instantiator Instantiator;
   std::string GenPath, Error;
@@ -109,6 +160,28 @@ int main() {
          StringRef::npos);
   assert(Content.find("#ifdef FOO_H") != StringRef::npos);
   assert(Content.find("#define T struct Foo") != StringRef::npos);
+
+  std::string SelectPath, SelectError;
+  assert(Instantiator.instantiate(*SelectDef, "int, Foo", FooGuard,
+                                  SelectPath, SelectError) ==
+         c_autotmpl::InstantiationResult::Added);
+  assert(Instantiator.instantiate(*SelectDef, "int, Foo", FooGuard,
+                                  SelectPath, SelectError) ==
+         c_autotmpl::InstantiationResult::Existing);
+  {
+    auto SelectBuffer = MemoryBuffer::getFile(SelectPath);
+    assert(SelectBuffer);
+    StringRef SelectContent = (*SelectBuffer)->getBuffer();
+    assert(SelectContent.find("/* c-autotmpl: select(int, Foo) */") !=
+           StringRef::npos);
+    assert(SelectContent.find("#ifndef C_AUTOTMPL_SELECT_INT__FOO_") !=
+           StringRef::npos);
+    assert(SelectContent.find("#ifdef FOO_H") != StringRef::npos);
+    assert(SelectContent.find("#define First int") != StringRef::npos);
+    assert(SelectContent.find("#define Second Foo") != StringRef::npos);
+    assert(SelectContent.find("#undef Second\n#undef First") !=
+           StringRef::npos);
+  }
 
   {
     // A stale hand-written block beside the generated one must be removed,
@@ -173,6 +246,105 @@ int main() {
   assert(MapContent.find("/* c-autotmpl: Map(char) */") != StringRef::npos);
   assert(MapContent.find("#define Elem char") != StringRef::npos);
   assert(MapContent.find("#undef Elem") != StringRef::npos);
+
+  {
+    SmallVector<c_autotmpl::FoundUsage, 8> Functions;
+    c_autotmpl::scanUsages(
+        "select(int, Foo) a; select(int, float) b; select_impl(x);",
+        Registry, Functions);
+    assert(Functions.size() == 2);
+    assert(Functions[0].Template == SelectDef);
+    assert(Functions[0].TypeSpelling == "int, Foo");
+    assert(Functions[0].Args.size() == 2 && Functions[0].Args[0] == "int" &&
+           Functions[0].Args[1] == "Foo");
+    assert(Functions[1].TypeSpelling == "int, float");
+    assert(Functions[1].Args.size() == 2);
+
+    SmallVector<c_autotmpl::FoundUsage, 8> Placeholders;
+    c_autotmpl::scanUsages(
+        "static inline int select(First, Second)(First a, Second b);",
+        Registry, Placeholders);
+    assert(Placeholders.empty());
+
+    SmallVector<c_autotmpl::FoundUsage, 8> WrongArity;
+    c_autotmpl::scanUsages("select(int) a; select(int, float, char) b;",
+                           Registry, WrongArity);
+    assert(WrongArity.empty());
+
+    SmallVector<c_autotmpl::FoundUsage, 8> TypePlaceholders;
+    c_autotmpl::scanUsages("List(T) p; User(F, Payload) u; List(int) q;",
+                           Registry, TypePlaceholders);
+    assert(TypePlaceholders.size() == 1);
+    assert(TypePlaceholders[0].Template == Def);
+    assert(TypePlaceholders[0].TypeSpelling == "int");
+
+    SmallVector<c_autotmpl::FoundUsage, 8> NestedFunction;
+    c_autotmpl::scanUsages("select(Box(int), float) n;", Registry,
+                           NestedFunction);
+    assert(NestedFunction.size() == 2);
+    assert(NestedFunction[0].Template == Registry.findByName("Box"));
+    assert(NestedFunction[0].IsNested);
+    assert(NestedFunction[1].Template == SelectDef);
+    assert(NestedFunction[1].TypeSpelling == "Box_int, float");
+    assert(NestedFunction[1].Args.size() == 2);
+    assert(NestedFunction[1].Args[0] == "Box_int");
+    assert(NestedFunction[1].DependsOn.size() == 1);
+
+    // A function header that spells out a concrete type in its function head
+    // creates a dependency without any type deduction.
+    SmallVector<c_autotmpl::FoundUsage, 8> HeaderDeps;
+    c_autotmpl::scanUsages("sum(int) s;", Registry, HeaderDeps);
+    assert(HeaderDeps.size() == 2);
+    assert(HeaderDeps[0].Template == Def);
+    assert(HeaderDeps[0].TypeSpelling == "int");
+    assert(HeaderDeps[0].IsNested);
+    assert(HeaderDeps[1].Template == SumDef);
+    assert(HeaderDeps[1].TypeSpelling == "int");
+    assert(HeaderDeps[1].DependsOn.size() == 1);
+    assert(HeaderDeps[1].DependsOn[0].Template == Def);
+    assert(HeaderDeps[1].DependsOn[0].TypeSpelling == "int");
+
+    // A bare registered template name is a lexical constructor. Substituting
+    // it into the type header reveals concrete applications such as
+    // Option(int), which become dependencies.
+    SmallVector<c_autotmpl::FoundUsage, 8> Hkt;
+    c_autotmpl::scanUsages("User(Option, int) user;", Registry, Hkt);
+    assert(Hkt.size() == 2);
+    assert(Hkt[0].Template == OptionDef);
+    assert(Hkt[0].TypeSpelling == "int");
+    assert(Hkt[0].IsNested);
+    assert(Hkt[1].Template == UserDef);
+    assert(Hkt[1].TypeSpelling == "Option, int");
+    assert(Hkt[1].Args.size() == 2 && Hkt[1].Args[0] == "Option" &&
+           Hkt[1].Args[1] == "int");
+    assert(Hkt[1].DependsOn.size() == 1);
+    assert(Hkt[1].DependsOn[0].Template == OptionDef);
+    assert(Hkt[1].DependsOn[0].TypeSpelling == "int");
+
+    SmallVector<c_autotmpl::FoundUsage, 8> SingleHkt;
+    c_autotmpl::scanUsages("Wrap(Option) wrap;", Registry, SingleHkt);
+    assert(SingleHkt.size() == 2);
+    assert(SingleHkt[0].Template == OptionDef);
+    assert(SingleHkt[0].TypeSpelling == "int");
+    assert(SingleHkt[1].Template == Registry.findByName("Wrap"));
+    assert(SingleHkt[1].TypeSpelling == "Option");
+    assert(SingleHkt[1].DependsOn.size() == 1);
+  }
+
+  {
+    std::string UserPath, UserError;
+    assert(Instantiator.instantiate(*UserDef, "Option, int", "", UserPath,
+                                    UserError) ==
+           c_autotmpl::InstantiationResult::Added);
+    auto UserBuffer = MemoryBuffer::getFile(UserPath);
+    assert(UserBuffer);
+    StringRef UserContent = (*UserBuffer)->getBuffer();
+    assert(UserContent.find("/* c-autotmpl: User(Option, int) */") !=
+           StringRef::npos);
+    assert(UserContent.find("#define F Option") != StringRef::npos);
+    assert(UserContent.find("#define Payload int") != StringRef::npos);
+    assert(UserContent.find("#undef Payload\n#undef F") != StringRef::npos);
+  }
 
   {
     // Nested applications expand inner types first. The already-mangled
@@ -290,6 +462,29 @@ int main() {
     assert(Pruned.find("/* c-autotmpl: List(Box_List_char) */") ==
            StringRef::npos);
     assert(Pruned.find("/* c-autotmpl: Box(List_char) */") != StringRef::npos);
+  }
+
+  {
+    std::string OtherPath, OtherError;
+    assert(Instantiator.instantiate(*SelectDef, "int, float", "",
+                                    OtherPath, OtherError) ==
+           c_autotmpl::InstantiationResult::Added);
+    StringSet<> Keep;
+    Keep.insert(c_autotmpl::instantiationMarker("select", "int, Foo"));
+    std::vector<std::string> Removed;
+    assert(Instantiator.prune(*SelectDef, Keep, Removed, OtherError));
+    bool RemovedOther = false;
+    for (const std::string &Marker : Removed)
+      RemovedOther |=
+          Marker == c_autotmpl::instantiationMarker("select", "int, float");
+    assert(RemovedOther);
+    auto PrunedBuffer = MemoryBuffer::getFile(OtherPath);
+    assert(PrunedBuffer);
+    StringRef Pruned = (*PrunedBuffer)->getBuffer();
+    assert(Pruned.find("/* c-autotmpl: select(int, float) */") ==
+           StringRef::npos);
+    assert(Pruned.find("/* c-autotmpl: select(int, Foo) */") !=
+           StringRef::npos);
   }
 
   std::cout << "selftest OK\n";

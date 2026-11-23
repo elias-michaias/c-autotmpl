@@ -13,6 +13,7 @@
   <a href="USAGE.md">Usage</a> &bull;
   <a href="BUILD.md">Build</a> &bull;
   <a href="#checked-constraints-and-generated-functions">Constraints</a> &bull;
+  <a href="#function-templates">Function templates</a> &bull;
   <a href="#extendible-generic-dispatch">Dispatch</a> &bull;
   <a href="#c-trait-generic-impls">Traits</a>
 </p>
@@ -28,6 +29,7 @@ Every example below is complete. Build the CLI from this repo, put it on your
 `PATH`, then run the commands shown with each example.
 
 - [Checked constraints and generated functions](#checked-constraints-and-generated-functions)
+- [Function templates](#function-templates)
 - [Extendible generic dispatch](#extendible-generic-dispatch)
 - [c-trait generic impls](#c-trait-generic-impls)
 - [Tagged unions with generated payloads](#tagged-unions-with-generated-payloads)
@@ -202,10 +204,21 @@ The generated names are plain C names with `T` pasted in:
 | `ops_add(T)` | fails the operator check | `ops_add_int` |
 
 The call site still names `T` in `pair_xy_sum(Point)` or `ops_add(int)`. These
-are generic functions by generation, not by dispatch. When the caller should
-not care which concrete function it calls, the next step is dispatch. The
-following section uses extendible `_Generic`. The one after that uses c-trait
-to generate the impl and the dispatcher together.
+are generic functions by generation, not by dispatch.
+
+## Function templates
+
+Use a `function` decorator when the operation needs more than one type. A header
+marked `// -- template function convert(From, To)` has parameter names, not
+fixed types. A call site supplies them as `convert(float, int)(2.5f)`.
+c-autotmpl writes one block with `#define From float`, `#define To int`, and
+`#undef`s in reverse order. Helper names such as `convert_impl` are not usages,
+and there is no AST deduction. [USAGE.md](USAGE.md#function-templates) has the
+full header and generated-block rules.
+
+When the caller should not care which concrete function it calls, the next step
+is dispatch. The following section uses extendible `_Generic`. The one after
+that uses c-trait to generate the impl and the dispatcher together.
 
 ## Extendible generic dispatch
 
@@ -411,10 +424,41 @@ typedef struct { T data[8]; int len; } List(T);
 #undef T
 ```
 
+A function template can call the generated trait overloads directly. Passing
+the item type is enough: the function head spells out `List(Item)`, so
+c-autotmpl lexes `List(int)` and `List(float)` out of the header and emits those
+blocks first.
+
+```c
+/* tmpl/list_sum.h */
+// -- template function list_sum(Item)
+
+#include "../trait.h"
+
+#ifndef Item
+typedef int Item;
+#endif
+
+#define LIST_SUM_CAT_I(a, b) a##b
+#define LIST_SUM_CAT(a, b) LIST_SUM_CAT_I(a, b)
+#define list_sum(Item) LIST_SUM_CAT(list_sum_, Item)
+
+static inline Item list_sum(Item)(List(Item) *xs) {
+  return $(List.get, xs, 0) + $(List.get, xs, 1);
+}
+
+#undef Item
+```
+
+No dummy wrapper type or extra trait impl is needed just to reach the overload.
+The dependency blocks are flattened into `gen/list_sum.h` ahead of the
+functions, so no manual `GEN_LIST_H` guard is needed.
+
 ```c
 /* src/main.c */
 #include "point.h"
 #include "gen/list.h"
+#include "gen/list_sum.h"
 #include <stdio.h>
 
 int main(void) {
@@ -431,20 +475,25 @@ int main(void) {
   $(List.push, &fs, new_f);
   $(List.push, &ps, new_p);
 
-  printf("xs=%d,%d fs=%.1f pt=(%d,%d) sum=%d\n",
+  printf("xs=%d,%d fs=%.1f pt=(%d,%d) sums=%d,%.1f\n",
          $(List.get, &xs, 0), $(List.get, &xs, 1),
          $(List.get, &fs, 0),
          $(List.get, &ps, 0).x, $(List.get, &ps, 0).y,
-         $(List.get, &xs, 0) + $(List.get, &xs, 1));
+         list_sum(int)(&xs),
+         list_sum(float)(&fs));
   return 0;
 }
 ```
+
+`point.h` comes first because `List(Point)` needs `Point` and its `POINT_H`
+guard. The function's own `List(int)` and `List(float)` dependencies are already
+inside `gen/list_sum.h`.
 
 ```sh
 cp /path/to/c-trait/trait.h .
 autotmpl --root . src/main.c
 cc -std=gnu11 -I. src/main.c -o demo && ./demo
-# xs=7,9 fs=3.5 pt=(4,5) sum=16
+# xs=7,9 fs=3.5 pt=(4,5) sums=16,3.5
 ```
 
 `List_Item` is set to `T` inside each generated block. The trait signature has
@@ -458,6 +507,10 @@ $(List.push, &xs, new_x);
 
 Add a trait impl by adding a `List(T)` usage. c-autotmpl writes the generated
 block, and the template writes the associated type and impl for that `T`.
+
+`list_sum(int)` and `list_sum(float)` add free functions that call
+`$(List.get, ...)` on the concrete list. The overload stays inside the generated
+function, so the call site only names the item type.
 
 See the [c-trait API reference](https://github.com/elias-michaias/c-trait/blob/main/docs/API.md)
 for defaults, dynamic dispatch, and supertraits.

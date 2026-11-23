@@ -1,10 +1,19 @@
 #include "SourceScan.h"
 
+#include "llvm/Support/MemoryBuffer.h"
+
+#include <algorithm>
 #include <cctype>
 
 using namespace llvm;
 
 namespace c_autotmpl {
+
+static void scanUsagesImpl(llvm::StringRef Code,
+                           const TemplateRegistry &Registry,
+                           llvm::SmallVectorImpl<FoundUsage> &Out,
+                           bool ScanHeaders);
+
 namespace {
 
 bool isIdentStart(char C) {
@@ -48,6 +57,18 @@ bool isBuiltinTypeName(StringRef Name) {
 bool needsIncludeGuard(StringRef TypeSpelling) {
   StringRef Name = lastIdentifier(TypeSpelling);
   return !Name.empty() && !isBuiltinTypeName(Name);
+}
+
+bool isTemplateConstructorArgument(StringRef Spelling,
+                                   const TemplateRegistry &Registry) {
+  StringRef Name = Spelling.trim();
+  if (Name.empty())
+    return false;
+  for (char C : Name)
+    if (!isIdentChar(C))
+      return false;
+  const TemplateDef *Def = Registry.findByName(Name);
+  return Def && Def->Kind == TemplateKind::Type;
 }
 
 std::string stripCommentsAndLiterals(StringRef Source) {
@@ -150,6 +171,109 @@ StringRef splitTypeArg(StringRef S, StringRef &Rest) {
 
 } // namespace
 
+bool splitExplicitArgs(StringRef Raw, const TemplateDef &Template,
+                       SmallVectorImpl<std::string> &Out) {
+  Out.clear();
+  if (Template.Kind == TemplateKind::Type) {
+    if (Template.Params.size() <= 1) {
+      StringRef Arg = Raw.trim();
+      if (Arg.empty())
+        return false;
+      Out.push_back(Arg.str());
+      return true;
+    }
+
+    StringRef Rest = Raw;
+    while (!Rest.empty()) {
+      StringRef Next;
+      StringRef Arg = splitTypeArg(Rest, Next).trim();
+      if (Arg.empty())
+        return false;
+      Out.push_back(Arg.str());
+      Rest = Next.ltrim();
+    }
+    return Out.size() == Template.Params.size();
+  }
+
+  StringRef Rest = Raw;
+  while (!Rest.empty()) {
+    StringRef Next;
+    StringRef Arg = splitTypeArg(Rest, Next).trim();
+    if (Arg.empty())
+      return false;
+    Out.push_back(Arg.str());
+    Rest = Next.ltrim();
+  }
+  size_t Expected = Template.Params.empty() ? 1 : Template.Params.size();
+  return Out.size() == Expected;
+}
+
+std::string joinExplicitArgs(ArrayRef<std::string> Args) {
+  std::string Out;
+  for (size_t I = 0; I < Args.size(); ++I) {
+    if (I)
+      Out += ", ";
+    Out += Args[I];
+  }
+  return Out;
+}
+
+static std::string substituteParams(StringRef Source,
+                                    const TemplateDef &Template,
+                                    ArrayRef<std::string> Args) {
+  std::string Out;
+  Out.reserve(Source.size());
+  for (unsigned I = 0; I < Source.size();) {
+    if (isIdentStart(Source[I])) {
+      unsigned Start = I++;
+      while (I < Source.size() && isIdentChar(Source[I]))
+        ++I;
+      StringRef Ident = Source.slice(Start, I);
+      bool Replaced = false;
+      for (size_t P = 0;
+           P < Template.Params.size() && P < Args.size(); ++P) {
+        if (Ident == StringRef(Template.Params[P])) {
+          Out += Args[P];
+          Replaced = true;
+          break;
+        }
+      }
+      if (!Replaced)
+        Out.append(Ident.data(), Ident.size());
+      continue;
+    }
+    Out += Source[I++];
+  }
+  return Out;
+}
+
+static void scanHeaderDeps(const TemplateDef &Template,
+                           ArrayRef<std::string> Args,
+                           const TemplateRegistry &Registry,
+                           SmallVectorImpl<FoundUsage> &Out) {
+  if (Template.Header.empty() || Args.empty())
+    return;
+  auto Buf = MemoryBuffer::getFile(Template.Header, /*IsText=*/true);
+  if (!Buf)
+    return;
+
+  std::string Source = substituteParams((*Buf)->getBuffer(), Template, Args);
+  SmallVector<FoundUsage, 4> Header;
+  scanUsagesImpl(Source, Registry, Header, /*ScanHeaders=*/false);
+
+  // The substituted header spells the instantiation itself, e.g.
+  // `list_sum(int)(...)` or `User(Option, int)`. That is the usage we are
+  // already emitting, not a dependency.
+  std::string Self = joinExplicitArgs(Args);
+  Header.erase(std::remove_if(Header.begin(), Header.end(),
+                              [&](const FoundUsage &U) {
+                                return U.Template == &Template &&
+                                       U.TypeSpelling == Self;
+                              }),
+               Header.end());
+  Out.append(Header.begin(), Header.end());
+}
+
 std::string canonicalizeType(StringRef Type, const TemplateRegistry &Registry,
                              SmallVectorImpl<FoundUsage> &Deps) {
   std::string Clean = stripCommentsAndLiterals(Type);
@@ -200,7 +324,7 @@ std::string canonicalizeType(StringRef Type, const TemplateRegistry &Registry,
     unsigned Rest = Close;
     while (Rest < S.size() && isSpace(S[Rest]))
       ++Rest;
-    if (!Def || Rest != S.size())
+    if (!Def || Def->Kind != TemplateKind::Type || Rest != S.size())
       break;
 
     StringRef Args = S.slice(ArgStart, Close - 1);
@@ -281,8 +405,89 @@ std::string canonicalizeType(StringRef Type, const TemplateRegistry &Registry,
   return Out;
 }
 
-void scanUsages(StringRef Code, const TemplateRegistry &Registry,
-                SmallVectorImpl<FoundUsage> &Out) {
+namespace {
+
+bool isDeclaredParam(const TemplateDef &Template, StringRef Arg) {
+  for (const std::string &Param : Template.Params)
+    if (StringRef(Param) == Arg)
+      return true;
+  return false;
+}
+
+void appendUsageChain(const TemplateDef &Template,
+                      ArrayRef<std::string> CanonArgs,
+                      SmallVectorImpl<FoundUsage> &Expanded,
+                      SmallVectorImpl<FoundUsage> &Out) {
+  for (FoundUsage &Dep : Expanded)
+    Dep.IsNested = true;
+  Out.append(Expanded.begin(), Expanded.end());
+
+  FoundUsage Usage;
+  Usage.Template = &Template;
+  Usage.TypeSpelling = joinExplicitArgs(CanonArgs);
+  for (const std::string &Arg : CanonArgs)
+    Usage.Args.push_back(Arg);
+  for (const FoundUsage &Dep : Expanded)
+    Usage.DependsOn.push_back({Dep.Template, Dep.TypeSpelling});
+  Out.push_back(std::move(Usage));
+}
+
+} // namespace
+
+void scanTemplateUsage(const TemplateDef &Template, StringRef RawType,
+                       const TemplateRegistry &Registry,
+                       SmallVectorImpl<FoundUsage> &Out, bool ScanHeaders) {
+  SmallVector<FoundUsage, 4> Expanded;
+  SmallVector<std::string, 4> RawArgs;
+  if (!splitExplicitArgs(RawType, Template, RawArgs))
+    return;
+
+  // The template header spells its own parameters, e.g. List(T) or
+  // User(F, Payload). Those are not instantiations.
+  bool Placeholders = !Template.Params.empty();
+  for (const std::string &Arg : RawArgs)
+    if (!isDeclaredParam(Template, Arg))
+      Placeholders = false;
+  if (Placeholders)
+    return;
+
+  SmallVector<std::string, 4> CanonArgs;
+  for (const std::string &Arg : RawArgs)
+    CanonArgs.push_back(canonicalizeType(Arg, Registry, Expanded));
+  if (ScanHeaders)
+    scanHeaderDeps(Template, CanonArgs, Registry, Expanded);
+  appendUsageChain(Template, CanonArgs, Expanded, Out);
+}
+
+static void scanFunctionUsage(const TemplateDef &Template, StringRef RawType,
+                              const TemplateRegistry &Registry,
+                              SmallVectorImpl<FoundUsage> &Out,
+                              bool ScanHeaders) {
+  SmallVector<std::string, 4> RawArgs;
+  if (!splitExplicitArgs(RawType, Template, RawArgs))
+    return;
+
+  // The definition inside a template header spells its own macro parameters,
+  // e.g. `select(T, U)(T a, U b)`. Those are not instantiations.
+  bool Placeholders = !Template.Params.empty();
+  for (const std::string &Arg : RawArgs)
+    if (!isDeclaredParam(Template, Arg))
+      Placeholders = false;
+  if (Placeholders)
+    return;
+
+  SmallVector<FoundUsage, 4> Expanded;
+  SmallVector<std::string, 4> CanonArgs;
+  for (const std::string &Arg : RawArgs)
+    CanonArgs.push_back(canonicalizeType(Arg, Registry, Expanded));
+  if (ScanHeaders)
+    scanHeaderDeps(Template, CanonArgs, Registry, Expanded);
+  appendUsageChain(Template, CanonArgs, Expanded, Out);
+}
+
+static void scanUsagesImpl(StringRef Code, const TemplateRegistry &Registry,
+                           SmallVectorImpl<FoundUsage> &Out,
+                           bool ScanHeaders) {
   if (!Registry.mayContainUsage(Code))
     return;
 
@@ -330,7 +535,10 @@ void scanUsages(StringRef Code, const TemplateRegistry &Registry,
         if (Depth == 0) {
           StringRef Type = S.slice(Start, Close - 1).trim();
           if (!Type.empty()) {
-            scanTemplateUsage(*Def, Type, Registry, Out);
+            if (Def->Kind == TemplateKind::Function)
+              scanFunctionUsage(*Def, Type, Registry, Out, ScanHeaders);
+            else
+              scanTemplateUsage(*Def, Type, Registry, Out, ScanHeaders);
             I = Close;
             continue;
           }
@@ -340,27 +548,15 @@ void scanUsages(StringRef Code, const TemplateRegistry &Registry,
 
     StringRef MangledType;
     if (const TemplateDef *Def = Registry.matchMangled(Ident, MangledType))
-      scanTemplateUsage(*Def, MangledType, Registry, Out);
+      scanTemplateUsage(*Def, MangledType, Registry, Out, ScanHeaders);
 
     I = End;
   }
 }
 
-void scanTemplateUsage(const TemplateDef &Template, StringRef RawType,
-                       const TemplateRegistry &Registry,
-                       SmallVectorImpl<FoundUsage> &Out) {
-  SmallVector<FoundUsage, 4> Expanded;
-  std::string Canon = canonicalizeType(RawType, Registry, Expanded);
-  for (FoundUsage &Dep : Expanded)
-    Dep.IsNested = true;
-  Out.append(Expanded.begin(), Expanded.end());
-
-  FoundUsage Usage;
-  Usage.Template = &Template;
-  Usage.TypeSpelling = std::move(Canon);
-  for (const FoundUsage &Dep : Expanded)
-    Usage.DependsOn.push_back({Dep.Template, Dep.TypeSpelling});
-  Out.push_back(std::move(Usage));
+void scanUsages(StringRef Code, const TemplateRegistry &Registry,
+                SmallVectorImpl<FoundUsage> &Out) {
+  scanUsagesImpl(Code, Registry, Out, /*ScanHeaders=*/true);
 }
 
 } // namespace c_autotmpl

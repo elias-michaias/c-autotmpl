@@ -133,6 +133,11 @@ typedef struct { T value; } List_IMPL(T);
 The name in the decorator chooses the generated file: `tmpl/list.h` maps to
 `gen/list.h`, and other directories get a sibling `gen/` directory.
 
+Type templates can declare several parameters, for example
+`// -- template type User(F, Payload)`. Call sites spell every argument:
+`User(Option, int)`. Generated blocks define parameters in decorator order and
+undef them in reverse order.
+
 Use two levels of macro indirection so the argument expands before pasting.
 A single-level `List_##T` breaks for argument macros.
 
@@ -154,6 +159,120 @@ duplicate definitions.
 
 Hand-written `#define T ... / #include / #undef T` blocks are recognized, so
 older generated files do not immediately gain duplicate copies.
+
+## Function templates
+
+A function template has a `function` decorator. The names in parentheses are
+parameters for the generated block, not fixed types. The template body decides
+how they are used:
+
+```c
+/* tmpl/convert.h */
+// -- template function convert(From, To)
+
+#ifndef From
+typedef int From;
+#endif
+#ifndef To
+typedef int To;
+#endif
+
+#define CONVERT_CAT4_I(a, b, c, d) a##b##c##d
+#define CONVERT_CAT4(a, b, c, d) CONVERT_CAT4_I(a, b, c, d)
+#define convert(From, To) CONVERT_CAT4(convert_, From, _, To)
+
+static inline To convert(From, To)(From value) { return (To)value; }
+
+#undef To
+#undef From
+```
+
+Call sites spell out all arguments. Do not put types in the decorator. Names
+such as `int` and `float` would become macro names in the generated block.
+
+```c
+#include "gen/convert.h"
+
+int n = convert(float, int)(2.5f);
+float x = convert(int, float)(7);
+```
+
+For `convert(int, float)`, the generated block defines both parameters and
+undefines them in reverse order:
+
+```c
+/* c-autotmpl: convert(int, float) */
+#ifndef C_AUTOTMPL_CONVERT_INT__FLOAT_...
+#define C_AUTOTMPL_CONVERT_INT__FLOAT_...
+#define From int
+#define To float
+#include "../tmpl/convert.h"
+#undef To
+#undef From
+#endif
+```
+
+Rules:
+
+- The call-site argument count must match the decorator. Wrong arity is ignored.
+- There is no AST deduction. Write `select(int, Foo)(a, b)`, not `select(a, b)`.
+- Only the exact template name starts a usage. Helpers such as `select_impl(x)`
+  are ignored, including by mangled-name scanning.
+- The template's own `convert(From, To)(value)` definition is skipped because its
+  arguments are exactly the declared parameters.
+- Each argument needs its own guard. For `select(int, Foo)`, the block is wrapped
+  in `#ifdef FOO_H`. Include the type header before `gen/select.h`.
+- The template header is lexed after substituting the declared parameters. A
+  function head such as `sum(Item)(List(Item) *xs)` adds `List(int)` as a
+  dependency when the call is `sum(int)(xs)`. The substituted self-usage is
+  ignored, and discovered dependencies are emitted before the function block.
+
+## Lexical HKTs
+
+A bare registered type-template name is a constructor argument. It is passed as
+a macro name, not as a concrete type, so it needs no include guard.
+
+```c
+/* tmpl/option.h */
+// -- template type Option(T)
+#define OPTION_CAT_I(a, b) a##b
+#define OPTION_CAT(a, b) OPTION_CAT_I(a, b)
+#define Option(T) OPTION_CAT(Option_, T)
+typedef struct { T value; int valid; } Option(T);
+#undef T
+```
+
+```c
+/* tmpl/user.h */
+// -- template type User(F, Payload)
+#ifndef F
+#define F Option
+#endif
+#define USER_CAT_I(a, b) a##b
+#define USER_CAT(a, b) USER_CAT_I(a, b)
+#define User(F, Payload) USER_CAT(User_, F)
+typedef struct { F(Payload) email; } User(F, Payload);
+#undef Payload
+#undef F
+```
+
+```c
+#include "gen/user.h"
+
+User(Option, int) user = { { 7, 1 } };
+```
+
+After substituting `F` as `Option`, c-autotmpl lexes `F(Payload)` as
+`Option(int)` and emits that block before `User(Option, int)`. Writing
+`User(Result, int)` emits `Result(int)` instead. Include only `gen/user.h`, just
+like any other nested chain.
+
+With one constructor parameter, `Wrap(Option)` works the same way when its
+header applies `F(int)`.
+
+This is lexical application, not kind checking. `Option` and `Result` are macro
+names with whatever arity their headers define. A wrong argument count fails at
+compile time. Partial application needs an explicit wrapper template.
 
 ## Type guards
 
@@ -184,37 +303,20 @@ Nested applications are expanded inside out:
 List(Box(int))
 ```
 
-First `Box(int)` becomes `Box_int`. Then `List(Box_int)` is emitted, with the
-whole block wrapped in `GEN_BOX_H`:
+First `Box(int)` becomes `Box_int`. Then `List(Box_int)` is emitted. The chain is
+flattened into the outermost generated header in dependency order:
 
 ```c
+/* c-autotmpl: Box(int) */
 /* c-autotmpl: List(Box_int) */
-#ifndef C_AUTOTMPL_LIST_BOX_INT_...
-#ifdef GEN_BOX_H
-#define C_AUTOTMPL_LIST_BOX_INT_...
-#define T Box_int
-#include "../tmpl/list.h"
-#undef T
-#endif
-#endif
 ```
 
-The source must include the dependency generated header first:
-
-```c
-#include "gen/box.h"
-#include "gen/list.h"
-```
-
-If the order is reversed, `GEN_BOX_H` is undefined and the nested block is
-skipped. c-autotmpl does not insert dependency includes for you.
+Because the inner block appears first in the same header, no `GEN_BOX_H` guard
+is needed there. Inner blocks are also mirrored into their own headers, with the
+guard restored, so direct use still works.
 
 No call-site alias macros are generated. Write `List(Box(int))` or
 `List(Box_int)` directly.
-
-Deeper chains such as `List(Box(List(int)))` are flattened into the outermost
-generated header in dependency order. Inner blocks are also mirrored into their
-own headers, and the presence macros make the copies harmless.
 
 ## Generated files
 

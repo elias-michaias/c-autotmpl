@@ -1,4 +1,5 @@
 #include "Instantiator.h"
+#include "SourceScan.h"
 
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
@@ -34,6 +35,18 @@ uint64_t stampFor(StringRef Path) {
 bool isSpace(char C) {
   return C == ' ' || C == '\t' || C == '\r' || C == '\n' || C == '\f' ||
          C == '\v';
+}
+
+size_t paramCount(const TemplateDef &Template) {
+  if (Template.Params.empty())
+    return 1;
+  return Template.Params.size();
+}
+
+StringRef paramName(const TemplateDef &Template, size_t I) {
+  if (I < Template.Params.size())
+    return Template.Params[I];
+  return StringRef("T");
 }
 
 bool parseDefine(StringRef Line, StringRef Param, StringRef &Type) {
@@ -94,14 +107,14 @@ SmallVector<LineInfo, 64> splitLines(StringRef Content) {
 /// reports its byte range. Trailing blank lines are included so removal does
 /// not leave extra whitespace behind.
 bool findBlockAt(ArrayRef<LineInfo> Lines, size_t Index,
-                 const TemplateDef &Template, StringRef &Type, size_t &Begin,
+                 const TemplateDef &Template, std::string &Type, size_t &Begin,
                  size_t &End, bool &Marked) {
   if (Index >= Lines.size())
     return false;
 
-  StringRef Param =
-      Template.Params.empty() ? StringRef("T") : Template.Params.front();
+  size_t Count = paramCount(Template);
   StringRef First = Lines[Index].Text.trim();
+  SmallVector<std::string, 4> ParsedArgs;
 
   if (First.starts_with(MarkerPrefix) && First.ends_with(MarkerSuffix)) {
     StringRef Inner =
@@ -112,14 +125,17 @@ bool findBlockAt(ArrayRef<LineInfo> Lines, size_t Index,
       return false;
     if (Inner.take_front(Open).trim() != Template.Name)
       return false;
-    Type = Inner.slice(Open + 1, Close).trim();
+    Type = Inner.slice(Open + 1, Close).trim().str();
     Marked = true;
   } else {
-    if (!parseDefine(First, Param, Type))
+    StringRef FirstArg;
+    if (!parseDefine(First, paramName(Template, 0), FirstArg))
       return false;
+    ParsedArgs.resize(Count);
+    ParsedArgs[0] = FirstArg.str();
     Marked = false;
   }
-  if (Type.empty())
+  if (!Marked && ParsedArgs.empty())
     return false;
 
   bool SawInclude = false;
@@ -127,7 +143,8 @@ bool findBlockAt(ArrayRef<LineInfo> Lines, size_t Index,
   int Depth = 0;
   size_t UndefIndex = StringRef::npos;
   size_t LastLine = StringRef::npos;
-  size_t Last = std::min(Index + 18, Lines.size());
+  size_t Last = std::min(Index + 18 + 4 * Count, Lines.size());
+  SmallVector<bool, 4> SeenUndef(Count, false);
   for (size_t I = Index + 1; I < Last; ++I) {
     StringRef Line = Lines[I].Text.trim();
     if (Line.starts_with("#if ") || Line.starts_with("#ifdef") ||
@@ -144,15 +161,38 @@ bool findBlockAt(ArrayRef<LineInfo> Lines, size_t Index,
     }
     if (lineIncludes(Line, Template.IncludeFromGenDir))
       SawInclude = true;
-    if (lineUndefines(Line, Param)) {
+    bool AllUndef = true;
+    for (size_t J = 0; J < Count; ++J) {
+      StringRef Name = paramName(Template, J);
+      if (lineUndefines(Line, Name))
+        SeenUndef[J] = true;
+      if (!SeenUndef[J])
+        AllUndef = false;
+      if (!Marked && !Name.empty()) {
+        StringRef Arg;
+        if (parseDefine(Line, Name, Arg) && J < ParsedArgs.size())
+          ParsedArgs[J] = Arg.str();
+      }
+    }
+    if (AllUndef) {
       UndefIndex = I;
-      // Unguarded blocks end at their #undef. Guarded blocks keep scanning to
-      // the matching #endif so nested presence/guard pairs are handled.
+      // Unguarded blocks end at their last #undef. Guarded blocks keep
+      // scanning to the matching #endif so nested presence/guard pairs are
+      // handled.
       if (!SawConditional)
         break;
     }
   }
   if (!SawInclude || UndefIndex == StringRef::npos)
+    return false;
+
+  if (!Marked) {
+    for (const std::string &Arg : ParsedArgs)
+      if (Arg.empty())
+        return false;
+    Type = joinExplicitArgs(ParsedArgs);
+  }
+  if (Type.empty())
     return false;
 
   if (LastLine == StringRef::npos)
@@ -178,7 +218,7 @@ bool hasManualInstantiation(StringRef Content, const TemplateDef &Template,
   for (size_t I = 0; I < Lines.size(); ++I) {
     if (Lines[I].Begin < SkipUntil)
       continue;
-    StringRef Type;
+    std::string Type;
     size_t Begin, End;
     bool Marked = false;
     if (!findBlockAt(Lines, I, Template, Type, Begin, End, Marked))
@@ -277,19 +317,24 @@ std::string makeInstantiationBlock(
   Out += Presence;
   Out += '\n';
 
-  StringRef Param =
-      Template.Params.empty() ? StringRef("T") : Template.Params.front();
-  Out += "#define ";
-  Out += Param;
-  Out += ' ';
-  Out += TypeSpelling;
-  Out += '\n';
+  SmallVector<std::string, 4> Args;
+  splitExplicitArgs(TypeSpelling, Template, Args);
+  size_t Count = paramCount(Template);
+  for (size_t I = 0; I < Count && I < Args.size(); ++I) {
+    Out += "#define ";
+    Out += paramName(Template, I);
+    Out += ' ';
+    Out += Args[I];
+    Out += '\n';
+  }
   Out += "#include \"";
   Out += Template.IncludeFromGenDir;
   Out += "\"\n";
-  Out += "#undef ";
-  Out += Param;
-  Out += '\n';
+  for (size_t I = Count; I > 0; --I) {
+    Out += "#undef ";
+    Out += paramName(Template, I - 1);
+    Out += '\n';
+  }
   for (unsigned I = Guards.size(); I > 0; --I)
     Out += "#endif\n";
   Out += "#endif\n";
@@ -381,7 +426,7 @@ bool Instantiator::prune(ArrayRef<const TemplateDef *> Templates,
     for (const TemplateDef *Template : Templates) {
       if (!Template)
         continue;
-      StringRef Type;
+      std::string Type;
       size_t Begin, End;
       bool Marked = false;
       if (!findBlockAt(Lines, I, *Template, Type, Begin, End, Marked))
@@ -458,6 +503,14 @@ Instantiator::instantiate(const TemplateDef &Template, StringRef TypeSpelling,
                           std::string &Error, bool DryRun,
                           ArrayRef<DependencyGuard> ExtraGuards,
                           StringRef OutputHeader) {
+  SmallVector<std::string, 4> Args;
+  if (!splitExplicitArgs(TypeSpelling, Template, Args) ||
+      Args.size() != paramCount(Template)) {
+    Error = "expected " + std::to_string(paramCount(Template)) +
+            " type argument(s) for " + Template.Name;
+    return InstantiationResult::Error;
+  }
+
   std::lock_guard<std::mutex> Lock(Mutex);
   GenPath = OutputHeader.empty() ? Template.GeneratedHeader : OutputHeader.str();
 

@@ -42,10 +42,17 @@ bool parseDecorator(StringRef Line, TemplateDef &Out) {
     return false;
   S = S.ltrim();
 
-  if (S.consume_front("type")) {
-    if (!S.empty() && !isSpace(S.front()))
-      return false;
-    S = S.ltrim();
+  TemplateKind Kind = TemplateKind::Type;
+  size_t Word = 0;
+  while (Word < S.size() && isIdentChar(S[Word]))
+    ++Word;
+  if (S.starts_with("type") && Word == 4 &&
+      (S.size() == 4 || isSpace(S[4]))) {
+    S = S.drop_front(4).ltrim();
+  } else if (S.starts_with("function") && Word == 8 &&
+             (S.size() == 8 || isSpace(S[8]))) {
+    Kind = TemplateKind::Function;
+    S = S.drop_front(8).ltrim();
   }
 
   size_t I = 0;
@@ -53,11 +60,13 @@ bool parseDecorator(StringRef Line, TemplateDef &Out) {
     ++I;
   if (I == 0)
     return false;
+  Out.Kind = Kind;
   Out.Name = S.take_front(I).str();
   S = S.drop_front(I).ltrim();
   if (!S.consume_front("("))
     return false;
 
+  Out.Params.clear();
   size_t Close = S.find(')');
   if (Close == StringRef::npos)
     return false;
