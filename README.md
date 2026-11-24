@@ -14,6 +14,7 @@
   <a href="#generated-output">Generated output</a> &bull;
   <a href="#get-started">Get started</a> &bull;
   <a href="doc/USAGE.md">Usage</a> &bull;
+  <a href="doc/USAGE.md#stc-quick-start">STC quick start</a> &bull;
   <a href="doc/POLYMORPHISM.md">Polymorphism</a> &bull;
   <a href="doc/BUILD.md">Build</a> &bull;
   <a href="#benchmarks">Benchmarks</a>
@@ -29,6 +30,12 @@ c-autotmpl generates C template-style re-include headers. It runs as a small,
 fast ISO C99 command line tool, or as a clangd plugin that works while you write
 C code.
 
+First-class [STC](https://github.com/stclib/STC) support is opt-in. A thin
+wrapper keeps `vec(int)` and `vec_push(int)(...)` call sites, and adapters are
+generated from the operations your code uses. Start with
+[auto-detection](doc/USAGE.md#stc-quick-start), or list template names
+explicitly.
+
 ## Features
 
 | Feature | Description |
@@ -41,7 +48,7 @@ C code.
 | **Lexical HKTs** | Pass a template name as an argument, as in `User(Option, int)`. |
 | **Idempotent output** | Additive writes and stable markers make reruns safe in build scripts. |
 | **Type-aware guards** | User types use real include guards; scalar types are emitted bare. |
-| **Opt-in STC profile** | STC containers read like parametric types; container names and trait defaults are derived, while default templates stay unchanged. |
+| **First-class [STC](https://github.com/stclib/STC) support** | Thin wrappers and generated adapters make STC containers read like parametric types, while default templates stay unchanged. |
 
 
 ## Example
@@ -173,30 +180,31 @@ A bare registered type-template name is a constructor argument. For
 `User(Result, int)` emits `Result(int)` instead. There is no kind checking,
 only lexical application.
 
-### Opt-in STC profile
+### STC with thin adapters
 
-STC uses macro configuration instead of `#define T ...` re-include headers. A
-thin wrapper gives it one c-autotmpl decorator and keeps the call site
-parametric:
+c-autotmpl has first-class support for [STC](https://github.com/stclib/STC).
+A wrapper needs one decorator and one paste macro. The generated header adds
+configuration and thin adapter macros, so calls stay native STC calls with
+parametric types:
 
 ```c
-/* tmpl/stc_vec.h */
-// -- template stc_vec(T)
-#define stc_vec_CAT_I(A, B) A##B
-#define stc_vec_CAT(A, B) stc_vec_CAT_I(A, B)
-#define stc_vec(T) stc_vec_CAT(stc_vec_, T)
-#include <stc/cstr.h>
-#include <stc/vec.h>
+vec(int) nums = {0};
+vec_push(int)(&nums, 7);
 ```
 
-The preset also emits matching function-template adapters. Calls use the same
-parametric spelling as the type, such as `stc_vec_push(int)(&nums, 7)`, so no
-extra call macro is needed in the wrapper. Enable the preset with `--stc`,
-`--profile stc`, or `C_AUTOTMPL_PROFILE=stc`:
+There are two ways to opt in.
 
-```sh
-autotmpl --root . --stc src
-```
+1. **Auto-detection, recommended.** Set `C_AUTOTMPL_STC_AUTO=1` or pass
+   `--stc-auto`. A wrapper with an STC include or two STC configuration macros
+   is detected from its template header. No name list is needed.
+2. **Explicit template lists.** Set `C_AUTOTMPL_STC_TEMPLATES=vec,hashmap` or
+   pass `--stc-template vec` repeatedly. This opts in unprefixed wrapper names
+   that do not need auto-detection.
+
+Both paths select the static STC profile automatically. A profile can also be
+selected directly with `--stc` or `C_AUTOTMPL_PROFILE=stc`; without auto-detection
+or a name list it uses the `stc_*` prefix rule. `--profile none` wins over all
+STC opt-ins.
 
 Configuration can live in an `autotmpl.env` file that your Makefile includes
 and exports:
@@ -207,38 +215,29 @@ export C_AUTOTMPL_PROFILE C_AUTOTMPL_STC_TEMPLATES C_AUTOTMPL_STC_AUTO
 ```
 
 ```text
-# autotmpl.env
-C_AUTOTMPL_PROFILE=stc
-C_AUTOTMPL_STC_TEMPLATES=vec,hashmap
+# autotmpl.env, auto-detection path
+C_AUTOTMPL_STC_AUTO=1
+
+# explicit-list path instead
+# C_AUTOTMPL_STC_TEMPLATES=vec,hashmap
 ```
 
-`stc_vec(int)` and `stc_vec(cstr)` generate derived names such as `stc_vec_int`
-and `stc_vec_cstr`, then map the type parameter to `i_key`. Trait flags stay out
-of the call site. STC string types such as `cstr` get `c_pro_key | c_use_eq` as
-keys and `c_pro_val` as values. Plain types get no `i_traits` define. Key and
-value arguments keep the normal type rules, except STC-owned types such as
-`cstr` need no c-autotmpl include guard.
-
-Unprefixed wrappers are opt-in. List the template names you want the preset to
-own in `C_AUTOTMPL_STC_TEMPLATES`, or pass repeated `--stc-template vec`
-arguments. A name list with no profile selects static STC mode. Then `vec(int)`
-and `hashmap(int, int)` receive the same roles, and
-adapters are named `vec_push(int)(...)` and `hashmap_insert(int, int)(...)`.
 Adapters come from the call sites actually used in the current sources, so a
 future STC operation such as `vec_new_op(int)(...)` works without a generator
-update.
-
-For wrapper auto-detection, use `--stc-auto` or `C_AUTOTMPL_STC_AUTO=1`.
-Detection is conservative: an STC include or two STC configuration macros in
-the template header are required. It is off by default. Without an explicit
-list or auto-detection, only `stc_*`
-templates receive STC roles. Projects that do not enable a profile keep the
-original output.
+update. `stc_vec(int)` and `stc_vec(cstr)` generate derived names such as
+`stc_vec_int` and `stc_vec_cstr`, then map the type parameter to `i_key`. Trait
+flags stay out of the call site. STC string types such as `cstr` get
+`c_pro_key | c_use_eq` as keys and `c_pro_val` as values. Plain types get no
+`i_traits` define. Key and value arguments keep the normal type rules, except
+STC-owned types such as `cstr` need no c-autotmpl include guard.
 
 An explicit `Name` or `Flags` decorator parameter keeps the advanced override
 form, including `i_type` and `i_traits` passed from the call site. Static
 full-include mode is the default. `--profile stc-shared` also sets `i_header`
 in public blocks and `i_implement` in grouped implementation sources.
+
+The compile-checked wrapper, source, generated adapter, and build command are
+in [doc/USAGE.md](doc/USAGE.md#stc-quick-start).
 
 ## Get started
 
@@ -272,6 +271,7 @@ changes. Full instructions are in [doc/BUILD.md](doc/BUILD.md).
 | --- | --- |
 | [**Build guide**](doc/BUILD.md) | CLI build, clangd plugin build, loading, tests, and build errors. |
 | [**Usage guide**](doc/USAGE.md) | CLI options, template authoring, guards, nested types, and runtime behavior. |
+| [**STC quick start**](doc/USAGE.md#stc-quick-start) | Compile-checked STC wrappers, thin adapters, auto-detection, and explicit template lists. |
 | [**Polymorphism**](doc/POLYMORPHISM.md) | Generated functions, function templates, dispatch, and direct trait calls. |
 | [**Troubleshooting**](doc/TROUBLESHOOTING.md) | Common failures and fixes. |
 

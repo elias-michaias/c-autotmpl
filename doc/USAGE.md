@@ -46,22 +46,131 @@ export C_AUTOTMPL_PROFILE C_AUTOTMPL_STC_TEMPLATES C_AUTOTMPL_STC_AUTO
 ```
 
 ```text
+# autotmpl.env, auto-detection path
+C_AUTOTMPL_STC_AUTO=1
+
+# explicit-list path instead
+# C_AUTOTMPL_STC_TEMPLATES=vec,hashmap
+```
+
+The preferred STC path is auto-detection. `--stc-auto` or
+`C_AUTOTMPL_STC_AUTO=1` detects wrappers from their template headers. An STC
+include or two STC configuration macros are required. Auto-detection selects
+the static `stc` profile without a name list.
+
+The second path is an explicit template list. The CLI accepts repeated
+`--stc-template NAME` arguments, and `C_AUTOTMPL_STC_TEMPLATES` accepts a
+comma-separated list. A name list replaces the `stc_` prefix rule for that run;
+it does not change template files, and it also selects the static `stc` profile.
+
+A profile can be selected directly with `--stc` or `C_AUTOTMPL_PROFILE=stc`.
+Without auto-detection or a name list, only `stc_*` templates receive STC roles.
+`--profile none` still wins over all STC opt-ins.
+
+## STC quick start
+
+c-autotmpl has first-class support for [STC](https://github.com/stclib/STC)
+through thin adapters. A wrapper needs one decorator and one paste macro. The
+generated header adds STC configuration and adapter macros from the operations
+used in your sources. The snippets below compile as shown with STC headers on
+the include path.
+
+### Auto-detection first
+
+Set `C_AUTOTMPL_STC_AUTO=1` or pass `--stc-auto`. A wrapper that includes an STC
+header is detected in `tmpl/` or `templates/`; no name list is needed.
+
+```c
+/* tmpl/vec.h */
+// -- template vec(T)
+#define VEC_CAT_I(A, B) A##B
+#define VEC_CAT(A, B) VEC_CAT_I(A, B)
+#define vec(T) VEC_CAT(vec_, T)
+#include <stc/vec.h>
+```
+
+```text
 # autotmpl.env
-C_AUTOTMPL_PROFILE=stc
-C_AUTOTMPL_STC_TEMPLATES=vec,hashmap
 C_AUTOTMPL_STC_AUTO=1
 ```
 
-STC roles apply to templates whose names start with `stc_`, or to an explicit
-name list. The CLI accepts repeated `--stc-template NAME` arguments, and
-`C_AUTOTMPL_STC_TEMPLATES` accepts a comma-separated list. An explicit name
-list replaces the `stc_` prefix rule for that run; it does not change template
-files. A name list with no profile selects the static `stc` profile.
+```c
+/* src/main.c */
+#include "gen/vec.h"
 
-`--stc-auto` and `C_AUTOTMPL_STC_AUTO=1` detect wrappers from their template
-headers. An STC include or two STC configuration macros are required.
-Auto-detection is off by default and can be combined with a name list.
-`--profile none` still wins over all STC opt-ins.
+#include <stdio.h>
+
+int main(void) {
+  vec(int) nums = {0};
+
+  vec_push(int)(&nums, 7);
+  vec_push(int)(&nums, 9);
+
+  printf("%d %d\n", *vec_at(int)(&nums, 0), *vec_at(int)(&nums, 1));
+  vec_drop(int)(&nums);
+  return 0;
+}
+```
+
+With that file sourced and exported by a Makefile, generation is
+`autotmpl --root . src`. The direct shell equivalent is:
+
+```sh
+C_AUTOTMPL_STC_AUTO=1 autotmpl --root . src
+cc -I. -Ithird_party/stc/include -std=c11 -Wall -Wextra -Werror \
+  src/main.c -o demo
+./demo
+```
+
+Replace the second `-I` with your STC include path, or drop it if STC is
+installed system-wide. The program prints:
+
+```text
+7 9
+```
+
+The generated header is intentionally thin:
+
+```c
+#ifndef GEN_VEC_H
+#define GEN_VEC_H
+
+/* c-autotmpl: vec(int) */
+#ifndef C_AUTOTMPL_vec_int
+#define C_AUTOTMPL_vec_int
+#define i_type vec_int
+#define i_key int
+#ifndef C_AUTOTMPL_STC_ADAPTER_CAT
+#define C_AUTOTMPL_STC_ADAPTER_CAT_I(A, B) A##B
+#define C_AUTOTMPL_STC_ADAPTER_CAT(A, B) C_AUTOTMPL_STC_ADAPTER_CAT_I(A, B)
+#endif
+#define vec_at(...) C_AUTOTMPL_STC_ADAPTER_CAT(vec(__VA_ARGS__), _at)
+#define vec_drop(...) C_AUTOTMPL_STC_ADAPTER_CAT(vec(__VA_ARGS__), _drop)
+#define vec_push(...) C_AUTOTMPL_STC_ADAPTER_CAT(vec(__VA_ARGS__), _push)
+#include "../tmpl/vec.h"
+#undef i_key
+#undef i_type
+#endif
+
+#endif
+```
+
+`vec_push(int)(...)` pastes `vec(int)` to `vec_int`, then appends `_push`.
+Only operations found at call sites are emitted, so a new STC operation works
+without changing c-autotmpl.
+
+### Explicit template list second
+
+If you prefer naming wrappers, set `C_AUTOTMPL_STC_TEMPLATES=vec` or pass
+`--stc-template vec`. The same wrapper and source compile with:
+
+```sh
+C_AUTOTMPL_STC_TEMPLATES=vec autotmpl --root . src
+```
+
+An explicit list opts in unprefixed names even when the wrapper has no STC
+include. Without a list or auto-detection, only `stc_*` templates receive STC
+roles when an STC profile is active.
 
 A second run reports `added=0`. The CLI is additive and idempotent. It does not
 remove unused blocks.
