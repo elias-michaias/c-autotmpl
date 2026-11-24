@@ -41,6 +41,7 @@ C code.
 | **Lexical HKTs** | Pass a template name as an argument, as in `User(Option, int)`. |
 | **Idempotent output** | Additive writes and stable markers make reruns safe in build scripts. |
 | **Type-aware guards** | User types use real include guards; scalar types are emitted bare. |
+| **Opt-in STC profile** | STC containers read like parametric types; container names and trait defaults are derived, while default templates stay unchanged. |
 
 
 ## Example
@@ -97,8 +98,8 @@ c-autotmpl appends:
 
 ```c
 /* c-autotmpl: List(float) */
-#ifndef C_AUTOTMPL_LIST_FLOAT_...
-#define C_AUTOTMPL_LIST_FLOAT_...
+#ifndef C_AUTOTMPL_List_float
+#define C_AUTOTMPL_List_float
 #define T float
 #include "../tmpl/list.h"
 #undef T
@@ -107,7 +108,8 @@ c-autotmpl appends:
 
 The marker drives idempotency and pruning. The presence macro lets the same
 nested instantiation appear in more than one generated header without duplicate
-definitions.
+definitions. Its name follows the marker directly, so it is reproducible by hand.
+Punctuation is written as `_HH` to keep different spellings distinct.
 
 User-defined types need a traditional include guard such as `FOO_H`. Builtin and
 fixed-width scalar types are emitted without a guard. `#pragma once` is not
@@ -147,8 +149,8 @@ call site. For `// -- template function convert(From, To)`, a usage of
 
 ```c
 /* c-autotmpl: convert(int, float) */
-#ifndef C_AUTOTMPL_CONVERT_INT__FLOAT_...
-#define C_AUTOTMPL_CONVERT_INT__FLOAT_...
+#ifndef C_AUTOTMPL_convert_int_2C_20float
+#define C_AUTOTMPL_convert_int_2C_20float
 #define From int
 #define To float
 #include "../tmpl/convert.h"
@@ -170,6 +172,73 @@ A bare registered type-template name is a constructor argument. For
 `Option`, lexes the substituted header, and emits `Option(int)` first.
 `User(Result, int)` emits `Result(int)` instead. There is no kind checking,
 only lexical application.
+
+### Opt-in STC profile
+
+STC uses macro configuration instead of `#define T ...` re-include headers. A
+thin wrapper gives it one c-autotmpl decorator and keeps the call site
+parametric:
+
+```c
+/* tmpl/stc_vec.h */
+// -- template stc_vec(T)
+#define stc_vec_CAT_I(A, B) A##B
+#define stc_vec_CAT(A, B) stc_vec_CAT_I(A, B)
+#define stc_vec(T) stc_vec_CAT(stc_vec_, T)
+#include <stc/cstr.h>
+#include <stc/vec.h>
+```
+
+The preset also emits matching function-template adapters. Calls use the same
+parametric spelling as the type, such as `stc_vec_push(int)(&nums, 7)`, so no
+extra call macro is needed in the wrapper. Enable the preset with `--stc`,
+`--profile stc`, or `C_AUTOTMPL_PROFILE=stc`:
+
+```sh
+autotmpl --root . --stc src
+```
+
+Configuration can live in an `autotmpl.env` file that your Makefile includes
+and exports:
+
+```make
+-include autotmpl.env
+export C_AUTOTMPL_PROFILE C_AUTOTMPL_STC_TEMPLATES C_AUTOTMPL_STC_AUTO
+```
+
+```text
+# autotmpl.env
+C_AUTOTMPL_PROFILE=stc
+C_AUTOTMPL_STC_TEMPLATES=vec,hashmap
+```
+
+`stc_vec(int)` and `stc_vec(cstr)` generate derived names such as `stc_vec_int`
+and `stc_vec_cstr`, then map the type parameter to `i_key`. Trait flags stay out
+of the call site. STC string types such as `cstr` get `c_pro_key | c_use_eq` as
+keys and `c_pro_val` as values. Plain types get no `i_traits` define. Key and
+value arguments keep the normal type rules, except STC-owned types such as
+`cstr` need no c-autotmpl include guard.
+
+Unprefixed wrappers are opt-in. List the template names you want the preset to
+own in `C_AUTOTMPL_STC_TEMPLATES`, or pass repeated `--stc-template vec`
+arguments. A name list with no profile selects static STC mode. Then `vec(int)`
+and `hashmap(int, int)` receive the same roles, and
+adapters are named `vec_push(int)(...)` and `hashmap_insert(int, int)(...)`.
+Adapters come from the call sites actually used in the current sources, so a
+future STC operation such as `vec_new_op(int)(...)` works without a generator
+update.
+
+For wrapper auto-detection, use `--stc-auto` or `C_AUTOTMPL_STC_AUTO=1`.
+Detection is conservative: an STC include or two STC configuration macros in
+the template header are required. It is off by default. Without an explicit
+list or auto-detection, only `stc_*`
+templates receive STC roles. Projects that do not enable a profile keep the
+original output.
+
+An explicit `Name` or `Flags` decorator parameter keeps the advanced override
+form, including `i_type` and `i_traits` passed from the call site. Static
+full-include mode is the default. `--profile stc-shared` also sets `i_header`
+in public blocks and `i_implement` in grouped implementation sources.
 
 ## Get started
 

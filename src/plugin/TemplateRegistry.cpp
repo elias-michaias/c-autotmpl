@@ -28,6 +28,22 @@ bool isSpace(char C) {
          C == '\v';
 }
 
+StringRef stripStcQualifiers(StringRef S) {
+  S = S.trim();
+  bool Changed = true;
+  while (Changed) {
+    Changed = false;
+    for (StringRef Q : {"const", "volatile", "restrict", "struct", "union",
+                        "enum"}) {
+      if (S.consume_front(Q)) {
+        S = S.trim();
+        Changed = true;
+      }
+    }
+  }
+  return S;
+}
+
 bool parseDecorator(StringRef Line, TemplateDef &Out) {
   StringRef S = Line.ltrim();
   if (!S.consume_front("//"))
@@ -199,7 +215,82 @@ bool hasTmplHeaderGuard(StringRef Buffer) {
   return false;
 }
 
+ArgSpec stcArgSpec(StringRef Param) {
+  struct Mapping {
+    StringRef Name;
+    ArgRole Role;
+    const char *Macro;
+  };
+  static const Mapping Mappings[] = {
+      {"Name", ArgRole::Name, "i_type"},
+      {"Container", ArgRole::Name, "i_type"},
+      {"Ct", ArgRole::Name, "i_type"},
+      {"Key", ArgRole::Key, "i_key"},
+      {"K", ArgRole::Key, "i_key"},
+      {"Elem", ArgRole::Key, "i_key"},
+      {"Element", ArgRole::Key, "i_key"},
+      {"T", ArgRole::Key, "i_key"},
+      {"Val", ArgRole::Value, "i_val"},
+      {"Value", ArgRole::Value, "i_val"},
+      {"V", ArgRole::Value, "i_val"},
+      {"Traits", ArgRole::Flags, "i_traits"},
+      {"Flags", ArgRole::Flags, "i_traits"},
+      {"Opts", ArgRole::Flags, "i_traits"},
+      {"Options", ArgRole::Flags, "i_traits"},
+      {"Alloc", ArgRole::Opaque, "i_allocator"},
+      {"Allocator", ArgRole::Opaque, "i_allocator"},
+      {"Cap", ArgRole::Opaque, "i_capacity"},
+      {"Capacity", ArgRole::Opaque, "i_capacity"},
+  };
+  for (const Mapping &M : Mappings)
+    if (Param == M.Name)
+      return {M.Role, M.Macro};
+  return {ArgRole::Type, Param.str()};
+}
+
 } // namespace
+
+bool isTypeArgument(const TemplateDef &Template, size_t Index) {
+  if (Index >= Template.ArgSpecs.size())
+    return true;
+  ArgRole Role = Template.ArgSpecs[Index].Role;
+  return Role == ArgRole::Type || Role == ArgRole::Key ||
+         Role == ArgRole::Value;
+}
+
+StringRef parameterName(const TemplateDef &Template, size_t Index) {
+  if (Index < Template.Params.size())
+    return Template.Params[Index];
+  return StringRef("T");
+}
+
+StringRef argumentMacroName(const TemplateDef &Template, size_t Index) {
+  if (Index < Template.ArgSpecs.size() &&
+      !Template.ArgSpecs[Index].Macro.empty())
+    return Template.ArgSpecs[Index].Macro;
+  return parameterName(Template, Index);
+}
+
+bool isStcPreset(const TemplateDef &Template) {
+  return Template.Preset == TemplatePreset::StcStatic ||
+         Template.Preset == TemplatePreset::StcShared;
+}
+
+bool parsePresetName(StringRef Name, TemplatePreset &Out) {
+  if (Name == "none") {
+    Out = TemplatePreset::None;
+    return true;
+  }
+  if (Name == "stc" || Name == "stc-static") {
+    Out = TemplatePreset::StcStatic;
+    return true;
+  }
+  if (Name == "stc-shared") {
+    Out = TemplatePreset::StcShared;
+    return true;
+  }
+  return false;
+}
 
 std::string makeAbsolute(StringRef Path) {
   SmallString<256> P(Path);
@@ -332,6 +423,128 @@ void TemplateRegistry::scanPreferTemplateDirs(StringRef Root) {
   // conventional directories contain no decorators.
   scanTree(Root);
   finishScan();
+}
+
+bool looksLikeStcHeader(const TemplateDef &Template) {
+  auto Buffer = MemoryBuffer::getFile(Template.Header, /*IsText=*/true);
+  if (!Buffer)
+    return false;
+  StringRef Content = (*Buffer)->getBuffer();
+  static const char *Markers[] = {"i_key",       "i_val",       "i_type",
+                                  "i_traits",    "i_implement", "i_header",
+                                  "i_capacity",  "i_allocator"};
+  int Score = Content.contains("stc/") ? 2 : 0;
+  for (const char *Marker : Markers)
+    if (Content.contains(Marker))
+      ++Score;
+  return Score >= 2;
+}
+
+void TemplateRegistry::applyPreset(TemplatePreset Preset,
+                                   ArrayRef<StringRef> Names, bool Auto) {
+  auto Selected = [&](const TemplateDef &Def) {
+    if (Auto && looksLikeStcHeader(Def))
+      return true;
+    if (Names.empty())
+      return StringRef(Def.Name).starts_with("stc_");
+    for (StringRef Name : Names)
+      if (Name == Def.Name)
+        return true;
+    return false;
+  };
+  for (auto &OwnedDef : Owned) {
+    OwnedDef->ArgSpecs.clear();
+    if (Preset == TemplatePreset::None || !Selected(*OwnedDef)) {
+      OwnedDef->Preset = TemplatePreset::None;
+      continue;
+    }
+    OwnedDef->Preset = Preset;
+    size_t Count = OwnedDef->Params.empty() ? 1 : OwnedDef->Params.size();
+    for (size_t I = 0; I < Count; ++I)
+      OwnedDef->ArgSpecs.push_back(
+          stcArgSpec(parameterName(*OwnedDef, I)));
+  }
+}
+
+bool usesDerivedStcNames(const TemplateDef &Template) {
+  if (!isStcPreset(Template))
+    return false;
+  for (const ArgSpec &Spec : Template.ArgSpecs)
+    if (Spec.Role == ArgRole::Name || Spec.Role == ArgRole::Flags ||
+        Spec.Role == ArgRole::Opaque)
+      return false;
+  return true;
+}
+
+bool isStcBuiltinType(StringRef Spelling) {
+  StringRef Name = stripStcQualifiers(Spelling);
+  static const char *Names[] = {"cstr",    "csview",     "csviewz",
+                                "zsview",  "cstr_buf",   "cstr_raw",
+                                "cstr_value", "csview_value", "csviewz_value",
+                                "cbits",   "coption",    "cbox",
+                                "carc",    "crc"};
+  for (const char *Builtin : Names)
+    if (Name == Builtin)
+      return true;
+  return false;
+}
+
+static bool isStcStringType(StringRef Spelling) {
+  StringRef Name = stripStcQualifiers(Spelling);
+  return Name == "cstr" || Name == "csview" || Name == "csviewz" ||
+         Name == "zsview";
+}
+
+std::string stcContainerName(const TemplateDef &Template,
+                             ArrayRef<std::string> Args) {
+  static const char Hex[] = "0123456789ABCDEF";
+  std::string Out = Template.Name;
+  for (const std::string &Raw : Args) {
+    StringRef Arg = StringRef(Raw).trim();
+    Out += '_';
+    for (char C : Arg) {
+      unsigned char Byte = static_cast<unsigned char>(C);
+      if (isIdentChar(C)) {
+        Out += C;
+      } else {
+        Out += '_';
+        Out += Hex[Byte >> 4];
+        Out += Hex[Byte & 0xF];
+      }
+    }
+  }
+  return Out;
+}
+
+std::string stcTraits(const TemplateDef &Template,
+                      ArrayRef<std::string> Args) {
+  if (!usesDerivedStcNames(Template))
+    return {};
+  bool Key = false, Value = false;
+  for (size_t I = 0; I < Args.size(); ++I) {
+    if (!isStcStringType(Args[I]))
+      continue;
+    ArgRole Role = I < Template.ArgSpecs.size() ? Template.ArgSpecs[I].Role
+                                                : ArgRole::Type;
+    if (Role == ArgRole::Value)
+      Value = true;
+    else
+      Key = true;
+  }
+  if (!Key && !Value)
+    return {};
+  std::string Out = "(";
+  if (Key)
+    Out += "c_pro_key";
+  if (Value) {
+    if (Key)
+      Out += " | ";
+    Out += "c_pro_val";
+  }
+  if (Key)
+    Out += " | c_use_eq";
+  Out += ')';
+  return Out;
 }
 
 std::string findIncludeGuard(StringRef Path) {

@@ -189,6 +189,94 @@ SmallString<256> findRoot(StringRef MainFile) {
   return SmallString<256>(makeAbsolute(sys::path::parent_path(MainFile)));
 }
 
+struct StcConfig {
+  TemplatePreset Preset = TemplatePreset::None;
+  std::string Name;
+  std::vector<std::string> Templates;
+  bool Auto = false;
+};
+
+static void addUniqueName(std::vector<std::string> &Out, StringRef Name) {
+  Name = Name.trim();
+  if (Name.empty())
+    return;
+  if (std::find(Out.begin(), Out.end(), Name.str()) == Out.end())
+    Out.push_back(Name.str());
+}
+
+static bool parseBoolName(StringRef Text, bool &Out) {
+  Text = Text.trim();
+  if (Text == "1" || Text.equals_insensitive("true") || Text.equals_insensitive("yes") ||
+      Text.equals_insensitive("on")) {
+    Out = true;
+    return true;
+  }
+  if (Text == "0" || Text.equals_insensitive("false") || Text.equals_insensitive("no") ||
+      Text.equals_insensitive("off")) {
+    Out = false;
+    return true;
+  }
+  return false;
+}
+
+static void addNameList(StringRef Text, std::vector<std::string> &Out) {
+  size_t I = 0;
+  while (I < Text.size()) {
+    while (I < Text.size() &&
+           (Text[I] == ',' || StringRef(Text.substr(I, 1)).trim().empty()))
+      ++I;
+    size_t Begin = I;
+    while (I < Text.size() && Text[I] != ',' &&
+           !StringRef(Text.substr(I, 1)).trim().empty())
+      ++I;
+    if (I > Begin)
+      addUniqueName(Out, Text.substr(Begin, I - Begin));
+  }
+}
+
+/// Configuration comes only from environment variables. Projects can source
+/// an autotmpl.env file before launching clangd or the CLI. An absent or
+/// unknown value leaves the original behavior unchanged.
+StcConfig resolvePreset() {
+  StcConfig Result;
+  auto TryName = [&](StringRef Name, TemplatePreset &ParsedOut) {
+    TemplatePreset Parsed;
+    if (!Name.empty() && parsePresetName(Name.trim(), Parsed)) {
+      Result.Name = Name.trim().str();
+      ParsedOut = Parsed;
+      return true;
+    }
+    return false;
+  };
+
+  bool ProfileChosen = false;
+  TemplatePreset ParsedProfile = TemplatePreset::None;
+  if (auto Env = sys::Process::GetEnv("C_AUTOTMPL_PROFILE")) {
+    if (TryName(*Env, ParsedProfile)) {
+      Result.Preset = ParsedProfile;
+      ProfileChosen = true;
+    }
+  }
+
+  if (auto Env = sys::Process::GetEnv("C_AUTOTMPL_STC_TEMPLATES"))
+    addNameList(*Env, Result.Templates);
+
+  if (auto Env = sys::Process::GetEnv("C_AUTOTMPL_STC_AUTO")) {
+    if (!parseBoolName(*Env, Result.Auto))
+      Result.Auto = false;
+  }
+
+  if ((!Result.Templates.empty() || Result.Auto) && !ProfileChosen) {
+    Result.Preset = TemplatePreset::StcStatic;
+    Result.Name = "stc";
+  }
+  return Result;
+}
+
+bool skipsStcGuard(const TemplateDef &Template, StringRef Arg) {
+  return isStcPreset(Template) && isStcBuiltinType(Arg);
+}
+
 SmallString<64> argString(const clang::Diagnostic &Info, unsigned Idx) {
   if (Info.getNumArgs() <= Idx)
     return {};
@@ -324,6 +412,7 @@ struct SharedState {
 
   std::mutex UsageMutex;
   std::string Root;
+  std::string ProfileName;
   llvm::StringMap<UsageFile> UsageCache;
   llvm::StringMap<llvm::StringSet<>> Wanted;
   llvm::StringMap<llvm::StringSet<>> WantedImpl;
@@ -350,7 +439,26 @@ struct SharedState {
     auto Start = std::chrono::steady_clock::now();
 
     Root = findRoot(MainFile).str();
+    StcConfig Config = resolvePreset();
+    ProfileName = Config.Name;
     Registry.scanPreferTemplateDirs(Root);
+    SmallVector<StringRef, 4> Names;
+    for (const std::string &Name : Config.Templates)
+      Names.push_back(Name);
+    Registry.applyPreset(Config.Preset, Names, Config.Auto);
+    if (!ProfileName.empty())
+      log("using profile " + ProfileName);
+    if (!Config.Templates.empty()) {
+      std::string NameList;
+      for (const std::string &Name : Config.Templates) {
+        if (!NameList.empty())
+          NameList += ',';
+        NameList += Name;
+      }
+      log("using stc templates " + NameList);
+    }
+    if (Config.Auto)
+      log("using stc auto=1");
     // Type guards are indexed lazily from the types actually used in the open
     // buffer. Scanning every unrelated header here would delay first parse.
     for (const auto &Def : Registry.templates()) {
@@ -382,7 +490,12 @@ struct SharedState {
     std::lock_guard<std::mutex> Lock(TypesMutex);
     bool Added = false;
     for (const FoundUsage &Usage : Usages) {
-      for (const std::string &Arg : Usage.Args) {
+      for (size_t I = 0; I < Usage.Args.size(); ++I) {
+        if (!isTypeArgument(*Usage.Template, I))
+          continue;
+        const std::string &Arg = Usage.Args[I];
+        if (skipsStcGuard(*Usage.Template, Arg))
+          continue;
         if (!needsIncludeGuard(Arg) || isGeneratedType(Arg) ||
             isTemplateConstructorArgument(Arg, Registry))
           continue;
@@ -777,6 +890,10 @@ struct SharedState {
   void generateUsages(ArrayRef<FoundUsage> Usages,
                       clang::CompilerInstance *CI) {
     generateImplUsages(Usages, CI);
+    llvm::StringMap<llvm::StringSet<>> AdapterOps;
+    for (const FoundUsage &Usage : Usages)
+      if (!Usage.AdapterOp.empty())
+        AdapterOps[Usage.Template->Name].insert(Usage.AdapterOp);
     for (size_t I = 0; I < Usages.size(); ++I) {
       if (Usages[I].IsNested)
         continue;
@@ -786,13 +903,14 @@ struct SharedState {
       SmallVector<const FoundUsage *, 8> Chain;
       for (size_t J = Begin; J <= I; ++J)
         Chain.push_back(&Usages[J]);
-      generateChain(Chain, CI);
+      generateChain(Chain, CI, nullptr, AdapterOps);
     }
   }
 
   bool generateChain(ArrayRef<const FoundUsage *> Chain,
                      clang::CompilerInstance *CI,
-                     std::string *GenPathOut = nullptr) {
+                     std::string *GenPathOut = nullptr,
+                     const llvm::StringMap<llvm::StringSet<>> &AdapterOps = {}) {
     if (Chain.empty())
       return false;
     const std::string OutputHeader = Chain.back()->Template->GeneratedHeader;
@@ -800,13 +918,14 @@ struct SharedState {
       *GenPathOut = OutputHeader;
     bool Added = false;
     for (const FoundUsage *Usage : Chain) {
-      Added |= generateInto(*Usage, OutputHeader, CI, Chain);
+      Added |= generateInto(*Usage, OutputHeader, CI, Chain, AdapterOps);
       // Keep the dependency's own generated header up to date as well. The
       // presence macro makes the two copies harmless, and it guarantees the
       // header exists for sources that include it before this one.
       if (Usage != Chain.back() &&
           Usage->Template->GeneratedHeader != OutputHeader)
-        Added |= generateInto(*Usage, Usage->Template->GeneratedHeader, CI, {});
+        Added |= generateInto(*Usage, Usage->Template->GeneratedHeader, CI, {},
+                              AdapterOps);
     }
     return Added;
   }
@@ -815,9 +934,20 @@ struct SharedState {
   /// template when this is a nested dependency.
   bool generateInto(const FoundUsage &Usage, StringRef OutputHeader,
                     clang::CompilerInstance *CI,
-                    ArrayRef<const FoundUsage *> Chain) {
+                    ArrayRef<const FoundUsage *> Chain,
+                    const llvm::StringMap<llvm::StringSet<>> &AdapterOps) {
+    SmallVector<StringRef, 4> Ops;
+    auto OpIt = AdapterOps.find(Usage.Template->Name);
+    if (OpIt != AdapterOps.end())
+      for (const auto &Entry : OpIt->second)
+        Ops.push_back(Entry.getKey());
+    std::string AdapterError;
+    bool AdaptersAdded =
+        Inst.ensureAdapters(*Usage.Template, Ops, OutputHeader, AdapterError);
+    if (!AdapterError.empty())
+      log(std::string("failed adapters: ") + AdapterError);
     if (Inst.has(*Usage.Template, Usage.TypeSpelling, OutputHeader))
-      return false;
+      return AdaptersAdded;
 
     SmallVector<DependencyGuard, 2> Guards;
     dependencyGuards(Usage, OutputHeader, Chain, Guards);
@@ -825,8 +955,11 @@ struct SharedState {
     SmallVector<std::string, 4> TypeGuards;
     llvm::StringSet<> SeenTypeGuards;
     bool MissingGuard = false;
-    for (const std::string &Arg : Usage.Args)
-      MissingGuard |= !collectTypeGuard(Arg, CI, 0, SeenTypeGuards, TypeGuards);
+    for (size_t I = 0; I < Usage.Args.size(); ++I)
+      if (isTypeArgument(*Usage.Template, I) &&
+          !skipsStcGuard(*Usage.Template, Usage.Args[I]))
+        MissingGuard |=
+            !collectTypeGuard(Usage.Args[I], CI, 0, SeenTypeGuards, TypeGuards);
     if (MissingGuard) {
       warnNoGuardOnce(Usage.Template->Name, Usage.TypeSpelling);
       return false;
@@ -841,9 +974,9 @@ struct SharedState {
     }
 
     std::string GenPath, Error;
-    InstantiationResult Result =
-        Inst.instantiate(*Usage.Template, Usage.TypeSpelling, "", GenPath,
-                         Error, /*DryRun=*/false, Guards, OutputHeader);
+    InstantiationResult Result = Inst.instantiate(
+        *Usage.Template, Usage.TypeSpelling, "", GenPath, Error,
+        /*DryRun=*/false, Guards, OutputHeader, Ops);
     if (Result == InstantiationResult::Error) {
       log(std::string("failed: ") + Error);
       return false;
@@ -853,7 +986,7 @@ struct SharedState {
           Usage.TypeSpelling + ") in " + GenPath);
       return true;
     }
-    return false;
+    return AdaptersAdded;
   }
 
   bool isGeneratedType(StringRef Spelling) const {
@@ -893,6 +1026,37 @@ struct SharedState {
       return false;
     if (Seen.insert(Guard).second)
       Guards.push_back(std::move(Guard));
+    return true;
+  }
+
+  /// True when the generated block exists and all of its conditional guards
+  /// are satisfied in the current parse. Used to tell a stale-parse diagnostic
+  /// from a real missing include or unsatisfied type guard.
+  bool blockIsUsable(const FoundUsage &Usage, StringRef OutputHeader,
+                     ArrayRef<const FoundUsage *> Chain,
+                     clang::CompilerInstance &CI) {
+    if (!Inst.has(*Usage.Template, Usage.TypeSpelling, OutputHeader))
+      return false;
+
+    SmallVector<DependencyGuard, 2> Deps;
+    dependencyGuards(Usage, OutputHeader, Chain, Deps);
+    StringSet<> Seen;
+    SmallVector<std::string, 4> Guards;
+    for (const DependencyGuard &Dep : Deps)
+      if (Seen.insert(Dep.Guard).second)
+        Guards.push_back(Dep.Guard);
+
+    bool MissingGuard = false;
+    for (size_t I = 0; I < Usage.Args.size(); ++I)
+      if (isTypeArgument(*Usage.Template, I) &&
+          !skipsStcGuard(*Usage.Template, Usage.Args[I]))
+        MissingGuard |= !collectTypeGuard(Usage.Args[I], &CI, 0, Seen, Guards);
+    if (MissingGuard)
+      return false;
+
+    for (const std::string &Guard : Guards)
+      if (!CI.getPreprocessor().isMacroDefined(Guard))
+        return false;
     return true;
   }
 
@@ -955,10 +1119,11 @@ struct SharedState {
       SmallVector<std::string, 4> Guards;
       SmallVector<std::string, 4> Headers;
       bool MissingGuard = false;
-      for (const std::string &Arg : Usage.Args)
-        MissingGuard |=
-            !collectImplArg(Arg, CI, 0, SeenGuards, SeenHeaders, Guards,
-                            Headers);
+      for (size_t I = 0; I < Usage.Args.size(); ++I)
+        if (isTypeArgument(Template, I) &&
+            !skipsStcGuard(Template, Usage.Args[I]))
+          MissingGuard |= !collectImplArg(Usage.Args[I], CI, 0, SeenGuards,
+                                          SeenHeaders, Guards, Headers);
       if (MissingGuard) {
         warnNoGuardOnce(Template.Name, Usage.TypeSpelling);
         continue;
@@ -1084,24 +1249,47 @@ public:
     State->generateChain(Chain, CI, &GenPath);
     State->generateImplUsages(Usages, CI);
     State->writeImplMakefile();
-    addIncludeFix(SM, Outer.Template->Name, GenPath, D);
+    bool IncludePresent = sourceIncludesGeneratedHeader(SM, GenPath);
+    addIncludeFix(SM, Outer.Template->Name, GenPath, D, IncludePresent);
+
+    // A generated header can be written after clangd has already started this
+    // parse, leaving the AST stale for one pass. If the source already includes
+    // the header and the new block is active under the current preprocessor,
+    // the reparse will resolve this diagnostic. Drop it so the editor never
+    // flashes red. Without the include, keep the diagnostic and its fix.
+    if (IncludePresent && !GenPath.empty() &&
+        State->blockIsUsable(Outer,
+                             Chain.back()->Template->GeneratedHeader, Chain,
+                             *CI)) {
+      log("suppressed transient diagnostic for " + Outer.Template->Name + "(" +
+          Outer.TypeSpelling + ")");
+      D.Severity = DiagnosticsEngine::Ignored;
+    }
   }
 
 private:
-  void addIncludeFix(const clang::SourceManager &SM, StringRef TemplateName,
-                     StringRef GenPath, Diag &D) {
-    if (MainFile.empty() || AddedInclude)
-      return;
-
+  bool sourceIncludesGeneratedHeader(const clang::SourceManager &SM,
+                                     StringRef GenPath) const {
+    if (MainFile.empty() || GenPath.empty())
+      return false;
     std::string Rel =
         computeRelativePath(sys::path::parent_path(MainFile), GenPath);
     bool Invalid = false;
     StringRef Buffer = SM.getBufferData(SM.getMainFileID(), &Invalid);
-    if (Invalid || Buffer.contains(Rel)) {
+    return !Invalid && (Buffer.contains(Rel) || Buffer.contains(GenPath));
+  }
+
+  void addIncludeFix(const clang::SourceManager &SM, StringRef TemplateName,
+                     StringRef GenPath, Diag &D, bool IncludePresent) {
+    if (MainFile.empty() || AddedInclude)
+      return;
+    if (IncludePresent) {
       AddedInclude = true;
       return;
     }
 
+    std::string Rel =
+        computeRelativePath(sys::path::parent_path(MainFile), GenPath);
     TextEdit Edit;
     Edit.range.start = Position{0, 0};
     Edit.range.end = Position{0, 0};

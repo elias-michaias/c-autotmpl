@@ -13,12 +13,332 @@ def write(path, text):
         f.write(text)
 
 
+CONFIG_KEYS = (
+    "C_AUTOTMPL_PROFILE",
+    "C_AUTOTMPL_STC_TEMPLATES",
+    "C_AUTOTMPL_STC_AUTO",
+)
+
+
+def env_with(**overrides):
+    env = dict(os.environ)
+    for key in CONFIG_KEYS:
+        env.pop(key, None)
+    env.update(overrides)
+    return env
+
+
 def require(condition, message, output=""):
     if not condition:
         print(message, file=sys.stderr)
         if output:
             print(output, file=sys.stderr)
         raise SystemExit(1)
+
+
+def check_stc_profile(cli, mode):
+    root = tempfile.mkdtemp(prefix="c-autotmpl-stc-")
+    try:
+        os.makedirs(os.path.join(root, "tmpl"))
+        os.makedirs(os.path.join(root, "gen"))
+        write(os.path.join(root, "tmpl", "stc_vec.h"), """\
+// -- template stc_vec(T)
+#define STC_VEC_CAT_I(A, B) A##B
+#define STC_VEC_CAT(A, B) STC_VEC_CAT_I(A, B)
+#define stc_vec(T) STC_VEC_CAT(stc_vec_, T)
+#ifndef STC_TEST_CSTR
+#define STC_TEST_CSTR
+typedef char cstr;
+#endif
+typedef struct { i_key value; } i_type;
+""")
+        write(os.path.join(root, "tmpl", "stc_hashmap.h"), """\
+// -- template stc_hashmap(Key, Val)
+#define STC_HASHMAP_JOIN_I(A, B) A##B
+#define STC_HASHMAP_JOIN(A, B) STC_HASHMAP_JOIN_I(A, B)
+#define STC_HASHMAP_TYPE_I(A, B, C) A##B##C
+#define STC_HASHMAP_TYPE(A, B, C) STC_HASHMAP_TYPE_I(A, B, C)
+#define stc_hashmap(Key, Val) \\
+  STC_HASHMAP_TYPE(stc_hashmap_, Key, STC_HASHMAP_JOIN(_, Val))
+#ifndef STC_TEST_CSTR
+#define STC_TEST_CSTR
+typedef char cstr;
+#endif
+typedef struct { i_key key; i_val value; } i_type;
+""")
+        write(os.path.join(root, "foo.h"), """\
+#ifndef FOO_H
+#define FOO_H
+typedef struct { int x; } Foo;
+#endif
+""")
+        write(os.path.join(root, "main.c"), """\
+#include "foo.h"
+#include "gen/stc_hashmap.h"
+#include "gen/stc_vec.h"
+
+static inline void stc_vec_Foo_push(stc_vec(Foo) *v, int x) {
+  v->value.x = x;
+}
+
+int main(void) {
+  stc_vec(Foo) v = {{0}};
+  stc_vec_push(Foo)(&v, 7);
+  stc_vec(cstr) s = {'a'};
+  stc_hashmap(Foo, cstr) m = {{9}, 'b'};
+  return v.value.x == 7 && s.value == 'a' && m.key.x == 9 &&
+                 m.value == 'b' ? 0 : 1;
+}
+""")
+        args = [cli, "--root", root, "--verbose"]
+        env = env_with()
+        if mode == "env":
+            env["C_AUTOTMPL_PROFILE"] = "stc"
+        elif mode == "profile":
+            args += ["--profile", "stc"]
+        else:
+            args += ["--stc"]
+        args.append(os.path.join(root, "main.c"))
+        proc = subprocess.run(args, cwd=root, capture_output=True, text=True,
+                              env=env)
+        output = proc.stdout + proc.stderr
+        require(proc.returncode == 0, "STC profile run exited with error",
+                output)
+        require("generated stc_vec(Foo)" in output,
+                "derived STC usage was not generated", output)
+        require("generated stc_hashmap(Foo, cstr)" in output,
+                "derived STC value usage was not generated", output)
+        require("no traditional include guard" not in output,
+                "derived STC type was guard-checked incorrectly", output)
+
+        rerun = subprocess.run(args, cwd=root, capture_output=True, text=True,
+                               env=env)
+        require(rerun.returncode == 0 and "added=0" in rerun.stdout + rerun.stderr,
+                "STC profile output was not idempotent", rerun.stdout + rerun.stderr)
+
+        with open(os.path.join(root, "gen", "stc_vec.h")) as f:
+            content = f.read()
+        for needle in ("/* c-autotmpl: stc_vec(Foo) */",
+                       "#ifndef C_AUTOTMPL_stc_vec_Foo",
+                       "#ifdef FOO_H",
+                       "#define i_type stc_vec_Foo",
+                       "#define i_key Foo",
+                       "#define stc_vec_push(...) "
+                       "C_AUTOTMPL_STC_ADAPTER_CAT(stc_vec(__VA_ARGS__), _push)",
+                       "#undef i_key\n#undef i_type",
+                       "/* c-autotmpl: stc_vec(cstr) */",
+                       "#define i_type stc_vec_cstr",
+                       "#define i_key cstr",
+                       "#define i_traits (c_pro_key | c_use_eq)",
+                       "#undef i_traits\n#undef i_key\n#undef i_type"):
+            require(needle in content, "missing STC preset text: " + needle,
+                    content)
+        require("#define T Foo" not in content,
+                "STC preset leaked the legacy parameter macro", content)
+        require(content.count("#define i_traits") == 1,
+                "STC preset added traits to a plain type", content)
+        require(content.count("/* c-autotmpl: stc_vec(Foo) */") == 1,
+                "STC profile duplicated an existing block", content)
+
+        with open(os.path.join(root, "gen", "stc_hashmap.h")) as f:
+            map_content = f.read()
+        for needle in ("/* c-autotmpl: stc_hashmap(Foo, cstr) */",
+                       "#define i_type stc_hashmap_Foo_cstr",
+                       "#define i_key Foo",
+                       "#define i_val cstr",
+                       "#define i_traits (c_pro_val)",
+                       "#undef i_traits\n#undef i_val\n#undef i_key\n#undef i_type"):
+            require(needle in map_content,
+                    "missing STC map preset text: " + needle, map_content)
+
+        compiler = os.environ.get("CC") or next(
+            (name for name in ("cc", "gcc", "clang") if shutil.which(name)),
+            None,
+        )
+        if compiler:
+            built = subprocess.run(
+                [compiler, "-std=c99", "-Wall", "-Wextra", "-Werror",
+                 "main.c", "-o", "stc-demo"],
+                cwd=root, capture_output=True, text=True,
+            )
+            build_output = built.stdout + built.stderr
+            require(built.returncode == 0,
+                    "STC profile output did not compile", build_output)
+            ran = subprocess.run([os.path.join(root, "stc-demo")], cwd=root)
+            require(ran.returncode == 0, "STC profile output did not run")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+def check_unprefixed_stc(cli):
+    root = tempfile.mkdtemp(prefix="c-autotmpl-unprefixed-")
+    try:
+        os.makedirs(os.path.join(root, "tmpl"))
+        os.makedirs(os.path.join(root, "gen"))
+        write(os.path.join(root, "tmpl", "vec.h"), """\
+// -- template vec(T)
+#define VEC_CAT_I(A, B) A##B
+#define VEC_CAT(A, B) VEC_CAT_I(A, B)
+#define vec(T) VEC_CAT(vec_, T)
+typedef struct { i_key value; } i_type;
+static inline void vec_int_push(vec(int) *v, int x) { v->value = x; }
+static inline void vec_int_frobnicate(vec(int) *v) { v->value += 1; }
+""")
+        write(os.path.join(root, "main.c"), """\
+#include "gen/vec.h"
+
+int main(void) {
+  vec(int) v = {0};
+  vec_push(int)(&v, 7);
+  vec_frobnicate(int)(&v);
+  return v.value == 8 ? 0 : 1;
+}
+""")
+        env = env_with(C_AUTOTMPL_PROFILE="stc",
+                       C_AUTOTMPL_STC_TEMPLATES="vec")
+        args = [cli, "--root", root, "--verbose", os.path.join(root, "main.c")]
+        proc = subprocess.run(args, cwd=root, capture_output=True, text=True,
+                              env=env)
+        output = proc.stdout + proc.stderr
+        require(proc.returncode == 0, "unprefixed STC run exited with error",
+                output)
+        require("generated vec(int)" in output,
+                "unprefixed STC usage was not generated", output)
+        require("stc templates=1" in output,
+                "unprefixed STC template list was not reported", output)
+        require("skipping vec(push)" not in output,
+                "adapter call was scanned as a mangled type", output)
+
+        with open(os.path.join(root, "gen", "vec.h")) as f:
+            content = f.read()
+        require(content.count("/* c-autotmpl: vec(int) */") == 1,
+                "initial unprefixed block was duplicated", content)
+        require("/* c-autotmpl: vec(push) */" not in content,
+                "spurious adapter usage was generated", content)
+        for needle in ("/* c-autotmpl: vec(int) */",
+                       "#ifndef C_AUTOTMPL_vec_int",
+                       "#define i_type vec_int",
+                       "#define i_key int",
+                       "#define vec_push(...) "
+                       "C_AUTOTMPL_STC_ADAPTER_CAT(vec(__VA_ARGS__), _push)",
+                       "#define vec_frobnicate(...) "
+                       "C_AUTOTMPL_STC_ADAPTER_CAT(vec(__VA_ARGS__), "
+                       "_frobnicate)",
+                       "#undef i_key\n#undef i_type"):
+            require(needle in content,
+                    "missing unprefixed STC text: " + needle, content)
+
+        compiler = os.environ.get("CC") or next(
+            (name for name in ("cc", "gcc", "clang") if shutil.which(name)),
+            None,
+        )
+        if compiler:
+            built = subprocess.run(
+                [compiler, "-std=c99", "-Wall", "-Wextra", "-Werror",
+                 "main.c", "-o", "unprefixed-demo"],
+                cwd=root, capture_output=True, text=True,
+            )
+            require(built.returncode == 0,
+                    "generated STC adapter did not compile",
+                    built.stdout + built.stderr)
+            ran = subprocess.run([os.path.join(root, "unprefixed-demo")],
+                                 cwd=root)
+            require(ran.returncode == 0, "generated STC adapter did not run")
+
+        # A new operation in existing source updates the generated header
+        # without rewriting the existing instantiation block.
+        with open(os.path.join(root, "tmpl", "vec.h"), "a") as f:
+            f.write("static inline void vec_int_clear(vec(int) *v) "
+                    "{ v->value = 0; }\n")
+        write(os.path.join(root, "main.c"), """\
+#include "gen/vec.h"
+
+int main(void) {
+  vec(int) v = {0};
+  vec_clear(int)(&v);
+  return v.value == 0 ? 0 : 1;
+}
+""")
+        proc = subprocess.run(args, cwd=root, capture_output=True, text=True,
+                              env=env)
+        output = proc.stdout + proc.stderr
+        require(proc.returncode == 0,
+                "new adapter operation did not update the header", output)
+        with open(os.path.join(root, "gen", "vec.h")) as f:
+            content = f.read()
+        require("#define vec_clear(...) "
+                "C_AUTOTMPL_STC_ADAPTER_CAT(vec(__VA_ARGS__), _clear)" in content,
+                "new adapter macro was not appended", content)
+        require(content.count("/* c-autotmpl: vec(int) */") == 1,
+                "new adapter duplicated the instantiation block", content)
+
+        # The CLI name list must work without environment configuration.
+        os.remove(os.path.join(root, "gen", "vec.h"))
+        args = [cli, "--root", root, "--verbose", "--profile", "stc",
+                "--stc-template", "vec", os.path.join(root, "main.c")]
+        proc = subprocess.run(args, cwd=root, capture_output=True, text=True,
+                              env=env_with())
+        output = proc.stdout + proc.stderr
+        require(proc.returncode == 0 and "generated vec(int)" in output,
+                "CLI STC template list did not generate an unprefixed wrapper",
+                output)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def check_stc_auto(cli):
+    root = tempfile.mkdtemp(prefix="c-autotmpl-auto-")
+    try:
+        os.makedirs(os.path.join(root, "tmpl"))
+        os.makedirs(os.path.join(root, "gen"))
+        write(os.path.join(root, "tmpl", "vec.h"), """\
+// -- template vec(T)
+#define vec(T) vec_##T
+typedef struct { i_key value; } i_type;
+static inline void vec_int_push(vec(int) *v, int x) { v->value = x; }
+""")
+        write(os.path.join(root, "main.c"), """\
+#include "gen/vec.h"
+
+int main(void) {
+  vec(int) v = {0};
+  vec_push(int)(&v, 7);
+  return v.value == 7 ? 0 : 1;
+}
+""")
+        env = env_with(C_AUTOTMPL_STC_AUTO="1")
+        args = [cli, "--root", root, "--verbose", os.path.join(root, "main.c")]
+        proc = subprocess.run(args, cwd=root, capture_output=True, text=True,
+                              env=env)
+        output = proc.stdout + proc.stderr
+        require(proc.returncode == 0, "STC auto run exited with error", output)
+        require("stc auto=1" in output,
+                "STC auto mode was not reported", output)
+        require("generated vec(int)" in output,
+                "STC auto did not detect the unprefixed wrapper", output)
+
+        with open(os.path.join(root, "gen", "vec.h")) as f:
+            content = f.read()
+        require("/* c-autotmpl: vec(int) */" in content and
+                "#define vec_push(...) " in content,
+                "STC auto did not generate type and adapter", content)
+
+        compiler = os.environ.get("CC") or next(
+            (name for name in ("cc", "gcc", "clang") if shutil.which(name)),
+            None,
+        )
+        if compiler:
+            built = subprocess.run(
+                [compiler, "-std=c99", "-Wall", "-Wextra", "-Werror",
+                 "main.c", "-o", "auto-demo"],
+                cwd=root, capture_output=True, text=True,
+            )
+            require(built.returncode == 0,
+                    "STC auto output did not compile",
+                    built.stdout + built.stderr)
+            ran = subprocess.run([os.path.join(root, "auto-demo")], cwd=root)
+            require(ran.returncode == 0, "STC auto output did not run")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def main():
@@ -28,6 +348,11 @@ def main():
     if not os.path.exists(cli):
         print("executable not found: " + cli, file=sys.stderr)
         return 1
+
+    for mode in ("profile", "env", "stc"):
+        check_stc_profile(cli, mode)
+    check_unprefixed_stc(cli)
+    check_stc_auto(cli)
 
     root = tempfile.mkdtemp(prefix="c-autotmpl-standalone-")
     try:
@@ -250,7 +575,7 @@ int raw(void) {
                        "#define T Foo",
                        "/* c-autotmpl: Thing(double) */",
                        "/* c-autotmpl: Thing(Box_float) */",
-                       '#ifndef C_AUTOTMPL_BOX_FLOAT_',
+                       '#ifndef C_AUTOTMPL_Box_float',
                        "#define T Box_float",
                        "/* c-autotmpl: Box(Thing_float) */",
                        "/* c-autotmpl: Thing(Box_Thing_float) */"):
@@ -263,7 +588,7 @@ int raw(void) {
             box_content = f.read()
         for needle in ("/* c-autotmpl: Box(float) */",
                        "/* c-autotmpl: Box(Thing_float) */",
-                       "#ifndef C_AUTOTMPL_BOX_THING_FLOAT_"):
+                       "#ifndef C_AUTOTMPL_Box_Thing_float"):
             require(needle in box_content,
                     "missing generated box text: " + needle, box_content)
 
@@ -272,9 +597,9 @@ int raw(void) {
         for needle in ("/* c-autotmpl: select(int, Foo) */",
                        "/* c-autotmpl: select(int, float) */",
                        "/* c-autotmpl: select(Box_int, float) */",
-                       "#ifndef C_AUTOTMPL_SELECT_INT__FOO_",
-                       "#ifndef C_AUTOTMPL_SELECT_BOX_INT__FLOAT_",
-                       "#ifndef C_AUTOTMPL_BOX_INT_",
+                       "#ifndef C_AUTOTMPL_select_int_2C_20Foo",
+                       "#ifndef C_AUTOTMPL_select_Box_int_2C_20float",
+                       "#ifndef C_AUTOTMPL_Box_int",
                        "#ifdef FOO_H",
                        "#define First int",
                        "#define Second Foo",
@@ -294,7 +619,7 @@ int raw(void) {
             apply_content = f.read()
         for needle in ("/* c-autotmpl: apply(int) */",
                        "/* c-autotmpl: apply(float) */",
-                       "#ifndef C_AUTOTMPL_APPLY_INT_",
+                       "#ifndef C_AUTOTMPL_apply_int",
                        "#define T int",
                        "#define T float",
                        "#undef T"):
@@ -308,7 +633,7 @@ int raw(void) {
             sum_content = f.read()
         for needle in ("/* c-autotmpl: Thing(int) */",
                        "/* c-autotmpl: sum(int) */",
-                       "#ifndef C_AUTOTMPL_SUM_INT_",
+                       "#ifndef C_AUTOTMPL_sum_int",
                        "#define Item int",
                        "#undef Item"):
             require(needle in sum_content,
@@ -321,7 +646,7 @@ int raw(void) {
             user_content = f.read()
         for needle in ("/* c-autotmpl: Option(int) */",
                        "/* c-autotmpl: User(Option, int) */",
-                       "#ifndef C_AUTOTMPL_USER_OPTION__INT_",
+                       "#ifndef C_AUTOTMPL_User_Option_2C_20int",
                        "#define F Option",
                        "#define Payload int",
                        "#undef Payload\n#undef F"):
@@ -335,7 +660,7 @@ int raw(void) {
             wrap_content = f.read()
         for needle in ("/* c-autotmpl: Option(int) */",
                        "/* c-autotmpl: Wrap(Option) */",
-                       "#ifndef C_AUTOTMPL_WRAP_OPTION_",
+                       "#ifndef C_AUTOTMPL_Wrap_Option",
                        "#define F Option",
                        "#undef F"):
             require(needle in wrap_content,
@@ -359,7 +684,7 @@ int raw(void) {
                        '#include "../../foo.h"',
                        "/* c-autotmpl: Split(int) */",
                        "/* c-autotmpl: Split(Foo) */",
-                       "#ifndef C_AUTOTMPL_IMPL_SPLIT_INT_",
+                       "#ifndef C_AUTOTMPL_IMPL_Split_int",
                        "#define T int",
                        "#define T Foo"):
             require(needle in split_impl_content,

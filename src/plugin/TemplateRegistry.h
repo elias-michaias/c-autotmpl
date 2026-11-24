@@ -1,6 +1,7 @@
 #ifndef C_AUTOTMPL_TEMPLATE_REGISTRY_H
 #define C_AUTOTMPL_TEMPLATE_REGISTRY_H
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
@@ -12,6 +13,19 @@
 namespace c_autotmpl {
 
 enum class TemplateKind { Type, Function };
+
+/// Explicit argument roles used by opt-in presets. Type arguments keep the
+/// ordinary guard and dependency rules; the other roles are passed through
+/// without being treated as type names.
+enum class ArgRole { Type, Name, Flags, Opaque, Key, Value };
+
+/// Opt-in emitter policy. None is the original, unchanged behavior.
+enum class TemplatePreset { None, StcStatic, StcShared };
+
+struct ArgSpec {
+  ArgRole Role = ArgRole::Type;
+  std::string Macro; // Empty means "use the decorator parameter name".
+};
 
 /// A template header discovered from a decorator such as:
 ///
@@ -28,13 +42,54 @@ struct TemplateDef {
   std::string GeneratedImplSource;             // absolute gen/impl/list.c
   std::string IncludeFromImplDir;              // "../../tmpl/list.h"
   bool HasTmplHeaderGuard = false;             // has `#ifndef TMPL_HEADER`
+  TemplatePreset Preset = TemplatePreset::None;
+  llvm::SmallVector<ArgSpec, 2> ArgSpecs;      // empty means legacy behavior
 };
+
+/// True for arguments that need include-guard and dependency handling.
+bool isTypeArgument(const TemplateDef &Template, size_t Index);
+
+/// Decorator parameter name at Index, defaulting to T for undeclared templates.
+llvm::StringRef parameterName(const TemplateDef &Template, size_t Index);
+
+/// Macro defined by the generated block for argument Index.
+llvm::StringRef argumentMacroName(const TemplateDef &Template, size_t Index);
+
+bool parsePresetName(llvm::StringRef Name, TemplatePreset &Out);
+
+/// True when the template uses STC macro names and split mapping.
+bool isStcPreset(const TemplateDef &Template);
+
+/// New-style STC wrappers declare only type-like parameters, so names and
+/// trait defaults are derived instead of passed at the call site.
+bool usesDerivedStcNames(const TemplateDef &Template);
+
+/// Conservative content-based check used by opt-in STC auto-detection.
+bool looksLikeStcHeader(const TemplateDef &Template);
+
+/// True for STC-owned types that need no c-autotmpl include guard.
+bool isStcBuiltinType(llvm::StringRef Spelling);
+
+/// Derived container type name, such as stc_vec_int.
+std::string stcContainerName(const TemplateDef &Template,
+                             llvm::ArrayRef<std::string> Args);
+
+/// Derived trait flags expression, or empty when STC needs no i_traits.
+std::string stcTraits(const TemplateDef &Template,
+                      llvm::ArrayRef<std::string> Args);
 
 /// Owns template definitions and answers hot-path lookups with StringRefs.
 /// Scanning happens once; lookups are simple hash/prefix comparisons.
 class TemplateRegistry {
 public:
   void scan(llvm::StringRef Root);
+
+  /// Applies an opt-in role/config preset to templates discovered by scan().
+  /// An explicit name list replaces the default stc_ prefix rule; Auto adds
+  /// templates whose headers contain STC configuration markers.
+  void applyPreset(TemplatePreset Preset,
+                   llvm::ArrayRef<llvm::StringRef> Names = {},
+                   bool Auto = false);
 
   /// Scans `Root/tmpl` or `Root/templates` first and stops if decorators are
   /// found there. Falls back to the full recursive scan for other layouts.

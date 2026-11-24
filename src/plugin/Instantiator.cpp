@@ -43,10 +43,103 @@ size_t paramCount(const TemplateDef &Template) {
   return Template.Params.size();
 }
 
-StringRef paramName(const TemplateDef &Template, size_t I) {
-  if (I < Template.Params.size())
-    return Template.Params[I];
-  return StringRef("T");
+static void appendArgDefines(std::string &Out, const TemplateDef &Template,
+                             ArrayRef<std::string> Args) {
+  size_t Count = paramCount(Template);
+  for (size_t I = 0; I < Count && I < Args.size(); ++I) {
+    Out += "#define ";
+    Out += argumentMacroName(Template, I).str();
+    Out += ' ';
+    Out += Args[I];
+    Out += '\n';
+  }
+}
+
+static void appendArgUndefs(std::string &Out, const TemplateDef &Template) {
+  size_t Count = paramCount(Template);
+  for (size_t I = Count; I > 0; --I) {
+    Out += "#undef ";
+    Out += argumentMacroName(Template, I - 1).str();
+    Out += '\n';
+  }
+}
+
+static void appendStcDefines(std::string &Out, const TemplateDef &Template,
+                             ArrayRef<std::string> Args) {
+  if (!usesDerivedStcNames(Template)) {
+    appendArgDefines(Out, Template, Args);
+    return;
+  }
+  Out += "#define i_type ";
+  Out += stcContainerName(Template, Args);
+  Out += '\n';
+  appendArgDefines(Out, Template, Args);
+  std::string Traits = stcTraits(Template, Args);
+  if (!Traits.empty()) {
+    Out += "#define i_traits ";
+    Out += Traits;
+    Out += '\n';
+  }
+}
+
+static void appendStcUndefs(std::string &Out, const TemplateDef &Template,
+                            ArrayRef<std::string> Args) {
+  if (!usesDerivedStcNames(Template)) {
+    appendArgUndefs(Out, Template);
+    return;
+  }
+  if (!stcTraits(Template, Args).empty())
+    Out += "#undef i_traits\n";
+  appendArgUndefs(Out, Template);
+  Out += "#undef i_type\n";
+}
+
+/// Derived STC wrappers expose type templates such as vec(int). Each adapter
+/// macro sampled from a call site adds the matching function template, such as
+/// vec_push(int)(&xs, 7). Operation names come from source, not from a baked-in
+/// STC version list.
+static void appendStcAdapterCat(std::string &Out) {
+  Out += "#ifndef C_AUTOTMPL_STC_ADAPTER_CAT\n";
+  Out += "#define C_AUTOTMPL_STC_ADAPTER_CAT_I(A, B) A##B\n";
+  Out += "#define C_AUTOTMPL_STC_ADAPTER_CAT(A, B) "
+         "C_AUTOTMPL_STC_ADAPTER_CAT_I(A, B)\n";
+  Out += "#endif\n";
+}
+
+static void appendStcAdapterMacro(std::string &Out, const TemplateDef &Template,
+                                  StringRef Op, bool Guarded) {
+  if (Guarded) {
+    Out += "#ifndef C_AUTOTMPL_STC_ADAPTER_";
+    Out += Template.Name;
+    Out += '_';
+    Out += Op;
+    Out += '\n';
+    Out += "#define C_AUTOTMPL_STC_ADAPTER_";
+    Out += Template.Name;
+    Out += '_';
+    Out += Op;
+    Out += '\n';
+  }
+  Out += "#define ";
+  Out += Template.Name;
+  Out += '_';
+  Out += Op;
+  Out += "(...) C_AUTOTMPL_STC_ADAPTER_CAT(";
+  Out += Template.Name;
+  Out += "(__VA_ARGS__), _";
+  Out += Op;
+  Out += ")\n";
+  if (Guarded)
+    Out += "#endif\n";
+}
+
+static void appendStcAdapters(std::string &Out, const TemplateDef &Template,
+                              ArrayRef<StringRef> Ops) {
+  if (!usesDerivedStcNames(Template) || Ops.empty())
+    return;
+  appendStcAdapterCat(Out);
+  for (StringRef Op : Ops)
+    appendStcAdapterMacro(Out, Template, Op, /*Guarded=*/false);
 }
 
 bool parseDefine(StringRef Line, StringRef Param, StringRef &Type) {
@@ -103,6 +196,24 @@ SmallVector<LineInfo, 64> splitLines(StringRef Content) {
   return Lines;
 }
 
+static bool fileDefinesMacro(StringRef Content, StringRef Macro) {
+  for (const LineInfo &Info : splitLines(Content)) {
+    StringRef S = Info.Text.ltrim();
+    if (!S.consume_front("#define"))
+      continue;
+    S = S.ltrim();
+    size_t End = 0;
+    while (End < S.size() &&
+           (S[End] == '_' || (S[End] >= 'a' && S[End] <= 'z') ||
+            (S[End] >= 'A' && S[End] <= 'Z') ||
+            (S[End] >= '0' && S[End] <= '9')))
+      ++End;
+    if (S.take_front(End) == Macro)
+      return true;
+  }
+  return false;
+}
+
 /// Finds one instantiation block at Lines[Index], marked or hand-written, and
 /// reports its byte range. Trailing blank lines are included so removal does
 /// not leave extra whitespace behind.
@@ -129,7 +240,7 @@ bool findBlockAt(ArrayRef<LineInfo> Lines, size_t Index,
     Marked = true;
   } else {
     StringRef FirstArg;
-    if (!parseDefine(First, paramName(Template, 0), FirstArg))
+    if (!parseDefine(First, argumentMacroName(Template, 0), FirstArg))
       return false;
     ParsedArgs.resize(Count);
     ParsedArgs[0] = FirstArg.str();
@@ -143,7 +254,9 @@ bool findBlockAt(ArrayRef<LineInfo> Lines, size_t Index,
   int Depth = 0;
   size_t UndefIndex = StringRef::npos;
   size_t LastLine = StringRef::npos;
-  size_t Last = std::min(Index + 20 + 5 * Count, Lines.size());
+  // Generated STC adapters add a block of function-template macros, so the
+  // include and undef lines can be well past the old 25-line window.
+  size_t Last = std::min(Index + 80 + 5 * Count, Lines.size());
   SmallVector<bool, 4> SeenUndef(Count, false);
   for (size_t I = Index + 1; I < Last; ++I) {
     StringRef Line = Lines[I].Text.trim();
@@ -165,7 +278,7 @@ bool findBlockAt(ArrayRef<LineInfo> Lines, size_t Index,
       SawInclude = true;
     bool AllUndef = true;
     for (size_t J = 0; J < Count; ++J) {
-      StringRef Name = paramName(Template, J);
+      StringRef Name = argumentMacroName(Template, J);
       if (lineUndefines(Line, Name))
         SeenUndef[J] = true;
       if (!SeenUndef[J])
@@ -252,29 +365,38 @@ std::string instantiationMarker(StringRef TemplateName, StringRef TypeSpelling) 
 
 /// A per-instantiation macro makes duplicate definitions harmless even when
 /// the same nested type is emitted in more than one generated header.
+///
+/// The name is readable and collision-free: letters and digits stay as written,
+/// while other bytes use _HH. A literal underscore followed by two hex digits
+/// is escaped as _5F so it cannot be mistaken for an escape sequence.
+static bool isMacroHexDigit(unsigned char C) {
+  return (C >= '0' && C <= '9') || (C >= 'a' && C <= 'f') ||
+         (C >= 'A' && C <= 'F');
+}
+
 static std::string presenceMacroWithPrefix(StringRef Prefix,
                                            StringRef TemplateName,
                                            StringRef TypeSpelling) {
   std::string Name = TemplateName.str() + "_" + TypeSpelling.str();
-  uint32_t Hash = 2166136261u;
-  for (unsigned char C : Name) {
-    Hash ^= C;
-    Hash *= 16777619u;
-  }
-
-  std::string Out = Prefix.str();
-  for (unsigned char C : Name) {
-    if (C >= 'a' && C <= 'z')
-      Out += static_cast<char>(C - 'a' + 'A');
-    else if ((C >= 'A' && C <= 'Z') || (C >= '0' && C <= '9'))
-      Out += static_cast<char>(C);
-    else
-      Out += '_';
-  }
   static const char Hex[] = "0123456789ABCDEF";
-  Out += '_';
-  for (int Shift = 28; Shift >= 0; Shift -= 4)
-    Out += Hex[(Hash >> Shift) & 0xF];
+  std::string Out = Prefix.str();
+  for (size_t I = 0; I < Name.size(); ++I) {
+    unsigned char C = static_cast<unsigned char>(Name[I]);
+    if ((C >= 'a' && C <= 'z') || (C >= 'A' && C <= 'Z') ||
+        (C >= '0' && C <= '9')) {
+      Out += static_cast<char>(C);
+    } else if (C == '_' && I + 2 < Name.size() &&
+               isMacroHexDigit(static_cast<unsigned char>(Name[I + 1])) &&
+               isMacroHexDigit(static_cast<unsigned char>(Name[I + 2]))) {
+      Out += "_5F";
+    } else if (C == '_') {
+      Out += '_';
+    } else {
+      Out += '_';
+      Out += Hex[C >> 4];
+      Out += Hex[C & 0xF];
+    }
+  }
   return Out;
 }
 
@@ -290,7 +412,7 @@ std::string implPresenceMacro(StringRef TemplateName,
 
 std::string makeInstantiationBlock(
     const TemplateDef &Template, StringRef TypeSpelling, StringRef GuardMacro,
-    ArrayRef<DependencyGuard> ExtraGuards) {
+    ArrayRef<DependencyGuard> ExtraGuards, ArrayRef<StringRef> AdapterOps) {
   std::string Out;
   Out.reserve(128 + Template.IncludeFromGenDir.size() + TypeSpelling.size() +
               GuardMacro.size());
@@ -333,26 +455,26 @@ std::string makeInstantiationBlock(
 
   SmallVector<std::string, 4> Args;
   splitExplicitArgs(TypeSpelling, Template, Args);
-  size_t Count = paramCount(Template);
-  for (size_t I = 0; I < Count && I < Args.size(); ++I) {
-    Out += "#define ";
-    Out += paramName(Template, I);
-    Out += ' ';
-    Out += Args[I];
-    Out += '\n';
-  }
-  if (Template.HasTmplHeaderGuard)
+  appendStcDefines(Out, Template, Args);
+  appendStcAdapters(Out, Template, AdapterOps);
+
+  bool SharedStc = Template.Preset == TemplatePreset::StcShared;
+  if (Template.HasTmplHeaderGuard && !isStcPreset(Template))
     Out += "#define TMPL_HEADER 1\n";
+  if (SharedStc) {
+    Out += "#define TMPL_HEADER 1\n";
+    Out += "#define i_header 1\n";
+  }
   Out += "#include \"";
   Out += Template.IncludeFromGenDir;
   Out += "\"\n";
-  if (Template.HasTmplHeaderGuard)
+  if (SharedStc)
+    Out += "#undef i_header\n";
+  if (Template.HasTmplHeaderGuard && !isStcPreset(Template))
     Out += "#undef TMPL_HEADER\n";
-  for (size_t I = Count; I > 0; --I) {
-    Out += "#undef ";
-    Out += paramName(Template, I - 1);
-    Out += '\n';
-  }
+  if (SharedStc)
+    Out += "#undef TMPL_HEADER\n";
+  appendStcUndefs(Out, Template, Args);
   for (unsigned I = Guards.size(); I > 0; --I)
     Out += "#endif\n";
   Out += "#endif\n";
@@ -393,21 +515,16 @@ std::string makeImplInstantiationBlock(const TemplateDef &Template,
   Out += Presence;
   Out += '\n';
 
-  for (size_t I = 0; I < Count; ++I) {
-    Out += "#define ";
-    Out += paramName(Template, I);
-    Out += ' ';
-    Out += ActualArgs[I];
-    Out += '\n';
-  }
+  appendStcDefines(Out, Template, ActualArgs);
+  bool SharedStc = Template.Preset == TemplatePreset::StcShared;
+  if (SharedStc)
+    Out += "#define i_implement 1\n";
   Out += "#include \"";
   Out += Template.IncludeFromImplDir;
   Out += "\"\n";
-  for (size_t I = Count; I > 0; --I) {
-    Out += "#undef ";
-    Out += paramName(Template, I - 1);
-    Out += '\n';
-  }
+  if (SharedStc)
+    Out += "#undef i_implement\n";
+  appendStcUndefs(Out, Template, ActualArgs);
   for (size_t I = GuardMacros.size(); I > 0; --I) {
     if (!GuardMacros[I - 1].empty())
       Out += "#endif\n";
@@ -597,6 +714,73 @@ bool Instantiator::has(const TemplateDef &Template, StringRef TypeSpelling,
          hasManualInstantiation(State.Content, Template, TypeSpelling);
 }
 
+bool Instantiator::ensureAdapters(const TemplateDef &Template,
+                                  ArrayRef<StringRef> Ops,
+                                  StringRef OutputHeader, std::string &Error) {
+  if (!usesDerivedStcNames(Template) || Ops.empty())
+    return false;
+
+  std::lock_guard<std::mutex> Lock(Mutex);
+  StringRef Path =
+      OutputHeader.empty() ? Template.GeneratedHeader : OutputHeader;
+  FileState &State = getState(Path);
+  StringRef Content(State.Content);
+  if (Content.empty())
+    return false;
+
+  std::string Missing;
+  if (!fileDefinesMacro(Content, "C_AUTOTMPL_STC_ADAPTER_CAT"))
+    appendStcAdapterCat(Missing);
+  for (StringRef Op : Ops) {
+    std::string Guard = std::string("C_AUTOTMPL_STC_ADAPTER_") +
+                        Template.Name + "_" + Op.str();
+    if (!fileDefinesMacro(Content, Guard))
+      appendStcAdapterMacro(Missing, Template, Op, /*Guarded=*/true);
+  }
+  if (Missing.empty())
+    return false;
+
+  size_t Pos = Content.rfind("#endif");
+  size_t Insert = Content.size();
+  if (Pos != StringRef::npos) {
+    size_t LineStart = Content.rfind('\n', Pos);
+    Insert = LineStart == StringRef::npos ? 0 : LineStart + 1;
+    if (!Content.slice(Insert, Pos).trim().empty())
+      Insert = Content.size();
+  }
+
+  std::string NewContent;
+  NewContent.reserve(Content.size() + Missing.size());
+  NewContent.append(Content.data(), Insert);
+  NewContent += Missing;
+  NewContent.append(Content.data() + Insert, Content.size() - Insert);
+
+  std::error_code EC;
+  SmallString<256> Dir(sys::path::parent_path(Path));
+  if (!Dir.empty()) {
+    EC = sys::fs::create_directories(Dir);
+    if (EC) {
+      Error = EC.message();
+      return false;
+    }
+  }
+  raw_fd_ostream OS(Path, EC, sys::fs::CD_CreateAlways);
+  if (EC) {
+    Error = EC.message();
+    return false;
+  }
+  OS << NewContent;
+  OS.close();
+  if (OS.has_error()) {
+    Error = "failed writing " + Path.str();
+    return false;
+  }
+
+  State.Content = std::move(NewContent);
+  State.Stamp = stampFor(Path);
+  return true;
+}
+
 bool Instantiator::prune(const TemplateDef &Template, const StringSet<> &Keep,
                          std::vector<std::string> &Removed,
                          std::string &Error) {
@@ -705,7 +889,8 @@ Instantiator::instantiate(const TemplateDef &Template, StringRef TypeSpelling,
                           StringRef GuardMacro, std::string &GenPath,
                           std::string &Error, bool DryRun,
                           ArrayRef<DependencyGuard> ExtraGuards,
-                          StringRef OutputHeader) {
+                          StringRef OutputHeader,
+                          ArrayRef<StringRef> AdapterOps) {
   SmallVector<std::string, 4> Args;
   if (!splitExplicitArgs(TypeSpelling, Template, Args) ||
       Args.size() != paramCount(Template)) {
@@ -732,8 +917,8 @@ Instantiator::instantiate(const TemplateDef &Template, StringRef TypeSpelling,
     NewContent += "\n#define ";
     NewContent += FileGuard;
     NewContent += "\n\n";
-    NewContent +=
-        makeInstantiationBlock(Template, TypeSpelling, GuardMacro, ExtraGuards);
+    NewContent += makeInstantiationBlock(Template, TypeSpelling, GuardMacro,
+                                         ExtraGuards, AdapterOps);
     NewContent += "#endif\n";
   } else {
     StringRef Content(State.Content);
@@ -759,14 +944,14 @@ Instantiator::instantiate(const TemplateDef &Template, StringRef TypeSpelling,
     if (!GuardLine.empty()) {
       NewContent.append(Content.data(), GuardLineStart);
       NewContent += makeInstantiationBlock(Template, TypeSpelling, GuardMacro,
-                                           ExtraGuards);
+                                           ExtraGuards, AdapterOps);
       NewContent.append(Content.data() + GuardLineStart,
                         Content.size() - GuardLineStart);
     } else {
       NewContent = Content.str();
       NewContent += '\n';
       NewContent += makeInstantiationBlock(Template, TypeSpelling, GuardMacro,
-                                           ExtraGuards);
+                                           ExtraGuards, AdapterOps);
     }
   }
 

@@ -19,6 +19,11 @@ line.
 | Wrong project root | The plugin checks `tmpl/` or `templates/`, then `.clangd`, `compile_commands.json`, and `.git`. Set `C_AUTOTMPL_ROOT` to force one. |
 | CLI finds no templates | Pass `--root .` explicitly. The inferred common ancestor may be wrong. |
 | `skipping Name(Foo): no traditional include guard` | Give `Foo` an `#ifndef FOO_H / #define FOO_H` guard. `#pragma once` is not supported. |
+| `skipping stc_vec(Foo): no traditional include guard` | `Foo` needs a traditional `FOO_H` guard, even in STC mode. STC-owned types such as `cstr` are exempt. |
+| STC roles were not applied | Enable `--stc`, `--profile stc`, or `C_AUTOTMPL_PROFILE`. The name must start with `stc_`, appear in `--stc-template` or `C_AUTOTMPL_STC_TEMPLATES`, or be found by `--stc-auto` / `C_AUTOTMPL_STC_AUTO`. |
+| Unprefixed STC adapter is undefined | Add a call such as `vec_push(int)(...)` and regenerate. Adapters come from the current call sites, not from a fixed operation list. The template must be selected by name or auto-detection. |
+| Derived STC name does not match the call site | Keep the wrapper paste macro in step with the template name, such as `stc_vec(T)` pasting to `stc_vec_##T`. Identifier-like type arguments are supported. |
+| Adapter call creates a `Name(Fn)` warning | Update to the current build. Call-like identifiers such as `vec_push(int)` are scanned as adapter uses only when a second call parenthesis follows the type arguments. |
 | Function template generated nothing | Spell every argument at the call site, e.g. `convert(int, float)(x)`. Wrong arity and helper names such as `convert_impl(x)` are ignored. |
 | Function template block is skipped at compile time | Each user-defined argument needs a guard. Include its type header before the generated header. Header-discovered type dependencies are emitted into the same header for you. |
 | HKT argument is treated as a type | The argument must be a bare registered template name, such as `Option`. The generated parameter is a macro name and has no include guard. |

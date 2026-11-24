@@ -275,6 +275,19 @@ static void scanHeaderDeps(const TemplateDef &Template,
 }
 
 std::string canonicalizeType(StringRef Type, const TemplateRegistry &Registry,
+                             SmallVectorImpl<FoundUsage> &Deps);
+
+static std::string canonicalizeArgument(StringRef Arg,
+                                        const TemplateDef &Template,
+                                        size_t Index,
+                                        const TemplateRegistry &Registry,
+                                        SmallVectorImpl<FoundUsage> &Deps) {
+  if (isTypeArgument(Template, Index))
+    return canonicalizeType(Arg, Registry, Deps);
+  return Arg.trim().str();
+}
+
+std::string canonicalizeType(StringRef Type, const TemplateRegistry &Registry,
                              SmallVectorImpl<FoundUsage> &Deps) {
   std::string Clean = stripCommentsAndLiterals(Type);
   StringRef S(Clean);
@@ -452,8 +465,9 @@ void scanTemplateUsage(const TemplateDef &Template, StringRef RawType,
     return;
 
   SmallVector<std::string, 4> CanonArgs;
-  for (const std::string &Arg : RawArgs)
-    CanonArgs.push_back(canonicalizeType(Arg, Registry, Expanded));
+  for (size_t I = 0; I < RawArgs.size(); ++I)
+    CanonArgs.push_back(
+        canonicalizeArgument(RawArgs[I], Template, I, Registry, Expanded));
   if (ScanHeaders)
     scanHeaderDeps(Template, CanonArgs, Registry, Expanded);
   appendUsageChain(Template, CanonArgs, Expanded, Out);
@@ -478,8 +492,9 @@ static void scanFunctionUsage(const TemplateDef &Template, StringRef RawType,
 
   SmallVector<FoundUsage, 4> Expanded;
   SmallVector<std::string, 4> CanonArgs;
-  for (const std::string &Arg : RawArgs)
-    CanonArgs.push_back(canonicalizeType(Arg, Registry, Expanded));
+  for (size_t I = 0; I < RawArgs.size(); ++I)
+    CanonArgs.push_back(
+        canonicalizeArgument(RawArgs[I], Template, I, Registry, Expanded));
   if (ScanHeaders)
     scanHeaderDeps(Template, CanonArgs, Registry, Expanded);
   appendUsageChain(Template, CanonArgs, Expanded, Out);
@@ -546,9 +561,58 @@ static void scanUsagesImpl(StringRef Code, const TemplateRegistry &Registry,
       }
     }
 
-    StringRef MangledType;
-    if (const TemplateDef *Def = Registry.matchMangled(Ident, MangledType))
-      scanTemplateUsage(*Def, MangledType, Registry, Out, ScanHeaders);
+    // A generated STC adapter reads as vec_push(int)(...). The leading
+    // identifier is a call, not the mangled type vec_push. For STC-derived
+    // templates, remember the operation and instantiate the underlying type.
+    // Other call-like identifiers keep the old skip behavior.
+    unsigned After = End;
+    while (After < S.size() && isSpace(S[After]))
+      ++After;
+    if (After < S.size() && S[After] == '(') {
+      unsigned Start = After + 1;
+      int Depth = 1;
+      unsigned Close = Start;
+      for (; Close < S.size() && Depth > 0; ++Close) {
+        if (S[Close] == '(')
+          ++Depth;
+        else if (S[Close] == ')')
+          --Depth;
+      }
+      unsigned Call = Close;
+      while (Call < S.size() && isSpace(S[Call]))
+        ++Call;
+      if (Depth == 0 && Close > Start && Call < S.size() && S[Call] == '(') {
+        StringRef MangledType;
+        if (const TemplateDef *Def =
+                Registry.matchMangled(Ident, MangledType)) {
+          if (usesDerivedStcNames(*Def) && !MangledType.empty() &&
+              isIdentStart(MangledType.front())) {
+            bool ValidOp = true;
+            for (char C : MangledType)
+              if (!isIdentChar(C))
+                ValidOp = false;
+            if (ValidOp) {
+              StringRef Type = S.slice(Start, Close - 1).trim();
+              if (!Type.empty()) {
+                size_t Before = Out.size();
+                scanTemplateUsage(*Def, Type, Registry, Out, ScanHeaders);
+                for (size_t K = Before; K < Out.size(); ++K)
+                  if (Out[K].Template == Def) {
+                    Out[K].AdapterOp = MangledType.str();
+                    break;
+                  }
+              }
+              I = Close;
+              continue;
+            }
+          }
+        }
+      }
+    } else {
+      StringRef MangledType;
+      if (const TemplateDef *Def = Registry.matchMangled(Ident, MangledType))
+        scanTemplateUsage(*Def, MangledType, Registry, Out, ScanHeaders);
+    }
 
     I = End;
   }

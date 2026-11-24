@@ -34,6 +34,9 @@ struct FoundUsage {
   /// Such blocks are emitted into the outermost generated header so mutually
   /// dependent nested types cannot be separated by include order.
   bool IsNested = false;
+  /// Nonempty for `vec_push(int)(...)`, where push is the STC operation that
+  /// must get a generated adapter macro.
+  std::string AdapterOp;
 };
 
 /// Replaces comments and string/char literals with spaces while preserving

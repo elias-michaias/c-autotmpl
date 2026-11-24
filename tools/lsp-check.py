@@ -36,6 +36,21 @@ def write(path, text):
         f.write(text)
 
 
+CONFIG_KEYS = (
+    "C_AUTOTMPL_PROFILE",
+    "C_AUTOTMPL_STC_TEMPLATES",
+    "C_AUTOTMPL_STC_AUTO",
+)
+
+
+def plugin_env(**overrides):
+    env = dict(os.environ)
+    for key in CONFIG_KEYS:
+        env.pop(key, None)
+    env.update(overrides)
+    return env
+
+
 def wait_for_file(path, needles, timeout=15):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -116,9 +131,92 @@ def no_template_errors(diags):
                ("Thing_float", "Thing_Foo", "Thing_Bar", "Thing_Box",
                 "Box_float", "Box_Thing_float", "Thing_Box_Thing_float",
                 "select_int__Foo", "select_int__float", "sum_int",
-               "Option_int", "User_Option", "Split_int")):
+               "Option_int", "User_Option", "Split_int", "vec_Foo",
+               "vec_cstr")):
             return False
     return True
+
+
+def check_auto_config(plugin):
+    root = tempfile.mkdtemp(prefix="c-autotmpl-lsp-auto-")
+    try:
+        os.makedirs(os.path.join(root, "tmpl"))
+        os.makedirs(os.path.join(root, "gen"))
+        write(os.path.join(root, "tmpl", "vec.h"), """\
+// -- template vec(T)
+#define VEC_CAT_I(A, B) A##B
+#define VEC_CAT(A, B) VEC_CAT_I(A, B)
+#define vec(T) VEC_CAT(vec_, T)
+typedef struct { i_key value; } i_type;
+static inline void vec_int_push(vec(int) *v, int x) { v->value = x; }
+""")
+        source = os.path.join(root, "main.c")
+        write(source, "int main(void) { return 0; }\n")
+        text = """\
+#include "gen/vec.h"
+
+int main(void) {
+  vec(int) v = {0};
+  vec_push(int)(&v, 7);
+  return v.value == 7 ? 0 : 1;
+}
+"""
+        generated = os.path.join(root, "gen", "vec.h")
+        log_path = os.path.join(root, "clangd.log")
+        stdout_path = os.path.join(root, "clangd.stdout")
+        env = plugin_env(C_AUTOTMPL_STC_AUTO="1")
+        with open(log_path, "wb") as log, open(stdout_path, "wb") as stdout:
+            proc = subprocess.Popen(
+                ["clangd", "--log=verbose", "--load=" + plugin],
+                cwd=root, stdin=subprocess.PIPE, stdout=stdout, stderr=log,
+                env=env,
+            )
+            try:
+                send(proc, {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "processId": None,
+                        "rootUri": "file://" + root,
+                        "capabilities": {},
+                    },
+                })
+                send(proc, {"jsonrpc": "2.0", "method": "initialized",
+                            "params": {}})
+                send(proc, {
+                    "jsonrpc": "2.0",
+                    "method": "textDocument/didOpen",
+                    "params": {"textDocument": {
+                        "uri": "file://" + source,
+                        "languageId": "c",
+                        "version": 1,
+                        "text": text,
+                    }},
+                })
+                content = wait_for_content(generated, lambda c: (
+                    "/* c-autotmpl: vec(int) */" in c and
+                    "#define vec_push(...) " in c and
+                    "/* c-autotmpl: vec(push) */" not in c
+                ))
+                if content is None:
+                    print("plugin C_AUTOTMPL_STC_AUTO did not generate",
+                          file=sys.stderr)
+                    with open(log_path, errors="replace") as f:
+                        print(f.read()[-4000:], file=sys.stderr)
+                    return 1
+            finally:
+                try:
+                    send(proc, {"jsonrpc": "2.0", "id": 2,
+                                "method": "shutdown", "params": None})
+                    send(proc, {"jsonrpc": "2.0", "method": "exit",
+                                "params": None})
+                    proc.wait(timeout=5)
+                except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
+                    proc.kill()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return 0
 
 
 def main():
@@ -127,6 +225,8 @@ def main():
     )
     if not os.path.exists(plugin):
         print("plugin not found: " + plugin, file=sys.stderr)
+        return 1
+    if check_auto_config(plugin) != 0:
         return 1
 
     root = tempfile.mkdtemp(prefix="c-autotmpl-lsp-")
@@ -225,6 +325,20 @@ static T SPLIT_GET(T)(Split(T) *p) { return p->value; }
 typedef struct { T value; } Split(T);
 #endif
 """)
+        write(os.path.join(root, "tmpl", "vec.h"), """\
+// -- template vec(T)
+#define VEC_CAT_I(A, B) A##B
+#define VEC_CAT(A, B) VEC_CAT_I(A, B)
+#define vec(T) VEC_CAT(vec_, T)
+#define VEC_FN_II(A, B) A##B
+#define VEC_FN_I(A, B) VEC_FN_II(A, B)
+#define VEC_FN(A, B) VEC_FN_I(A, B)
+typedef char cstr;
+typedef struct { i_key value; } i_type;
+static inline int VEC_FN(i_type, _size)(i_type *v) { (void)v; return 7; }
+static inline int VEC_FN(i_type, _frobnicate)(i_type *v) { (void)v; return 1; }
+static inline int VEC_FN(i_type, _future)(i_type *v) { (void)v; return 1; }
+""")
         write(os.path.join(root, "bar.h"), """\
 #ifndef BAR_H
 #define BAR_H
@@ -240,6 +354,7 @@ typedef struct { int y; } Pragma;
         sum_generated = os.path.join(root, "gen", "sum.h")
         user_generated = os.path.join(root, "gen", "user.h")
         split_generated = os.path.join(root, "gen", "split.h")
+        stc_generated = os.path.join(root, "gen", "vec.h")
         split_impl = os.path.join(root, "gen", "impl", "split.c")
         impl_makefile = os.path.join(root, "gen", "impl", "c-autotmpl.mk")
         # A pre-existing hand-written block for Thing(float). The plugin must
@@ -274,6 +389,7 @@ int main(void) { return 0; }
 #include "gen/box.h"
 #include "gen/select.h"
 #include "gen/split.h"
+#include "gen/vec.h"
 #include "gen/sum.h"
 #include "gen/thing.h"
 #include "gen/user.h"
@@ -293,10 +409,21 @@ int main(void) {
   int d = user.email.valid ? user.email.value : 1;
   Split(int) sp = {9};
   int e = sp.value;
+  vec(Foo) sv = {{11}};
+  int g = sv.value.x;
+  int g2 = vec_size(Foo)(&sv);
+  int g3 = vec_frobnicate(Foo)(&sv);
+  vec(cstr) sv2 = {'a'};
+  int h = sv2.value;
+  int h2 = vec_size(cstr)(&sv2);
   return f.value + u.value.x + p.value.y + n.value.value +
-         (deep != 0) + a + b + c + d + e;
+         (deep != 0) + a + b + c + d + e + g + g2 + g3 + h + h2;
 }
 """
+        text1_future = text1.replace(
+            "vec_frobnicate(Foo)(&sv);",
+            "vec_frobnicate(Foo)(&sv);\n  int g4 = vec_future(Foo)(&sv);",
+        ).replace("+ g3 + h", "+ g3 + g4 + h")
         text2 = """\
 #include "foo.h"
 #include "pragma.h"
@@ -334,6 +461,8 @@ int other(void) {
                 stdin=subprocess.PIPE,
                 stdout=stdout,
                 stderr=log,
+                env=plugin_env(C_AUTOTMPL_PROFILE="stc",
+                               C_AUTOTMPL_STC_TEMPLATES="vec"),
             )
             try:
                 uri = "file://" + source
@@ -369,7 +498,7 @@ int other(void) {
                     "/* c-autotmpl: Thing(Foo) */" in c and
                     "#ifdef FOO_H" in c and
                     "/* c-autotmpl: Thing(Box_float) */" in c and
-                    '#ifndef C_AUTOTMPL_BOX_FLOAT_' in c and
+                    '#ifndef C_AUTOTMPL_Box_float' in c and
                     '#define T Box_float' in c and
                     '/* c-autotmpl: Box(Thing_float) */' in c and
                     '/* c-autotmpl: Thing(Box_Thing_float) */' in c and
@@ -390,7 +519,7 @@ int other(void) {
                 select_content = wait_for_content(select_generated, lambda c: (
                     "/* c-autotmpl: select(int, Foo) */" in c and
                     "/* c-autotmpl: select(int, float) */" in c and
-                    "#ifndef C_AUTOTMPL_SELECT_INT__FOO_" in c and
+                    "#ifndef C_AUTOTMPL_select_int_2C_20Foo" in c and
                     "#ifdef FOO_H" in c and
                     "#define First int" in c and
                     "#define Second Foo" in c and
@@ -448,12 +577,59 @@ int other(void) {
                         print(f.read()[-4000:], file=sys.stderr)
                     return 1
 
+                stc_content = wait_for_content(stc_generated, lambda c: (
+                    "/* c-autotmpl: vec(Foo) */" in c and
+                    "#ifdef FOO_H" in c and
+                    "#define i_type vec_Foo" in c and
+                    "#define i_key Foo" in c and
+                    "#define vec_size(...) "
+                    "C_AUTOTMPL_STC_ADAPTER_CAT(vec(__VA_ARGS__), _size)" in c and
+                    "#define vec_frobnicate(...) "
+                    "C_AUTOTMPL_STC_ADAPTER_CAT(vec(__VA_ARGS__), "
+                    "_frobnicate)" in c and
+                    "#undef i_key\n#undef i_type" in c and
+                    "/* c-autotmpl: vec(cstr) */" in c and
+                    "#define i_type vec_cstr" in c and
+                    "#define i_key cstr" in c and
+                    "#define i_traits (c_pro_key | c_use_eq)" in c and
+                    "#undef i_traits\n#undef i_key\n#undef i_type" in c and
+                    "/* c-autotmpl: vec(size) */" not in c and
+                    "#define TMPL_HEADER" not in c and
+                    "#define T Foo" not in c
+                ))
+                if stc_content is None:
+                    print("timed out waiting for STC profile generation",
+                          file=sys.stderr)
+                    with open(log_path, errors="replace") as f:
+                        print(f.read()[-4000:], file=sys.stderr)
+                    return 1
+
+                send(proc, {
+                    "jsonrpc": "2.0",
+                    "method": "textDocument/didChange",
+                    "params": {
+                        "textDocument": {"uri": uri, "version": 2},
+                        "contentChanges": [{"text": text1_future}],
+                    },
+                })
+                future_content = wait_for_content(stc_generated, lambda c: (
+                    "#define vec_future(...) "
+                    "C_AUTOTMPL_STC_ADAPTER_CAT(vec(__VA_ARGS__), _future)" in c and
+                    c.count("/* c-autotmpl: vec(Foo) */") == 1
+                ))
+                if future_content is None:
+                    print("plugin did not append a new adapter operation",
+                          file=sys.stderr)
+                    with open(log_path, errors="replace") as f:
+                        print(f.read()[-4000:], file=sys.stderr)
+                    return 1
+
                 split_impl_content = wait_for_content(split_impl, lambda c: (
                     "/* c-autotmpl: Split(int) */" in c and
                     "/* Generated by c-autotmpl. Do not edit. */" in c and
                     "#undef TMPL_HEADER\n" in c and
                     '#include "../../tmpl/split.h"' in c and
-                    "#ifndef C_AUTOTMPL_IMPL_SPLIT_INT_" in c and
+                    "#ifndef C_AUTOTMPL_IMPL_Split_int" in c and
                     "#define TMPL_HEADER" not in c
                 ))
                 if split_impl_content is None:
@@ -477,6 +653,20 @@ int other(void) {
                     stdout_path, uri, 1, no_template_errors, timeout=10)
                 if diags is None:
                     print("clangd published template-name errors", file=sys.stderr)
+                    with open(stdout_path, errors="replace") as f:
+                        print(f.read()[-6000:], file=sys.stderr)
+                    return 1
+
+                published = []
+                for msg in messages(stdout_path):
+                    if msg.get("method") != "textDocument/publishDiagnostics":
+                        continue
+                    params = msg.get("params", {})
+                    if params.get("uri") == uri and params.get("version") == 1:
+                        published.append(params.get("diagnostics", []))
+                if any(not no_template_errors(d) for d in published):
+                    print("clangd briefly published template-name errors",
+                          file=sys.stderr)
                     with open(stdout_path, errors="replace") as f:
                         print(f.read()[-6000:], file=sys.stderr)
                     return 1
@@ -591,7 +781,7 @@ int impl_probe(void) {
                     "jsonrpc": "2.0",
                     "method": "textDocument/didChange",
                     "params": {
-                        "textDocument": {"uri": uri, "version": 2},
+                        "textDocument": {"uri": uri, "version": 3},
                         "contentChanges": [{"text": text2}],
                     },
                 })
@@ -654,6 +844,17 @@ int impl_probe(void) {
                         print(f.read()[-4000:], file=sys.stderr)
                     return 1
 
+                pruned_stc = wait_for_content(stc_generated, lambda c: (
+                    "/* c-autotmpl: vec(Foo) */" not in c and
+                    "/* c-autotmpl: vec(cstr) */" not in c
+                ), timeout=10) is not None
+                if not pruned_stc:
+                    print("plugin did not prune STC profile blocks",
+                          file=sys.stderr)
+                    with open(log_path, errors="replace") as f:
+                        print(f.read()[-4000:], file=sys.stderr)
+                    return 1
+
                 pruned_split_impl = wait_for_content(split_impl, lambda c: (
                     "/* c-autotmpl: Split(int) */" not in c
                 ), timeout=10) is not None
@@ -697,6 +898,8 @@ int impl_probe(void) {
                                "[c-autotmpl] generated Option(int)",
                                "[c-autotmpl] generated User(Option, int)",
                                "[c-autotmpl] generated Split(int)",
+                                "[c-autotmpl] generated vec(Foo)",
+                                "[c-autotmpl] generated vec(cstr)",
                                "[c-autotmpl] generated implementation Split(int)",
                                "removed /* c-autotmpl: Thing(Foo) */",
                                "removed /* c-autotmpl: Thing(Box_float) */",

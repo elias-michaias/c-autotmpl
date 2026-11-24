@@ -1029,6 +1029,13 @@ static char *generated_header_guard(const char *path) {
 /* ------------------------------ registry ------------------------------- */
 
 typedef enum { TEMPLATE_TYPE, TEMPLATE_FUNCTION } TemplateKind;
+typedef enum { ARG_TYPE, ARG_NAME, ARG_FLAGS, ARG_OPAQUE, ARG_KEY, ARG_VALUE } ArgRole;
+typedef enum { PRESET_NONE, PRESET_STC_STATIC, PRESET_STC_SHARED } PresetKind;
+
+typedef struct {
+  ArgRole role;
+  char *macro; /* NULL means use the decorator parameter name */
+} ArgSpec;
 
 typedef struct {
   TemplateKind kind;
@@ -1041,6 +1048,10 @@ typedef struct {
   char *impl;             /* grouped implementation TU, when split */
   char *impl_include;     /* template header relative to impl TU */
   int has_tmpl_header;
+  PresetKind preset;
+  ArgSpec *specs;         /* NULL means legacy behavior */
+  size_t nspecs;
+  Set adapter_ops;        /* STC operation names seen at call sites */
 } TemplateDef;
 
 typedef struct {
@@ -1054,6 +1065,319 @@ static TemplateDef *registry_find(const Registry *r, const char *name) {
       return d;
   }
   return NULL;
+}
+
+static int is_type_arg(const TemplateDef *tmpl, size_t i) {
+  if (i >= tmpl->nspecs)
+    return 1;
+  ArgRole role = tmpl->specs[i].role;
+  return role == ARG_TYPE || role == ARG_KEY || role == ARG_VALUE;
+}
+
+static const char *parameter_name(const TemplateDef *tmpl, size_t i) {
+  if (i < tmpl->nparams)
+    return tmpl->params[i];
+  return "T";
+}
+
+static const char *arg_macro_name(const TemplateDef *tmpl, size_t i) {
+  if (i < tmpl->nspecs && tmpl->specs[i].macro)
+    return tmpl->specs[i].macro;
+  return parameter_name(tmpl, i);
+}
+
+static int parse_preset_name(const char *name, PresetKind *out) {
+  if (!name)
+    return 0;
+  if (strcmp(name, "none") == 0)
+    *out = PRESET_NONE;
+  else if (strcmp(name, "stc") == 0 || strcmp(name, "stc-static") == 0)
+    *out = PRESET_STC_STATIC;
+  else if (strcmp(name, "stc-shared") == 0)
+    *out = PRESET_STC_SHARED;
+  else
+    return 0;
+  return 1;
+}
+
+static int is_stc_preset(const TemplateDef *tmpl) {
+  return tmpl->preset == PRESET_STC_STATIC ||
+         tmpl->preset == PRESET_STC_SHARED;
+}
+
+/* Auto-detection is deliberately conservative. An STC include is decisive;
+ * otherwise two distinct STC configuration macros must be present. Ordinary
+ * templates that happen to declare one macro keep their original behavior. */
+static int looks_like_stc_header(const TemplateDef *tmpl) {
+  char *content = read_file(tmpl->header, NULL);
+  if (!content)
+    return 0;
+  static const char *markers[] = {"i_key",   "i_val",      "i_type",
+                                  "i_traits", "i_implement", "i_header",
+                                  "i_capacity", "i_allocator"};
+  int score = strstr(content, "stc/") ? 2 : 0;
+  for (size_t i = 0; i < sizeof(markers) / sizeof(markers[0]); ++i)
+    if (strstr(content, markers[i]))
+      ++score;
+  free(content);
+  return score >= 2;
+}
+
+/* New-style STC wrappers declare only type-like parameters. The preset derives
+ * the container name and trait defaults, so call sites stay parametric:
+ * stc_vec(int), not stc_vec(IntVec, int, 0). Explicit Name or Flags parameters
+ * keep the original advanced escape hatch. */
+static int stc_derived_mode(const TemplateDef *tmpl) {
+  if (!is_stc_preset(tmpl))
+    return 0;
+  for (size_t i = 0; i < tmpl->nspecs; ++i) {
+    ArgRole role = tmpl->specs[i].role;
+    if (role == ARG_NAME || role == ARG_FLAGS || role == ARG_OPAQUE)
+      return 0;
+  }
+  return 1;
+}
+
+/* Types supplied by STC itself have no c-autotmpl header guard to test. */
+static int stc_builtin_type(const char *spelling) {
+  static const char *names[] = {"cstr",       "csview",      "csviewz",
+                                "zsview",     "cstr_buf",    "cstr_raw",
+                                "cstr_value", "csview_value", "csviewz_value",
+                                "cbits",      "coption",     "cbox",
+                                "carc",       "crc"};
+  for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i)
+    if (strcmp(spelling, names[i]) == 0)
+      return 1;
+  return 0;
+}
+
+static int skips_stc_guard(const TemplateDef *tmpl, const char *arg) {
+  return is_stc_preset(tmpl) && stc_builtin_type(arg);
+}
+
+static int stc_string_type(const char *spelling) {
+  static const char *names[] = {"cstr", "csview", "csviewz", "zsview"};
+  char *type = strip_qualifiers(spelling);
+  int found = 0;
+  for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i)
+    if (strcmp(type, names[i]) == 0) {
+      found = 1;
+      break;
+    }
+  free(type);
+  return found;
+}
+
+/* STC arguments are identified by the decorator parameter names. This is the
+ * thin built-in preset; user templates keep the original macro names. */
+static ArgSpec stc_arg_spec(const char *param) {
+  struct Mapping {
+    const char *name;
+    ArgRole role;
+    const char *macro;
+  };
+  static const struct Mapping map[] = {
+      {"Name", ARG_NAME, "i_type"},        {"Container", ARG_NAME, "i_type"},
+      {"Ct", ARG_NAME, "i_type"},          {"Key", ARG_KEY, "i_key"},
+      {"K", ARG_KEY, "i_key"},             {"Elem", ARG_KEY, "i_key"},
+      {"Element", ARG_KEY, "i_key"},       {"T", ARG_KEY, "i_key"},
+      {"Val", ARG_VALUE, "i_val"},         {"Value", ARG_VALUE, "i_val"},
+      {"V", ARG_VALUE, "i_val"},           {"Traits", ARG_FLAGS, "i_traits"},
+      {"Flags", ARG_FLAGS, "i_traits"},    {"Opts", ARG_FLAGS, "i_traits"},
+      {"Options", ARG_FLAGS, "i_traits"},  {"Alloc", ARG_OPAQUE, "i_allocator"},
+      {"Allocator", ARG_OPAQUE, "i_allocator"},
+      {"Cap", ARG_OPAQUE, "i_capacity"},
+      {"Capacity", ARG_OPAQUE, "i_capacity"},
+  };
+  ArgSpec spec;
+  spec.role = ARG_TYPE;
+  spec.macro = xstrdup(param);
+  for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); ++i) {
+    if (strcmp(param, map[i].name) == 0) {
+      spec.role = map[i].role;
+      free(spec.macro);
+      spec.macro = xstrdup(map[i].macro);
+      break;
+    }
+  }
+  return spec;
+}
+
+static int stc_name_selected(const TemplateDef *def, const Set *names,
+                             int has_names, int auto_detect) {
+  if (auto_detect && looks_like_stc_header(def))
+    return 1;
+  if (has_names)
+    return set_has(names, def->name);
+  return strncmp(def->name, "stc_", 4) == 0;
+}
+
+static void apply_preset(Registry *reg, PresetKind preset, const Set *names,
+                         int has_names, int auto_detect) {
+  for (size_t i = 0; i < reg->items.len; ++i) {
+    TemplateDef *def = (TemplateDef *)reg->items.items[i];
+    for (size_t j = 0; j < def->nspecs; ++j)
+      free(def->specs[j].macro);
+    free(def->specs);
+    def->specs = NULL;
+    def->nspecs = 0;
+    if (preset == PRESET_NONE ||
+        !stc_name_selected(def, names, has_names, auto_detect)) {
+      def->preset = PRESET_NONE;
+      continue;
+    }
+    def->preset = preset;
+    size_t count = def->nparams ? def->nparams : 1;
+    def->specs = (ArgSpec *)xmalloc(count * sizeof(ArgSpec));
+    def->nspecs = count;
+    for (size_t j = 0; j < count; ++j)
+      def->specs[j] = stc_arg_spec(parameter_name(def, j));
+  }
+}
+
+static char *stc_container_name(const TemplateDef *tmpl, Vec *args) {
+  static const char hex[] = "0123456789ABCDEF";
+  Str out;
+  str_init(&out);
+  str_append(&out, tmpl->name);
+  for (size_t i = 0; i < args->len; ++i) {
+    char *arg = trim_copy((char *)args->items[i]);
+    str_append_char(&out, '_');
+    for (size_t j = 0; arg[j]; ++j) {
+      unsigned char c = (unsigned char)arg[j];
+      if (is_ident_char((char)c)) {
+        str_append_char(&out, (char)c);
+      } else {
+        str_append_char(&out, '_');
+        str_append_char(&out, hex[c >> 4]);
+        str_append_char(&out, hex[c & 0xF]);
+      }
+    }
+    free(arg);
+  }
+  return str_take(&out);
+}
+
+static char *stc_traits(const TemplateDef *tmpl, Vec *args) {
+  if (!stc_derived_mode(tmpl))
+    return NULL;
+  int key = 0, val = 0;
+  for (size_t i = 0; i < args->len; ++i) {
+    if (!stc_string_type((char *)args->items[i]))
+      continue;
+    ArgRole role = i < tmpl->nspecs ? tmpl->specs[i].role : ARG_TYPE;
+    if (role == ARG_VALUE)
+      val = 1;
+    else
+      key = 1;
+  }
+  if (!key && !val)
+    return NULL;
+  Str out;
+  str_init(&out);
+  str_append_char(&out, '(');
+  if (key)
+    str_append(&out, "c_pro_key");
+  if (val) {
+    if (key)
+      str_append(&out, " | ");
+    str_append(&out, "c_pro_val");
+  }
+  if (key)
+    str_append(&out, " | c_use_eq");
+  str_append_char(&out, ')');
+  return str_take(&out);
+}
+
+static int parse_bool_text(const char *text) {
+  if (!text)
+    return -1;
+  while (is_space(*text))
+    ++text;
+  if (strncmp(text, "true", 4) == 0 || strncmp(text, "1", 1) == 0 ||
+      strncmp(text, "yes", 3) == 0 || strncmp(text, "on", 2) == 0)
+    return 1;
+  if (strncmp(text, "false", 5) == 0 || strncmp(text, "0", 1) == 0 ||
+      strncmp(text, "no", 2) == 0 || strncmp(text, "off", 3) == 0)
+    return 0;
+  return -1;
+}
+
+static void add_name_list(Set *out, const char *text) {
+  const char *p = text;
+  while (*p) {
+    while (is_space(*p) || *p == ',')
+      ++p;
+    if (!*p)
+      break;
+    const char *begin = p;
+    while (*p && !is_space(*p) && *p != ',')
+      ++p;
+    if (p > begin) {
+      char *name = xstrdup_n(begin, (size_t)(p - begin));
+      set_add(out, name);
+      free(name);
+    }
+  }
+}
+
+/* Configuration comes only from explicit CLI options and environment
+ * variables. Projects can source an autotmpl.env file from their Makefile to
+ * set the variables for a run. */
+static PresetKind resolve_preset(const char *configured, const Set *cli_names,
+                                 int has_cli_names, int cli_auto,
+                                 char **name_out, Set *names_out,
+                                 int *has_names_out, int *auto_out) {
+  const char *env = getenv("C_AUTOTMPL_PROFILE");
+  PresetKind preset = PRESET_NONE;
+  char *name = NULL;
+  int profile_chosen = 0;
+
+  if (configured && configured[0] && parse_preset_name(configured, &preset)) {
+    name = xstrdup(configured);
+    profile_chosen = 1;
+  } else if (env && env[0] && parse_preset_name(env, &preset)) {
+    name = xstrdup(env);
+    profile_chosen = 1;
+  }
+
+  Set *names = names_out;
+  if (names) {
+    names->items = NULL;
+    names->len = names->cap = 0;
+    if (has_cli_names && cli_names) {
+      for (size_t i = 0; i < cli_names->len; ++i)
+        set_add(names, cli_names->items[i]);
+    } else {
+      const char *list = getenv("C_AUTOTMPL_STC_TEMPLATES");
+      if (list && list[0])
+        add_name_list(names, list);
+    }
+    if (has_names_out)
+      *has_names_out = names->len != 0;
+  }
+
+  int auto_detect = cli_auto;
+  if (!auto_detect)
+    auto_detect = parse_bool_text(getenv("C_AUTOTMPL_STC_AUTO"));
+  if (auto_detect < 0)
+    auto_detect = 0;
+  if (auto_out)
+    *auto_out = auto_detect;
+
+  if ((names && names->len) || auto_detect) {
+    if (!profile_chosen) {
+      preset = PRESET_STC_STATIC;
+      free(name);
+      name = xstrdup("stc");
+    }
+  }
+
+  if (name_out)
+    *name_out = name;
+  else
+    free(name);
+  return preset;
 }
 
 /* A bare registered type-template name is a lexical constructor argument, not
@@ -1567,6 +1891,15 @@ static void usage_free(Usage *u) {
   free(u);
 }
 
+static char *canonicalize_type(const char *type, Registry *reg, Vec *expanded);
+
+static char *canonicalize_argument(const char *arg, const TemplateDef *tmpl,
+                                   size_t index, Registry *reg, Vec *expanded) {
+  if (is_type_arg(tmpl, index))
+    return canonicalize_type(arg, reg, expanded);
+  return trim_copy(arg);
+}
+
 static void copy_deps(Vec *out, Vec *expanded, size_t begin) {
   for (size_t i = begin; i < expanded->len; ++i) {
     Usage *u = (Usage *)expanded->items[i];
@@ -1763,7 +2096,8 @@ static void scan_template_usage(const TemplateDef *tmpl, const char *raw,
     if (placeholders)
       goto cleanup;
     for (size_t i = 0; i < raw_args.len; ++i) {
-      char *canon = canonicalize_type((char *)raw_args.items[i], reg, &expanded);
+      char *canon = canonicalize_argument((char *)raw_args.items[i], tmpl, i,
+                                          reg, &expanded);
       if (!canon[0]) {
         free(canon);
         goto cleanup;
@@ -1777,7 +2111,7 @@ static void scan_template_usage(const TemplateDef *tmpl, const char *raw,
       goto cleanup;
     }
     free(trimmed);
-    single_canon = canonicalize_type(raw, reg, &expanded);
+    single_canon = canonicalize_argument(raw, tmpl, 0, reg, &expanded);
     single_pushed = single_canon[0] != 0;
     if (single_pushed)
       vec_push(&canon_args, single_canon);
@@ -1844,7 +2178,8 @@ static void scan_function_usage(const TemplateDef *tmpl, const char *raw,
   canon_args.items = NULL;
   canon_args.len = canon_args.cap = 0;
   for (size_t i = 0; i < raw_args.len; ++i) {
-    char *canon = canonicalize_type((char *)raw_args.items[i], reg, &expanded);
+    char *canon = canonicalize_argument((char *)raw_args.items[i], tmpl, i,
+                                        reg, &expanded);
     if (!canon[0]) {
       free(canon);
       goto cleanup;
@@ -1990,10 +2325,63 @@ static void scan_usages_impl(const char *code, Registry *reg, Vec *out,
         }
       }
     } else {
-      const char *arg;
-      TemplateDef *mangled = registry_match_mangled(reg, ident, &arg);
-      if (mangled)
-        scan_template_usage(mangled, arg, reg, out, scan_headers);
+      /* A generated STC adapter reads as vec_push(int)(...). The leading
+       * identifier is a call, not the mangled type vec_push. For STC-derived
+       * templates, remember the operation and instantiate the underlying type.
+       * Other call-like identifiers keep the old skip behavior. */
+      size_t after = end;
+      while (after < n && is_space(clean[after]))
+        ++after;
+      if (after < n && clean[after] == '(') {
+        size_t begin = after + 1;
+        int depth = 1;
+        size_t close = begin;
+        for (; close < n && depth > 0; ++close) {
+          if (clean[close] == '(')
+            ++depth;
+          else if (clean[close] == ')')
+            --depth;
+        }
+        size_t call = close;
+        while (call < n && is_space(clean[call]))
+          ++call;
+        if (depth == 0 && close > begin && call < n && clean[call] == '(') {
+          const char *arg;
+          TemplateDef *mangled = registry_match_mangled(reg, ident, &arg);
+          if (mangled && stc_derived_mode(mangled) && arg[0] &&
+              is_ident_start(arg[0])) {
+            int valid_op = 1;
+            for (size_t k = 0; arg[k]; ++k)
+              if (!is_ident_char(arg[k]))
+                valid_op = 0;
+            if (valid_op) {
+              char *raw = xstrdup_n(clean + begin, close - begin - 1);
+              char *type = trim_copy(raw);
+              if (type[0]) {
+                size_t before = out->len;
+                scan_template_usage(mangled, type, reg, out, scan_headers);
+                for (size_t k = before; k < out->len; ++k) {
+                  Usage *u = (Usage *)out->items[k];
+                  if (u->tmpl == mangled) {
+                    set_add(&mangled->adapter_ops, arg);
+                    break;
+                  }
+                }
+              }
+              free(type);
+              free(raw);
+              i = close;
+              free(ident);
+              continue;
+            }
+          }
+        }
+      } else {
+        const char *arg;
+        TemplateDef *mangled = registry_match_mangled(reg, ident, &arg);
+        if (mangled)
+          scan_template_usage(mangled, arg, reg, out, scan_headers);
+      }
     }
     free(ident);
     i = end;
@@ -2043,6 +2431,14 @@ static char *instantiation_marker(const char *name, const char *type) {
   return str_take(&out);
 }
 
+static int is_macro_hex_digit(unsigned char c) {
+  return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+         (c >= 'A' && c <= 'F');
+}
+
+/* Readable and collision-free: letters and digits stay as written, while other
+ * bytes use _HH. A literal underscore followed by two hex digits is escaped as
+ * _5F so it cannot be mistaken for an escape sequence. */
 static char *presence_macro_prefixed(const char *prefix, const char *name,
                                      const char *type) {
   Str key;
@@ -2050,29 +2446,27 @@ static char *presence_macro_prefixed(const char *prefix, const char *name,
   str_append(&key, name);
   str_append_char(&key, '_');
   str_append(&key, type);
-  uint32_t hash = 2166136261u;
-  for (size_t i = 0; i < key.len; ++i) {
-    hash ^= (unsigned char)key.data[i];
-    hash *= 16777619u;
-  }
+  static const char hex[] = "0123456789ABCDEF";
   Str out;
   str_init(&out);
   str_append(&out, prefix);
   for (size_t i = 0; i < key.len; ++i) {
     unsigned char c = (unsigned char)key.data[i];
-    char upper;
-    if (c >= 'a' && c <= 'z')
-      upper = (char)(c - 'a' + 'A');
-    else if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))
-      upper = (char)c;
-    else
-      upper = '_';
-    str_append_char(&out, upper);
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+        (c >= '0' && c <= '9')) {
+      str_append_char(&out, (char)c);
+    } else if (c == '_' && i + 2 < key.len &&
+               is_macro_hex_digit((unsigned char)key.data[i + 1]) &&
+               is_macro_hex_digit((unsigned char)key.data[i + 2])) {
+      str_append(&out, "_5F");
+    } else if (c == '_') {
+      str_append_char(&out, '_');
+    } else {
+      str_append_char(&out, '_');
+      str_append_char(&out, hex[c >> 4]);
+      str_append_char(&out, hex[c & 0xF]);
+    }
   }
-  char hex[9];
-  snprintf(hex, sizeof(hex), "%08X", hash);
-  str_append_char(&out, '_');
-  str_append(&out, hex);
   str_free(&key);
   return str_take(&out);
 }
@@ -2149,12 +2543,6 @@ static size_t param_count(const TemplateDef *tmpl) {
   return 1;
 }
 
-static const char *param_name(const TemplateDef *tmpl, size_t i) {
-  if (i < tmpl->nparams)
-    return tmpl->params[i];
-  return "T";
-}
-
 static int all_seen(const char *seen, size_t n) {
   for (size_t i = 0; i < n; ++i)
     if (!seen[i])
@@ -2167,7 +2555,7 @@ static int has_manual_block(const char *content, const TemplateDef *tmpl,
   size_t count = param_count(tmpl);
   if (args->len < count)
     return 0;
-  const char *param = param_name(tmpl, 0);
+  const char *param = arg_macro_name(tmpl, 0);
   const char *type = (char *)args->items[0];
   const char *p = content;
   while (*p) {
@@ -2183,7 +2571,7 @@ static int has_manual_block(const char *content, const TemplateDef *tmpl,
       while (*q) {
         char *body = xstrdup_n(q, (size_t)(next_line(q) - q));
         for (size_t i = 0; i < count; ++i)
-          if (undef_matches(body, param_name(tmpl, i)))
+          if (undef_matches(body, arg_macro_name(tmpl, i)))
             seen[i] = 1;
         free(body);
         q = next_line(q);
@@ -2220,7 +2608,7 @@ static int has_manual_block(const char *content, const TemplateDef *tmpl,
         if (include_matches(body, tmpl->include))
           saw_include = 1;
         for (size_t j = 0; j < count; ++j) {
-          const char *name = param_name(tmpl, j);
+          const char *name = arg_macro_name(tmpl, j);
           char *line_define = define_type_from_line(body, name);
           if (line_define && strcmp(line_define, (char *)args->items[j]) == 0)
             seen_def[j] = 1;
@@ -2296,7 +2684,8 @@ static int collect_guards(Usage *usage, EmitCtx *ctx, Set *guards) {
   int missing = 0;
   for (size_t i = 0; i < usage->args.len; ++i) {
     const char *arg = (char *)usage->args.items[i];
-    if (!needs_guard(arg) || is_constructor_arg(arg, ctx->reg))
+    if (!is_type_arg(usage->tmpl, i) || skips_stc_guard(usage->tmpl, arg) ||
+        !needs_guard(arg) || is_constructor_arg(arg, ctx->reg))
       continue;
     char *guard = guard_for_arg(arg, ctx);
     if (guard[0])
@@ -2306,6 +2695,108 @@ static int collect_guards(Usage *usage, EmitCtx *ctx, Set *guards) {
     free(guard);
   }
   return missing;
+}
+
+static void append_arg_defines(Str *out, const TemplateDef *tmpl, Vec *args) {
+  size_t count = param_count(tmpl);
+  for (size_t i = 0; i < count && i < args->len; ++i) {
+    str_append(out, "#define ");
+    str_append(out, arg_macro_name(tmpl, i));
+    str_append_char(out, ' ');
+    str_append(out, (char *)args->items[i]);
+    str_append_char(out, '\n');
+  }
+}
+
+static void append_arg_undefs(Str *out, const TemplateDef *tmpl) {
+  size_t count = param_count(tmpl);
+  for (size_t i = count; i > 0; --i) {
+    str_append(out, "#undef ");
+    str_append(out, arg_macro_name(tmpl, i - 1));
+    str_append_char(out, '\n');
+  }
+}
+
+static void append_stc_defines(Str *out, const TemplateDef *tmpl, Vec *args) {
+  if (!stc_derived_mode(tmpl)) {
+    append_arg_defines(out, tmpl, args);
+    return;
+  }
+  char *name = stc_container_name(tmpl, args);
+  str_append(out, "#define i_type ");
+  str_append(out, name);
+  str_append_char(out, '\n');
+  free(name);
+  append_arg_defines(out, tmpl, args);
+  char *traits = stc_traits(tmpl, args);
+  if (traits) {
+    str_append(out, "#define i_traits ");
+    str_append(out, traits);
+    str_append_char(out, '\n');
+    free(traits);
+  }
+}
+
+static void append_stc_undefs(Str *out, const TemplateDef *tmpl, Vec *args) {
+  if (!stc_derived_mode(tmpl)) {
+    append_arg_undefs(out, tmpl);
+    return;
+  }
+  char *traits = stc_traits(tmpl, args);
+  if (traits) {
+    str_append(out, "#undef i_traits\n");
+    free(traits);
+  }
+  append_arg_undefs(out, tmpl);
+  str_append(out, "#undef i_type\n");
+}
+
+/* Derived STC wrappers expose type templates such as vec(int). Each adapter
+ * macro sampled from a call site adds the matching function template, such as
+ * vec_push(int)(&xs, 7). Operation names come from source, not from a baked-in
+ * STC version list. */
+static void append_stc_adapter_cat(Str *out) {
+  str_append(out, "#ifndef C_AUTOTMPL_STC_ADAPTER_CAT\n");
+  str_append(out, "#define C_AUTOTMPL_STC_ADAPTER_CAT_I(A, B) A##B\n");
+  str_append(out,
+             "#define C_AUTOTMPL_STC_ADAPTER_CAT(A, B) "
+             "C_AUTOTMPL_STC_ADAPTER_CAT_I(A, B)\n");
+  str_append(out, "#endif\n");
+}
+
+static void append_stc_adapter_macro(Str *out, const TemplateDef *tmpl,
+                                     const char *op, int guarded) {
+  if (guarded) {
+    str_append(out, "#ifndef C_AUTOTMPL_STC_ADAPTER_");
+    str_append(out, tmpl->name);
+    str_append_char(out, '_');
+    str_append(out, op);
+    str_append_char(out, '\n');
+    str_append(out, "#define C_AUTOTMPL_STC_ADAPTER_");
+    str_append(out, tmpl->name);
+    str_append_char(out, '_');
+    str_append(out, op);
+    str_append_char(out, '\n');
+  }
+  str_append(out, "#define ");
+  str_append(out, tmpl->name);
+  str_append_char(out, '_');
+  str_append(out, op);
+  str_append(out, "(...) C_AUTOTMPL_STC_ADAPTER_CAT(");
+  str_append(out, tmpl->name);
+  str_append(out, "(__VA_ARGS__), _");
+  str_append(out, op);
+  str_append(out, ")\n");
+  if (guarded)
+    str_append(out, "#endif\n");
+}
+
+static void append_stc_adapters(Str *out, const TemplateDef *tmpl) {
+  if (!stc_derived_mode(tmpl) || !tmpl->adapter_ops.len)
+    return;
+  append_stc_adapter_cat(out);
+  for (size_t i = 0; i < tmpl->adapter_ops.len; ++i)
+    append_stc_adapter_macro(out, tmpl, tmpl->adapter_ops.items[i], 0);
 }
 
 static char *make_block(Usage *usage, Set *guards) {
@@ -2329,27 +2820,24 @@ static char *make_block(Usage *usage, Set *guards) {
   str_append(&out, presence);
   str_append_char(&out, '\n');
 
-  size_t count = param_count(tmpl);
-  for (size_t i = 0; i < count; ++i) {
-    str_append(&out, "#define ");
-    str_append(&out, param_name(tmpl, i));
-    str_append_char(&out, ' ');
-    str_append(&out, (char *)usage->args.items[i]);
-    str_append_char(&out, '\n');
-  }
-  if (tmpl->has_tmpl_header)
+  append_stc_defines(&out, tmpl, &usage->args);
+  append_stc_adapters(&out, tmpl);
+  int shared_stc = tmpl->preset == PRESET_STC_SHARED;
+  if (tmpl->has_tmpl_header && !is_stc_preset(tmpl))
     str_append(&out, "#define TMPL_HEADER 1\n");
+  if (shared_stc) {
+    str_append(&out, "#define TMPL_HEADER 1\n");
+    str_append(&out, "#define i_header 1\n");
+  }
   str_append(&out, "#include \"");
   str_append(&out, tmpl->include);
   str_append_char(&out, '"');
   str_append_char(&out, '\n');
-  if (tmpl->has_tmpl_header)
+  if (shared_stc)
+    str_append(&out, "#undef i_header\n");
+  if ((tmpl->has_tmpl_header && !is_stc_preset(tmpl)) || shared_stc)
     str_append(&out, "#undef TMPL_HEADER\n");
-  for (size_t i = count; i > 0; --i) {
-    str_append(&out, "#undef ");
-    str_append(&out, param_name(tmpl, i - 1));
-    str_append_char(&out, '\n');
-  }
+  append_stc_undefs(&out, tmpl, &usage->args);
   for (size_t i = guards->len; i > 0; --i)
     str_append(&out, "#endif\n");
   str_append(&out, "#endif\n\n");
@@ -2408,6 +2896,99 @@ static int append_block(const char *path, const char *block, EmitCtx *ctx) {
   return rc;
 }
 
+static int file_defines_macro(const char *content, const char *macro) {
+  const char *p = content;
+  while (*p) {
+    const char *end = strchr(p, '\n');
+    size_t n = end ? (size_t)(end - p) : strlen(p);
+    char *line = xstrdup_n(p, n);
+    char *s = line;
+    while (is_space(*s))
+      ++s;
+    if (strncmp(s, "#define", 7) == 0 &&
+        (s[7] == '\0' || is_space(s[7]))) {
+      char *name = read_identifier(s + 7);
+      int found = strcmp(name, macro) == 0;
+      free(name);
+      free(line);
+      if (found)
+        return 1;
+    } else {
+      free(line);
+    }
+    if (!end)
+      break;
+    p = end + 1;
+  }
+  return 0;
+}
+
+/* Adapters live with their template's generated header. New operations are
+ * appended without rewriting existing instantiation blocks, so a source change
+ * that only adds vec_push(int)(...) still updates the generated header. */
+static int ensure_stc_adapters(const char *path, const TemplateDef *tmpl,
+                               EmitCtx *ctx) {
+  if (!stc_derived_mode(tmpl) || !tmpl->adapter_ops.len)
+    return 0;
+  const char *content = cached_file(ctx, path);
+  if (!content[0])
+    return 0;
+
+  Str missing;
+  str_init(&missing);
+  if (!file_defines_macro(content, "C_AUTOTMPL_STC_ADAPTER_CAT"))
+    append_stc_adapter_cat(&missing);
+  for (size_t i = 0; i < tmpl->adapter_ops.len; ++i) {
+    const char *op = tmpl->adapter_ops.items[i];
+    Str name;
+    str_init(&name);
+    str_append(&name, tmpl->name);
+    str_append_char(&name, '_');
+    str_append(&name, op);
+    char *macro = str_take(&name);
+    if (!file_defines_macro(content, macro))
+      append_stc_adapter_macro(&missing, tmpl, op, 1);
+    free(macro);
+  }
+  if (!missing.data) {
+    str_free(&missing);
+    return 0;
+  }
+
+  size_t len = strlen(content);
+  size_t insert = len;
+  const char *p = content;
+  while (*p) {
+    char *line = xstrdup_n(p, (size_t)(next_line(p) - p));
+    char *trimmed = trim_copy(line);
+    if (strncmp(trimmed, "#endif", 6) == 0)
+      insert = (size_t)(p - content);
+    free(trimmed);
+    free(line);
+    const char *next = next_line(p);
+    if (next == p)
+      break;
+    p = next;
+  }
+  if (insert > len)
+    insert = len;
+
+  Str out;
+  str_init(&out);
+  str_append_n(&out, content, insert);
+  str_append(&out, missing.data);
+  str_append_n(&out, content + insert, len - insert);
+  int rc = 0;
+  if (!ctx->dry_run) {
+    rc = write_file(path, out.data ? out.data : "", out.len);
+    if (rc == 0)
+      map_set(&ctx->files, path, out.data ? out.data : "");
+  }
+  str_free(&out);
+  str_free(&missing);
+  return rc;
+}
+
 /* ------------------------- implementation TUs --------------------------- */
 
 static char *make_impl_block(Usage *usage, Set *guards) {
@@ -2429,23 +3010,17 @@ static char *make_impl_block(Usage *usage, Set *guards) {
   str_append(&out, "#define ");
   str_append(&out, presence);
   str_append_char(&out, '\n');
-  size_t count = param_count(tmpl);
-  for (size_t i = 0; i < count; ++i) {
-    str_append(&out, "#define ");
-    str_append(&out, param_name(tmpl, i));
-    str_append_char(&out, ' ');
-    str_append(&out, (char *)usage->args.items[i]);
-    str_append_char(&out, '\n');
-  }
+  append_stc_defines(&out, tmpl, &usage->args);
+  int shared_stc = tmpl->preset == PRESET_STC_SHARED;
+  if (shared_stc)
+    str_append(&out, "#define i_implement 1\n");
   str_append(&out, "#include \"");
   str_append(&out, tmpl->impl_include);
   str_append_char(&out, '"');
   str_append_char(&out, '\n');
-  for (size_t i = count; i > 0; --i) {
-    str_append(&out, "#undef ");
-    str_append(&out, param_name(tmpl, i - 1));
-    str_append_char(&out, '\n');
-  }
+  if (shared_stc)
+    str_append(&out, "#undef i_implement\n");
+  append_stc_undefs(&out, tmpl, &usage->args);
   for (size_t i = guards->len; i > 0; --i)
     str_append(&out, "#endif\n");
   str_append(&out, "#endif\n\n");
@@ -2477,8 +3052,11 @@ static void collect_impl_include_arg(const char *spelling, EmitCtx *ctx,
 }
 
 static void collect_impl_includes(Usage *usage, EmitCtx *ctx, Set *includes) {
-  for (size_t i = 0; i < usage->args.len; ++i)
-    collect_impl_include_arg((char *)usage->args.items[i], ctx, includes);
+  for (size_t i = 0; i < usage->args.len; ++i) {
+    const char *arg = (char *)usage->args.items[i];
+    if (is_type_arg(usage->tmpl, i) && !skips_stc_guard(usage->tmpl, arg))
+      collect_impl_include_arg(arg, ctx, includes);
+  }
 }
 
 static char *build_impl_prologue(const TemplateDef *tmpl, Set *includes) {
@@ -2765,8 +3343,11 @@ static void add_wanted_type(const char *spelling, Registry *reg, Set *wanted) {
 }
 
 static void add_wanted_usage(Usage *usage, Registry *reg, Set *wanted) {
-  for (size_t i = 0; i < usage->args.len; ++i)
-    add_wanted_type((char *)usage->args.items[i], reg, wanted);
+  for (size_t i = 0; i < usage->args.len; ++i) {
+    const char *arg = (char *)usage->args.items[i];
+    if (is_type_arg(usage->tmpl, i) && !skips_stc_guard(usage->tmpl, arg))
+      add_wanted_type(arg, reg, wanted);
+  }
 }
 
 /* -------------------------------- CLI ---------------------------------- */
@@ -2774,13 +3355,19 @@ static void add_wanted_usage(Usage *usage, Registry *reg, Set *wanted) {
 typedef struct {
   Vec inputs;
   char *root;
+  char *profile;
+  Set stc_templates;
+  int has_stc_templates;
+  int stc_auto;
   int dry_run;
   int verbose;
 } Options;
 
 static void usage(const char *prog) {
   fprintf(stderr,
-          "usage: %s [--root DIR] [--dry-run] [--verbose] <file-or-dir>...\n",
+          "usage: %s [--root DIR] [--stc | --profile NAME] "
+          "[--stc-template NAME]... [--stc-auto] [--dry-run] [--verbose] "
+          "<file-or-dir>...\n",
           prog);
 }
 
@@ -2788,6 +3375,11 @@ static int parse_args(int argc, char **argv, Options *opt) {
   opt->inputs.items = NULL;
   opt->inputs.len = opt->inputs.cap = 0;
   opt->root = NULL;
+  opt->profile = NULL;
+  opt->stc_templates.items = NULL;
+  opt->stc_templates.len = opt->stc_templates.cap = 0;
+  opt->has_stc_templates = 0;
+  opt->stc_auto = 0;
   opt->dry_run = 0;
   opt->verbose = 0;
   for (int i = 1; i < argc; ++i) {
@@ -2803,6 +3395,33 @@ static int parse_args(int argc, char **argv, Options *opt) {
       }
       free(opt->root);
       opt->root = xstrdup(argv[++i]);
+      continue;
+    }
+    if (strcmp(a, "--stc") == 0) {
+      free(opt->profile);
+      opt->profile = xstrdup("stc");
+      continue;
+    }
+    if (strcmp(a, "--profile") == 0 || strcmp(a, "-p") == 0) {
+      if (i + 1 >= argc) {
+        fprintf(stderr, "error: %s needs a profile name\n", a);
+        return 0;
+      }
+      free(opt->profile);
+      opt->profile = xstrdup(argv[++i]);
+      continue;
+    }
+    if (strcmp(a, "--stc-template") == 0) {
+      if (i + 1 >= argc) {
+        fprintf(stderr, "error: %s needs a template name\n", a);
+        return 0;
+      }
+      set_add(&opt->stc_templates, argv[++i]);
+      opt->has_stc_templates = 1;
+      continue;
+    }
+    if (strcmp(a, "--stc-auto") == 0) {
+      opt->stc_auto = 1;
       continue;
     }
     if (strcmp(a, "--dry-run") == 0 || strcmp(a, "-n") == 0) {
@@ -2940,10 +3559,33 @@ int main(int argc, char **argv) {
   }
 
   char *root = determine_root(&opt, &files);
+  PresetKind preset = PRESET_NONE;
+  char *preset_name = NULL;
+  Set preset_names;
+  preset_names.items = NULL;
+  preset_names.len = preset_names.cap = 0;
+  int has_preset_names = 0;
+  int stc_auto = 0;
+  if (opt.profile && !parse_preset_name(opt.profile, &preset)) {
+    fprintf(stderr, "error: unknown profile: %s\n", opt.profile);
+    return 1;
+  }
+  preset = resolve_preset(opt.profile, &opt.stc_templates,
+                          opt.has_stc_templates, opt.stc_auto, &preset_name,
+                          &preset_names, &has_preset_names, &stc_auto);
+  if (opt.verbose && preset_name)
+    printf("profile %s\n", preset_name);
+  free(preset_name);
+  if (opt.verbose && has_preset_names)
+    printf("stc templates=%zu\n", preset_names.len);
+  if (opt.verbose && stc_auto)
+    printf("stc auto=1\n");
+
   Registry reg;
   reg.items.items = NULL;
   reg.items.len = reg.items.cap = 0;
   registry_scan(&reg, root);
+  apply_preset(&reg, preset, &preset_names, has_preset_names, stc_auto);
   if (!reg.items.len) {
     if (opt.verbose)
       printf("no templates found under %s\n", root);
@@ -3016,11 +3658,16 @@ int main(int argc, char **argv) {
       const char *output = ((Usage *)fu->usages.items[i])->tmpl->generated;
       for (size_t j = begin; j <= i; ++j) {
         Usage *u = (Usage *)fu->usages.items[j];
+        if (ensure_stc_adapters(output, u->tmpl, &emit) != 0)
+          return 1;
         if (emit_usage(u, output, &emit, &fu->usages, begin, i) != 0)
           return 1;
-        if (j != i && strcmp(u->tmpl->generated, output) != 0 &&
-            emit_usage(u, u->tmpl->generated, &emit, NULL, 0, 0) != 0)
-          return 1;
+        if (j != i && strcmp(u->tmpl->generated, output) != 0) {
+          if (ensure_stc_adapters(u->tmpl->generated, u->tmpl, &emit) != 0)
+            return 1;
+          if (emit_usage(u, u->tmpl->generated, &emit, NULL, 0, 0) != 0)
+            return 1;
+        }
       }
     }
   }

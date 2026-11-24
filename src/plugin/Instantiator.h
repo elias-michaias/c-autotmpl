@@ -34,6 +34,12 @@ public:
   bool has(const TemplateDef &Template, llvm::StringRef TypeSpelling,
            llvm::StringRef OutputHeader = {});
 
+  /// Appends adapter macros for new call-site operations to an existing
+  /// generated header. Returns true when the file changed.
+  bool ensureAdapters(const TemplateDef &Template,
+                      llvm::ArrayRef<llvm::StringRef> Ops,
+                      llvm::StringRef OutputHeader, std::string &Error);
+
   /// Removes generated blocks that are not in Keep. Returns true and fills
   /// Removed when the generated header changed.
   bool prune(const TemplateDef &Template, const llvm::StringSet<> &Keep,
@@ -51,7 +57,8 @@ public:
       llvm::StringRef GuardMacro, std::string &GenPath, std::string &Error,
       bool DryRun = false,
       llvm::ArrayRef<DependencyGuard> ExtraGuards = {},
-      llvm::StringRef OutputHeader = {});
+      llvm::StringRef OutputHeader = {},
+      llvm::ArrayRef<llvm::StringRef> AdapterOps = {});
 
   /// Writes one block into the template's grouped implementation source.
   /// IncludeLines are already relative to the implementation source directory.
@@ -85,7 +92,8 @@ std::string instantiationMarker(llvm::StringRef TemplateName,
 std::string makeInstantiationBlock(
     const TemplateDef &Template, llvm::StringRef TypeSpelling,
     llvm::StringRef GuardMacro,
-    llvm::ArrayRef<DependencyGuard> ExtraGuards = {});
+    llvm::ArrayRef<DependencyGuard> ExtraGuards = {},
+    llvm::ArrayRef<llvm::StringRef> AdapterOps = {});
 
 /// Presence macro used by generated implementation sources. It deliberately
 /// uses a different prefix from public headers so the two block sets cannot

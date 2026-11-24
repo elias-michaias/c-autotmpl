@@ -96,6 +96,36 @@ int main() {
   }
   {
     std::error_code EC;
+    raw_fd_ostream OS(join(Root, "tmpl/stc_vec.h"), EC);
+    OS << "// -- template stc_vec(T)\n"
+          "#define stc_vec_CAT_I(A, B) A##B\n"
+          "#define stc_vec_CAT(A, B) stc_vec_CAT_I(A, B)\n"
+          "#define stc_vec(T) stc_vec_CAT(stc_vec_, T)\n"
+          "typedef struct { i_key value; } i_type;\n";
+  }
+  {
+    std::error_code EC;
+    raw_fd_ostream OS(join(Root, "tmpl/stc_vec_explicit.h"), EC);
+    OS << "// -- template stc_vec_explicit(Name, Elem, Traits)\n"
+          "#define stc_vec_explicit(Name, Elem, Traits) Name\n"
+          "typedef struct { i_key value; } i_type;\n";
+  }
+  {
+    std::error_code EC;
+    raw_fd_ostream OS(join(Root, "tmpl/stc_hashmap.h"), EC);
+    OS << "// -- template stc_hashmap(Key, Val)\n"
+          "#define stc_hashmap(Key, Val) stc_hashmap_##Key##_##Val\n"
+          "typedef struct { i_key key; i_val value; } i_type;\n";
+  }
+  {
+    std::error_code EC;
+    raw_fd_ostream OS(join(Root, "tmpl/vec.h"), EC);
+    OS << "// -- template vec(T)\n"
+          "#define vec(T) vec_##T\n"
+          "typedef struct { i_key value; } i_type;\n";
+  }
+  {
+    std::error_code EC;
     raw_fd_ostream OS(join(Root, "other/foo.h"), EC);
     OS << "#ifndef FOO_H\n#define FOO_H\nstruct Foo { int x; };\n#endif\n";
   }
@@ -119,6 +149,7 @@ int main() {
   c_autotmpl::TemplateRegistry Registry;
   Registry.scan(Root);
   assert(!Registry.empty());
+  Registry.applyPreset(c_autotmpl::TemplatePreset::StcStatic);
 
   const c_autotmpl::TemplateDef *Def = Registry.findByName("List");
   assert(Def && Def->Name == "List");
@@ -132,6 +163,66 @@ int main() {
   assert(SplitDef->GeneratedImplSource.find("/gen/impl/split.c") !=
          std::string::npos);
   assert(!Def->HasTmplHeaderGuard);
+
+  const c_autotmpl::TemplateDef *StcDef = Registry.findByName("stc_vec");
+  assert(StcDef && StcDef->Preset == c_autotmpl::TemplatePreset::StcStatic);
+  assert(StcDef->ArgSpecs.size() == 1);
+  assert(StcDef->ArgSpecs[0].Role == c_autotmpl::ArgRole::Key);
+  assert(c_autotmpl::isTypeArgument(*StcDef, 0));
+  assert(c_autotmpl::argumentMacroName(*StcDef, 0) == "i_key");
+  assert(c_autotmpl::usesDerivedStcNames(*StcDef));
+  assert(c_autotmpl::stcContainerName(*StcDef, {"cstr"}) == "stc_vec_cstr");
+
+  const c_autotmpl::TemplateDef *StcExplicitDef =
+      Registry.findByName("stc_vec_explicit");
+  assert(StcExplicitDef &&
+         StcExplicitDef->Preset == c_autotmpl::TemplatePreset::StcStatic);
+  assert(StcExplicitDef->ArgSpecs.size() == 3);
+  assert(StcExplicitDef->ArgSpecs[0].Role == c_autotmpl::ArgRole::Name);
+  assert(StcExplicitDef->ArgSpecs[1].Role == c_autotmpl::ArgRole::Key);
+  assert(StcExplicitDef->ArgSpecs[2].Role == c_autotmpl::ArgRole::Flags);
+  assert(!c_autotmpl::isTypeArgument(*StcExplicitDef, 0));
+  assert(c_autotmpl::isTypeArgument(*StcExplicitDef, 1));
+  assert(!c_autotmpl::isTypeArgument(*StcExplicitDef, 2));
+  assert(c_autotmpl::argumentMacroName(*StcExplicitDef, 0) == "i_type");
+  assert(c_autotmpl::argumentMacroName(*StcExplicitDef, 1) == "i_key");
+  assert(c_autotmpl::argumentMacroName(*StcExplicitDef, 2) == "i_traits");
+  assert(!c_autotmpl::usesDerivedStcNames(*StcExplicitDef));
+
+  const c_autotmpl::TemplateDef *StcMapDef =
+      Registry.findByName("stc_hashmap");
+  assert(StcMapDef && StcMapDef->ArgSpecs.size() == 2);
+  assert(StcMapDef->ArgSpecs[0].Role == c_autotmpl::ArgRole::Key);
+  assert(StcMapDef->ArgSpecs[1].Role == c_autotmpl::ArgRole::Value);
+  assert(c_autotmpl::isTypeArgument(*StcMapDef, 0));
+  assert(c_autotmpl::isTypeArgument(*StcMapDef, 1));
+  assert(c_autotmpl::argumentMacroName(*StcMapDef, 0) == "i_key");
+  assert(c_autotmpl::argumentMacroName(*StcMapDef, 1) == "i_val");
+  assert(c_autotmpl::usesDerivedStcNames(*StcMapDef));
+  assert(c_autotmpl::stcContainerName(*StcMapDef, {"Foo", "cstr"}) ==
+         "stc_hashmap_Foo_cstr");
+  assert(c_autotmpl::stcTraits(*StcMapDef, {"Foo", "cstr"}) == "(c_pro_val)");
+
+  c_autotmpl::TemplateRegistry NamedRegistry;
+  NamedRegistry.scan(Root);
+  SmallVector<StringRef, 1> NamedStcTemplates{"vec"};
+  NamedRegistry.applyPreset(c_autotmpl::TemplatePreset::StcStatic,
+                            NamedStcTemplates);
+  const c_autotmpl::TemplateDef *VecDef = NamedRegistry.findByName("vec");
+  assert(VecDef && c_autotmpl::isStcPreset(*VecDef));
+  assert(VecDef->ArgSpecs.size() == 1);
+  assert(VecDef->ArgSpecs[0].Role == c_autotmpl::ArgRole::Key);
+  assert(c_autotmpl::usesDerivedStcNames(*VecDef));
+  assert(c_autotmpl::stcContainerName(*VecDef, {"cstr"}) == "vec_cstr");
+  assert(NamedRegistry.findByName("stc_vec")->Preset ==
+         c_autotmpl::TemplatePreset::None);
+
+  c_autotmpl::TemplateRegistry AutoRegistry;
+  AutoRegistry.scan(Root);
+  AutoRegistry.applyPreset(c_autotmpl::TemplatePreset::StcStatic, {},
+                           /*Auto=*/true);
+  assert(c_autotmpl::isStcPreset(*AutoRegistry.findByName("vec")));
+  assert(c_autotmpl::isStcPreset(*AutoRegistry.findByName("stc_vec")));
 
   const c_autotmpl::TemplateDef *SelectDef =
       Registry.findByName("select");
@@ -176,7 +267,7 @@ int main() {
   assert(BufferOrErr);
   StringRef Content = (*BufferOrErr)->getBuffer();
   assert(Content.find("#define T int") != StringRef::npos);
-  assert(Content.find("#ifndef C_AUTOTMPL_LIST_STRUCT_FOO_") !=
+  assert(Content.find("#ifndef C_AUTOTMPL_List_struct_20Foo") !=
          StringRef::npos);
   assert(Content.find("#ifdef FOO_H") != StringRef::npos);
   assert(Content.find("#define T struct Foo") != StringRef::npos);
@@ -219,7 +310,7 @@ int main() {
            StringRef::npos);
     assert(ImplContent.find("/* c-autotmpl: Split(Foo) */") !=
            StringRef::npos);
-    assert(ImplContent.find("#ifndef C_AUTOTMPL_IMPL_SPLIT_FOO_") !=
+    assert(ImplContent.find("#ifndef C_AUTOTMPL_IMPL_Split_Foo") !=
            StringRef::npos);
     assert(ImplContent.find("#ifdef FOO_H\n") != StringRef::npos);
     assert(ImplContent.find("#define T Foo\n") != StringRef::npos);
@@ -241,7 +332,7 @@ int main() {
     StringRef SelectContent = (*SelectBuffer)->getBuffer();
     assert(SelectContent.find("/* c-autotmpl: select(int, Foo) */") !=
            StringRef::npos);
-    assert(SelectContent.find("#ifndef C_AUTOTMPL_SELECT_INT__FOO_") !=
+    assert(SelectContent.find("#ifndef C_AUTOTMPL_select_int_2C_20Foo") !=
            StringRef::npos);
     assert(SelectContent.find("#ifdef FOO_H") != StringRef::npos);
     assert(SelectContent.find("#define First int") != StringRef::npos);
@@ -396,6 +487,47 @@ int main() {
     assert(SingleHkt[1].Template == Registry.findByName("Wrap"));
     assert(SingleHkt[1].TypeSpelling == "Option");
     assert(SingleHkt[1].DependsOn.size() == 1);
+
+    // Derived STC wrappers read like ordinary parametric types. Names and
+    // trait flags are no longer present at the call site.
+    SmallVector<c_autotmpl::FoundUsage, 8> StcUsages;
+    c_autotmpl::scanUsages("stc_vec(Foo) v; stc_vec(cstr) s;", Registry,
+                           StcUsages);
+    assert(StcUsages.size() == 2);
+    assert(StcUsages[0].Template == StcDef);
+    assert(StcUsages[0].TypeSpelling == "Foo");
+    assert(StcUsages[0].Args.size() == 1);
+    assert(StcUsages[0].Args[0] == "Foo");
+    assert(StcUsages[1].TypeSpelling == "cstr");
+    assert(StcUsages[1].Args[0] == "cstr");
+
+    SmallVector<c_autotmpl::FoundUsage, 8> StcAdapterUsages;
+    c_autotmpl::scanUsages("stc_vec_push(Foo)(&v, 7);", Registry,
+                           StcAdapterUsages);
+    assert(StcAdapterUsages.size() == 1);
+    assert(StcAdapterUsages[0].Template == StcDef);
+    assert(StcAdapterUsages[0].TypeSpelling == "Foo");
+    assert(StcAdapterUsages[0].AdapterOp == "push");
+
+    SmallVector<c_autotmpl::FoundUsage, 8> StcExplicitUsages;
+    c_autotmpl::scanUsages(
+        "stc_vec_explicit(LegacyVec, Foo, (c_pro_key | c_use_eq)) v;",
+        Registry, StcExplicitUsages);
+    assert(StcExplicitUsages.size() == 1);
+    assert(StcExplicitUsages[0].Template == StcExplicitDef);
+    assert(StcExplicitUsages[0].TypeSpelling ==
+           "LegacyVec, Foo, (c_pro_key | c_use_eq)");
+    assert(StcExplicitUsages[0].Args[0] == "LegacyVec");
+    assert(StcExplicitUsages[0].Args[2] == "(c_pro_key | c_use_eq)");
+
+    SmallVector<c_autotmpl::FoundUsage, 8> StcMapUsages;
+    c_autotmpl::scanUsages("stc_hashmap(Foo, cstr) m;", Registry,
+                           StcMapUsages);
+    assert(StcMapUsages.size() == 1);
+    assert(StcMapUsages[0].Template == StcMapDef);
+    assert(StcMapUsages[0].Args.size() == 2);
+    assert(StcMapUsages[0].Args[0] == "Foo");
+    assert(StcMapUsages[0].Args[1] == "cstr");
   }
 
   {
@@ -411,6 +543,83 @@ int main() {
     assert(UserContent.find("#define F Option") != StringRef::npos);
     assert(UserContent.find("#define Payload int") != StringRef::npos);
     assert(UserContent.find("#undef Payload\n#undef F") != StringRef::npos);
+  }
+
+  {
+    std::string StcPath, StcError;
+    SmallVector<StringRef, 1> StcOps{"push"};
+    assert(Instantiator.instantiate(*StcDef, "Foo", FooGuard, StcPath,
+                                    StcError, /*DryRun=*/false, {}, {},
+                                    StcOps) ==
+           c_autotmpl::InstantiationResult::Added);
+    auto StcBuffer = MemoryBuffer::getFile(StcPath);
+    assert(StcBuffer);
+    StringRef StcContent = (*StcBuffer)->getBuffer();
+    assert(StcContent.find("/* c-autotmpl: stc_vec(Foo) */") !=
+           StringRef::npos);
+    assert(StcContent.find("#ifdef FOO_H") != StringRef::npos);
+    assert(StcContent.find("#define i_type stc_vec_Foo\n#define i_key Foo\n") !=
+           StringRef::npos);
+    assert(StcContent.find("#undef i_key\n#undef i_type\n") !=
+           StringRef::npos);
+    assert(StcContent.find("#define i_traits") == StringRef::npos);
+    assert(StcContent.find(
+               "#define stc_vec_push(...) "
+               "C_AUTOTMPL_STC_ADAPTER_CAT(stc_vec(__VA_ARGS__), _push)\n") !=
+           StringRef::npos);
+    assert(StcContent.find("#define TMPL_HEADER") == StringRef::npos);
+    assert(StcContent.find("#define T Foo") == StringRef::npos);
+
+    std::string StcBuiltinPath;
+    assert(Instantiator.instantiate(*StcDef, "cstr", "", StcBuiltinPath,
+                                    StcError) ==
+           c_autotmpl::InstantiationResult::Added);
+    auto StcBuiltinBuffer = MemoryBuffer::getFile(StcBuiltinPath);
+    assert(StcBuiltinBuffer);
+    StringRef StcBuiltinContent = (*StcBuiltinBuffer)->getBuffer();
+    size_t BuiltinMarker =
+        StcBuiltinContent.find("/* c-autotmpl: stc_vec(cstr) */");
+    assert(BuiltinMarker != StringRef::npos);
+    assert(StcBuiltinContent.substr(BuiltinMarker).find("#ifdef") ==
+           StringRef::npos);
+    assert(StcBuiltinContent.find(
+               "#define i_type stc_vec_cstr\n#define i_key cstr\n"
+               "#define i_traits (c_pro_key | c_use_eq)\n") !=
+           StringRef::npos);
+    assert(StcBuiltinContent.find(
+               "#undef i_traits\n#undef i_key\n#undef i_type\n") !=
+           StringRef::npos);
+
+    std::string StcLegacyPath;
+    assert(Instantiator.instantiate(
+               *StcExplicitDef, "LegacyVec, Foo, (c_pro_key | c_use_eq)",
+               FooGuard, StcLegacyPath, StcError) ==
+           c_autotmpl::InstantiationResult::Added);
+    auto StcLegacyBuffer = MemoryBuffer::getFile(StcLegacyPath);
+    assert(StcLegacyBuffer);
+    StringRef StcLegacyContent = (*StcLegacyBuffer)->getBuffer();
+    assert(StcLegacyContent.find(
+               "#define i_type LegacyVec\n#define i_key Foo\n"
+               "#define i_traits (c_pro_key | c_use_eq)\n") !=
+           StringRef::npos);
+    assert(StcLegacyContent.find(
+               "#undef i_traits\n#undef i_key\n#undef i_type\n") !=
+           StringRef::npos);
+
+    std::string StcMapPath;
+    assert(Instantiator.instantiate(*StcMapDef, "Foo, cstr", FooGuard,
+                                    StcMapPath, StcError) ==
+           c_autotmpl::InstantiationResult::Added);
+    auto StcMapBuffer = MemoryBuffer::getFile(StcMapPath);
+    assert(StcMapBuffer);
+    StringRef StcMapContent = (*StcMapBuffer)->getBuffer();
+    assert(StcMapContent.find(
+               "#define i_type stc_hashmap_Foo_cstr\n#define i_key Foo\n"
+               "#define i_val cstr\n#define i_traits (c_pro_val)\n") !=
+           StringRef::npos);
+    assert(StcMapContent.find(
+               "#undef i_traits\n#undef i_val\n#undef i_key\n#undef i_type\n") !=
+           StringRef::npos);
   }
 
   {
@@ -450,7 +659,7 @@ int main() {
     auto NestedBuffer = MemoryBuffer::getFile(NestedPath);
     assert(NestedBuffer);
     StringRef Nested = (*NestedBuffer)->getBuffer();
-    assert(Nested.find("#ifndef C_AUTOTMPL_LIST_BOX_INT_") !=
+    assert(Nested.find("#ifndef C_AUTOTMPL_List_Box_int") !=
            StringRef::npos);
     assert(Nested.find("#ifdef GEN_BOX_H") != StringRef::npos);
     assert(Nested.find("#define T Box_int") != StringRef::npos);
