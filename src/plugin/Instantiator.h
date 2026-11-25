@@ -26,8 +26,9 @@ struct DependencyGuard {
 
 /// One concrete specialization used by a generated dispatch chain.
 struct DispatchCase {
-  std::string Type;      // canonical spelling used by the presence macro
-  std::string Container; // concrete container type, e.g. vec_int
+  std::string Type;                      // canonical spelling for the guard
+  std::string Container;                 // concrete container type, e.g. vec_int
+  std::vector<std::string> Args;         // canonical individual arguments
 };
 
 /// Caches generated-header contents and append-only instantiation markers.

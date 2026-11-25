@@ -488,24 +488,38 @@ static bool isDispatchIdentChar(char C) {
          (C >= '0' && C <= '9');
 }
 
-std::string dispatchContainerName(const TemplateDef &Template,
-                                  ArrayRef<std::string> Args) {
+static void appendDispatchArg(std::string &Out, StringRef Raw) {
   static const char Hex[] = "0123456789ABCDEF";
-  std::string Out = Template.Name;
-  for (const std::string &Raw : Args) {
-    std::string Arg = StringRef(Raw).trim().str();
-    Out += '_';
-    for (char C : Arg) {
-      unsigned char Byte = static_cast<unsigned char>(C);
-      if (isDispatchIdentChar(C))
-        Out += C;
-      else {
-        Out += '_';
-        Out += Hex[Byte >> 4];
-        Out += Hex[Byte & 0xF];
-      }
+  std::string Arg = Raw.trim().str();
+  Out += '_';
+  for (char C : Arg) {
+    unsigned char Byte = static_cast<unsigned char>(C);
+    if (isDispatchIdentChar(C))
+      Out += C;
+    else {
+      Out += '_';
+      Out += Hex[Byte >> 4];
+      Out += Hex[Byte & 0xF];
     }
   }
+}
+
+std::string dispatchContainerName(const TemplateDef &Template,
+                                  ArrayRef<std::string> Args) {
+  std::string Out = Template.Name;
+  for (const std::string &Raw : Args)
+    appendDispatchArg(Out, Raw);
+  return Out;
+}
+
+static std::string dispatchCallTarget(const TemplateDef &Template,
+                                      StringRef Op, const DispatchCase &Case) {
+  auto It = Template.DispatchTargets.find(Op);
+  if (It == Template.DispatchTargets.end())
+    return Case.Container + "_" + Op.str();
+  std::string Out = It->second;
+  for (const std::string &Arg : Case.Args)
+    appendDispatchArg(Out, Arg);
   return Out;
 }
 
@@ -534,12 +548,11 @@ static void appendDispatchCaseSelector(std::string &Out,
                                        const DispatchConfig &Config,
                                        StringRef TemplateName, StringRef Op,
                                        size_t CaseIndex, size_t Arity,
-                                       StringRef Container) {
+                                       StringRef Container, StringRef Target) {
   std::string Name = dispatchSelectorName(TemplateName, Op, Arity, CaseIndex);
   std::string Previous =
       dispatchSelectorName(TemplateName, Op, Arity, CaseIndex - 1);
   std::string Params = dispatchParams(Arity);
-  std::string Target = Container.str() + "_" + Op.str();
   std::string Expr = Previous + "(" + Params + ")";
 
   for (size_t K = Arity; K > 0; --K) {
@@ -547,13 +560,13 @@ static void appendDispatchCaseSelector(std::string &Out,
     std::string Next;
     if (Config.Backend == DispatchBackend::Builtin) {
       Next = "__builtin_choose_expr(__builtin_types_compatible_p(__typeof__(" +
-             Param + "), " + Container.str() + "), " + Target +
+             Param + "), " + Container.str() + "), " + Target.str() +
              ", __builtin_choose_expr(__builtin_types_compatible_p(__typeof__(" +
-             Param + "), " + Container.str() + "*), " + Target + ", " + Expr +
+             Param + "), " + Container.str() + "*), " + Target.str() + ", " + Expr +
              "))";
     } else {
-      Next = "_Generic((" + Param + "), " + Container.str() + ": " + Target +
-             ", " + Container.str() + "*: " + Target + ", default: " + Expr +
+      Next = "_Generic((" + Param + "), " + Container.str() + ": " + Target.str() +
+             ", " + Container.str() + "*: " + Target.str() + ", default: " + Expr +
              ")";
     }
     Expr = std::move(Next);
@@ -596,7 +609,8 @@ std::string makeDispatchSection(const TemplateDef &Template,
         std::string Presence = presenceMacro(Template.Name, Cases[I].Type);
         Out += "#ifdef " + Presence + "\n";
         appendDispatchCaseSelector(Out, Config, Template.Name, Op, I + 1,
-                                   Arity, Cases[I].Container);
+                                   Arity, Cases[I].Container,
+                                   dispatchCallTarget(Template, Op, Cases[I]));
         Out += "#else\n";
         Out += "#define " +
                dispatchSelectorName(Template.Name, Op, Arity, I + 1) + "(" +

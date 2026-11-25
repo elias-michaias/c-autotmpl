@@ -126,7 +126,9 @@ Set `dispatch=1` in `autotmpl.conf` to get method-like names for functions
 declared in type-template headers. A function qualifies when its declaration
 mentions the template type spelling. It does not need a pointer, and the
 container does not need to be the first argument. The same rule applies to
-`vec(T)` and to two-argument templates such as `pair(Key, Value)`.
+`vec(T)` and to two-argument templates such as `pair(Key, Value)`. Lowercase
+helper bases such as `box_alloc(T)` are matched to `Box` case-insensitively and
+dispatch to `box_alloc_<Type>`.
 
 ```c
 #include "gen/vec.h"

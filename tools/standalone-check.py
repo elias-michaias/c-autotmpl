@@ -446,26 +446,48 @@ static inline A PAIR_FN(A, B, _sum)(int extra, pair(A, B) p) {
   return (A)(p.first + p.second + extra);
 }
 """)
+        write(os.path.join(root, "tmpl", "box.h"), """\
+// -- template type Box(T)
+#define BOX_CAT_I(A, B) A##B
+#define BOX_CAT(A, B) BOX_CAT_I(A, B)
+#define Box(T) BOX_CAT(Box_, T)
+#define box_alloc(T) BOX_CAT(box_alloc_, T)
+#define box_free(T) BOX_CAT(box_free_, T)
+typedef struct { T value; } Box(T);
+static inline Box(T) *box_alloc(T)(void) {
+  static Box(T) value;
+  return &value;
+}
+static inline void box_free(T)(Box(T) *b) { b->value = 0; }
+#ifndef TMPL_HEADER
+#define box_secret(T) BOX_CAT(box_secret_, T)
+static inline int box_secret(T)(Box(T) *b) { return b->value; }
+#endif
+""")
         source = os.path.join(root, "main.c")
         write(source, """\
 #include "gen/vec.h"
 #include "gen/pair.h"
+#include "gen/box.h"
 
 int main(void) {
   vec(int) v = {0};
   vec(float) f = {0};
   pair(int, float) p = {1, 2.5f};
+  Box(int) b = {7};
   $vec_push(&v, 7);
   $vec_push(&f, 2);
   $vec_clear(&v);
   $vec_pick(7, v);
+  $Box_free(&b);
   return ($vec_size(&v) == 1 && v.value == 0 && $vec_pick(7, v) == 7 &&
           $vec_size(&f) == 1 && $vec_pick(3, f) == 5 &&
-          (int)$pair_sum(3, p) == 6) ? 0 : 1;
+          (int)$pair_sum(3, p) == 6 && b.value == 0) ? 0 : 1;
 }
 """)
         generated = os.path.join(root, "gen", "vec.h")
         generated_pair = os.path.join(root, "gen", "pair.h")
+        generated_box = os.path.join(root, "gen", "box.h")
         write(os.path.join(root, "autotmpl.conf"), """\
 # project settings
 profile=stc
@@ -483,7 +505,7 @@ dispatch=1
         for needle in ("dispatch=1", "dispatch backend=generic",
                        "dispatch style=prefix", "dispatch affix=$",
                        "generated vec(int)", "generated vec(float)",
-                       "generated pair(int, float)"):
+                       "generated pair(int, float)", "generated Box(int)"):
             require(needle in output, "missing dispatch report: " + needle,
                     output)
 
@@ -516,6 +538,19 @@ dispatch=1
                     pair_content)
         require("c-autotmpl dispatch begin vec_push" not in content,
                 "dispatch macro call was scanned as a mangled type", content)
+        with open(generated_box) as f:
+            box_content = f.read()
+        for needle in ("/* c-autotmpl dispatch begin Box */",
+                       "Box_int: box_alloc_int", "Box_int*: box_alloc_int",
+                       "Box_int: box_free_int", "Box_int*: box_free_int",
+                       "#define $Box_alloc(...)", "#define $Box_free(...)"):
+            require(needle in box_content,
+                    "lowercase dispatch text is missing: " + needle,
+                    box_content)
+        require("box_secret" not in box_content and
+                "$Box_secret(...)" not in box_content,
+                "implementation-only helper was treated as a dispatch op",
+                box_content)
 
         compiler = os.environ.get("CC") or next(
             (name for name in ("cc", "gcc", "clang") if shutil.which(name)),
@@ -546,6 +581,8 @@ dispatch=1
 
         os.remove(generated)
         os.remove(generated_pair)
+        if os.path.exists(generated_box):
+            os.remove(generated_box)
         builtin_env = dict(env)
         builtin_env["C_AUTOTMPL_DISPATCH_BACKEND"] = "builtin"
         proc = subprocess.run(args, cwd=root, capture_output=True, text=True,
@@ -573,6 +610,8 @@ dispatch=1
 
         os.remove(generated)
         os.remove(generated_pair)
+        if os.path.exists(generated_box):
+            os.remove(generated_box)
         write(source, """\
 #include "gen/vec.h"
 

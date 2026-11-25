@@ -92,9 +92,11 @@ bool signatureUsesTemplate(StringRef S, size_t Begin, size_t End,
 }
 
 /// Finds associated functions in a template header. A declaration such as
-/// vec_int_push(vec(int) *, ...) or VEC_FN(i_type, _push)(i_type *, ...)
-/// contributes `push`. The template type must appear in the declaration, but
-/// it need not be a pointer or the first parameter.
+/// vec_int_push(vec(int) *, ...), VEC_FN(i_type, _push)(i_type *, ...), or
+/// box_alloc(T)(Box(T) *) contributes `push` or `alloc`. The template type must
+/// appear in the declaration, but it need not be a pointer or the first
+/// parameter. Declarations after `#ifndef TMPL_HEADER` are implementation-only
+/// and are ignored.
 void collectDispatchOps(StringRef Content, TemplateDef &Out,
                         size_t BaseOffset = 0) {
   if (Out.Kind != TemplateKind::Type || Out.Name.empty())
@@ -115,15 +117,25 @@ void collectDispatchOps(StringRef Content, TemplateDef &Out,
            (Clean[LinePos] == ' ' || Clean[LinePos] == '\t'))
       ++LinePos;
     if (LineStart && LinePos < Clean.size() && Clean[LinePos] == '#') {
+      size_t DirectiveEnd = Clean.find('\n', I);
+      if (DirectiveEnd == StringRef::npos)
+        DirectiveEnd = Clean.size();
+      StringRef Directive = Clean.substr(I, DirectiveEnd - I);
+      if (Directive.contains("TMPL_HEADER") &&
+          (Directive.contains("#ifndef") || Directive.contains("#if !defined")))
+        break;
       bool Continued;
       do {
-        size_t End = Clean.find('\n', I);
-        if (End == StringRef::npos)
-          End = Clean.size();
+        size_t End = DirectiveEnd;
         Continued = End > I && Clean[End - 1] == '\\';
         I = End < Clean.size() ? End + 1 : End;
-        LineStart = true;
-      } while (Continued && I < Clean.size());
+        if (!Continued)
+          break;
+        DirectiveEnd = Clean.find('\n', I);
+        if (DirectiveEnd == StringRef::npos)
+          DirectiveEnd = Clean.size();
+      } while (I < Clean.size());
+      LineStart = true;
       continue;
     }
     if (!isIdentStart(Clean[I])) {
@@ -136,6 +148,7 @@ void collectDispatchOps(StringRef Content, TemplateDef &Out,
     while (End < Clean.size() && isIdentChar(Clean[End]))
       ++End;
     StringRef Ident = Clean.slice(I, End);
+    std::string NormIdent = normalMacroName(Ident);
     size_t After = End;
     while (After < Clean.size() && isSpace(Clean[After]))
       ++After;
@@ -147,7 +160,6 @@ void collectDispatchOps(StringRef Content, TemplateDef &Out,
           ++AfterMacro;
         if (AfterMacro < Clean.size() && Clean[AfterMacro] == '(') {
           size_t CallClose = matchingParen(Clean, AfterMacro);
-          std::string NormIdent = normalMacroName(Ident);
           if (CallClose < Clean.size() && NormIdent.find(NormTemplate) !=
                                                std::string::npos) {
             size_t ArgBegin = After + 1;
@@ -175,8 +187,10 @@ void collectDispatchOps(StringRef Content, TemplateDef &Out,
             }
           }
         }
-        if (Ident.starts_with(Out.Name) && Ident.size() > Out.Name.size() &&
-            Ident[Out.Name.size()] == '_') {
+        bool Direct = NormIdent.size() > NormTemplate.size() &&
+                      StringRef(NormIdent).starts_with(NormTemplate) &&
+                      NormIdent[NormTemplate.size()] == '_';
+        if (Direct) {
           StringRef Tail = Ident.drop_front(Out.Name.size() + 1);
           size_t Under = Tail.rfind('_');
           StringRef Op = Under != StringRef::npos && Under + 1 < Tail.size()
@@ -188,8 +202,12 @@ void collectDispatchOps(StringRef Content, TemplateDef &Out,
               Valid = false;
           if (Valid &&
               signatureUsesTemplate(Clean, declarationBegin(Clean, I), Close,
-                                    Out))
+                                    Out)) {
             recordOp(Op, I);
+            if (normalMacroName(Tail) == normalMacroName(Op) &&
+                Close > After + 1)
+              Out.DispatchTargets[Op.str()] = Ident.str();
+          }
         }
       }
     }

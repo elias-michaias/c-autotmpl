@@ -185,19 +185,41 @@ typedef struct { i_key value; } i_type;
 static inline void vec_int_push(i_type *v, int x) { v->value = x; }
 static inline void vec_int_set(int x, i_type v) { v.value = x; }
 """)
+        write(os.path.join(root, "tmpl", "box.h"), """\
+// -- template type Box(T)
+#define BOX_CAT_I(A, B) A##B
+#define BOX_CAT(A, B) BOX_CAT_I(A, B)
+#define Box(T) BOX_CAT(Box_, T)
+#define box_alloc(T) BOX_CAT(box_alloc_, T)
+#define box_free(T) BOX_CAT(box_free_, T)
+typedef struct { T value; } Box(T);
+static inline Box(T) *box_alloc(T)(void) {
+  static Box(T) value;
+  return &value;
+}
+static inline void box_free(T)(Box(T) *b) { b->value = 0; }
+#ifndef TMPL_HEADER
+#define box_secret(T) BOX_CAT(box_secret_, T)
+static inline int box_secret(T)(Box(T) *b) { return b->value; }
+#endif
+""")
         source = os.path.join(root, "main.c")
         write(source, "int main(void) { return 0; }\n")
         text = """\
 #include "gen/vec.h"
+#include "gen/box.h"
 
 int main(void) {
   vec(int) v = {0};
   $vec_push(&v, 7);
   $vec_set(7, v);
-  return v.value == 7 ? 0 : 1;
+  Box(int) *b = box_alloc(int)();
+  $Box_free(b);
+  return v.value == 7 && b->value == 0 ? 0 : 1;
 }
 """
         generated = os.path.join(root, "gen", "vec.h")
+        generated_box = os.path.join(root, "gen", "box.h")
         log_path = os.path.join(root, "clangd.log")
         uri = "file://" + source
         write(os.path.join(root, "autotmpl.conf"), """\
@@ -253,6 +275,23 @@ dispatch=1
                     print("plugin scanned a dispatch macro as a type",
                           file=sys.stderr)
                     return 1
+                box_content = wait_for_content(generated_box, lambda c: (
+                    "/* c-autotmpl dispatch begin Box */" in c and
+                    "#define $Box_alloc(...)" in c and
+                    "#define $Box_free(...)" in c and
+                    "Box_int: box_alloc_int" in c and
+                    "Box_int: box_free_int" in c
+                ))
+                if box_content is None:
+                    print("plugin lowercase dispatch was not generated",
+                          file=sys.stderr)
+                    with open(log_path, errors="replace") as f:
+                        print(f.read()[-4000:], file=sys.stderr)
+                    return 1
+                if "box_secret" in box_content:
+                    print("plugin exposed an implementation-only helper",
+                          file=sys.stderr)
+                    return 1
 
                 send(proc, {
                     "jsonrpc": "2.0",
@@ -260,7 +299,7 @@ dispatch=1
                     "method": "textDocument/definition",
                     "params": {
                         "textDocument": {"uri": uri},
-                        "position": {"line": 4, "character": 3},
+                        "position": {"line": 5, "character": 3},
                     },
                 })
                 response = receive_response(proc, 3)
@@ -273,6 +312,37 @@ dispatch=1
                     print(response, file=sys.stderr)
                     with open(log_path, errors="replace") as f:
                         print(f.read()[-4000:], file=sys.stderr)
+                    return 1
+
+                with open(os.path.join(root, "tmpl", "box.h")) as f:
+                    box_header = f.read()
+                send(proc, {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "textDocument/definition",
+                    "params": {
+                        "textDocument": {"uri": uri},
+                        "position": {"line": 8, "character": 3},
+                    },
+                })
+                response = receive_response(proc, 4)
+                locations = response.get("result") if response else None
+                if not locations or len(locations) != 1 or not locations[0][
+                        "uri"].endswith("tmpl/box.h"):
+                    print("plugin did not map lowercase dispatch macro",
+                          file=sys.stderr)
+                    print(response, file=sys.stderr)
+                    with open(log_path, errors="replace") as f:
+                        print(f.read()[-4000:], file=sys.stderr)
+                    return 1
+                start = locations[0]["range"]["start"]
+                start_offset = sum(len(line) + 1 for line in
+                                   box_header.splitlines()[:start["line"]])
+                start_offset += start["character"]
+                if not box_header[start_offset:].startswith("box_free"):
+                    print("lowercase dispatch pointed at the wrong declaration",
+                          file=sys.stderr)
+                    print(response, file=sys.stderr)
                     return 1
 
                 send(proc, {

@@ -951,8 +951,10 @@ struct SharedState {
     for (const DispatchCase &Case : Group->Cases)
       if (Case.Type == Usage.TypeSpelling)
         return;
-    Group->Cases.push_back(
-        {Usage.TypeSpelling, dispatchContainerName(*Template, Usage.Args)});
+    Group->Cases.push_back({Usage.TypeSpelling,
+                            dispatchContainerName(*Template, Usage.Args),
+                            std::vector<std::string>(Usage.Args.begin(),
+                                                     Usage.Args.end())});
   }
 
   /// Rewrites every dispatch section from scratch so added specializations,

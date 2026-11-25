@@ -69,6 +69,7 @@ struct TemplateDef {
   llvm::SmallVector<ArgSpec, 2> ArgSpecs;      // empty means legacy behavior
   llvm::StringSet<> DispatchOps;                // method-like operation names
   llvm::StringMap<unsigned> DispatchOpOffsets;  // declaration offsets in Header
+  llvm::StringMap<std::string> DispatchTargets; // op -> concrete call name base
   bool DispatchEnabled = false;
 };
 

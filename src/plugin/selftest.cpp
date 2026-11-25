@@ -64,6 +64,24 @@ int main() {
   }
   {
     std::error_code EC;
+    raw_fd_ostream OS(join(Root, "tmpl/lower.h"), EC);
+    OS << "// -- template type Crate(T)\n"
+          "#define Crate(T) Crate_##T\n"
+          "#define crate_alloc(T) crate_alloc_##T\n"
+          "#define crate_free(T) crate_free_##T\n"
+          "typedef struct { T value; } Crate(T);\n"
+          "static inline Crate(T) *crate_alloc(T)(void) {\n"
+          "  static Crate(T) value;\n"
+          "  return &value;\n"
+          "}\n"
+          "static inline void crate_free(T)(Crate(T) *c) { c->value = 0; }\n"
+          "#ifndef TMPL_HEADER\n"
+          "#define crate_secret(T) crate_secret_##T\n"
+          "static inline int crate_secret(T)(Crate(T) *c) { return c->value; }\n"
+          "#endif\n";
+  }
+  {
+    std::error_code EC;
     raw_fd_ostream OS(join(Root, "tmpl/select.h"), EC);
     OS << "// -- template function select(First, Second)\n"
           "#define select(First, Second) select_##First##Second\n";
@@ -269,6 +287,28 @@ int main() {
   assert(DispatchDef->DispatchOps.contains("push"));
   assert(DispatchDef->DispatchOps.contains("set"));
   assert(!DispatchDef->DispatchOps.contains("helper"));
+  const c_autotmpl::TemplateDef *CrateDef = Registry.findByName("Crate");
+  assert(CrateDef && CrateDef->DispatchEnabled);
+  assert(CrateDef->DispatchOps.contains("alloc"));
+  assert(CrateDef->DispatchOps.contains("free"));
+  assert(!CrateDef->DispatchOps.contains("secret"));
+  auto AllocTarget = CrateDef->DispatchTargets.find("alloc");
+  assert(AllocTarget != CrateDef->DispatchTargets.end());
+  assert(AllocTarget->second == "crate_alloc");
+  auto AllocOffset = CrateDef->DispatchOpOffsets.find("alloc");
+  assert(AllocOffset != CrateDef->DispatchOpOffsets.end());
+  auto CrateHeader = MemoryBuffer::getFile(CrateDef->Header);
+  assert(CrateHeader);
+  assert(StringRef((*CrateHeader)->getBuffer())
+             .substr(AllocOffset->second)
+             .starts_with("crate_alloc"));
+  SmallVector<c_autotmpl::DispatchCase, 1> CrateCases{
+      {"int", "Crate_int", {"int"}}};
+  SmallVector<StringRef, 2> CrateOps{"alloc", "free"};
+  std::string CrateSection = c_autotmpl::makeDispatchSection(
+      *CrateDef, CrateCases, CrateOps, DispatchCfg);
+  assert(CrateSection.find("Crate_int: crate_alloc_int") != std::string::npos);
+  assert(CrateSection.find("Crate_int: crate_free_int") != std::string::npos);
   auto PushOffset = DispatchDef->DispatchOpOffsets.find("push");
   assert(PushOffset != DispatchDef->DispatchOpOffsets.end());
   auto DispatchHeader = MemoryBuffer::getFile(DispatchDef->Header);

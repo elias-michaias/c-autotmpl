@@ -289,7 +289,13 @@ function whose declaration mentions that template's type spelling. The spelling
 can be the template call form such as `Vec(T)`, a generated parameter macro such
 as `T`, or a decorator parameter such as `Key`. Pointer-ness and argument
 position do not matter. Helper functions that never mention the template type are
-ignored.
+ignored. Declarations inside `#ifndef TMPL_HEADER` are implementation-only and are
+also ignored.
+
+Function bases are matched case-insensitively against the template name. A
+lowercase base such as `box_alloc(T)` therefore yields `$Box_alloc`, and
+selectors call `box_alloc_<Type>`. Names that already contain the concrete
+type, such as `Vec_int_push`, keep the usual `<TypeContainer>_<op>` target.
 
 The rule covers direct declarations and paste-macro declarations, including
 two-argument templates such as `pair(Key, Value)`:

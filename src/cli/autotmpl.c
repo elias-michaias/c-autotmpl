@@ -1041,6 +1041,11 @@ typedef struct {
 } ArgSpec;
 
 typedef struct {
+  char *op;
+  char *base;
+} DispatchTarget;
+
+typedef struct {
   TemplateKind kind;
   char *name;
   char **params;
@@ -1056,6 +1061,7 @@ typedef struct {
   size_t nspecs;
   Set adapter_ops;        /* STC operation names seen at call sites */
   Set dispatch_ops;       /* method-like operations for generated dispatch */
+  Vec dispatch_targets;   /* DispatchTarget*, op-specific call name prefixes */
   int dispatch_enabled;
 } TemplateDef;
 
@@ -1248,6 +1254,38 @@ static char *normal_macro_name(const char *s) {
   return str_take(&out);
 }
 
+static void set_dispatch_target(TemplateDef *tmpl, const char *op,
+                                const char *base) {
+  if (!tmpl || !op || !base || !op[0] || !base[0])
+    return;
+  for (size_t i = 0; i < tmpl->dispatch_targets.len; ++i) {
+    DispatchTarget *target =
+        (DispatchTarget *)tmpl->dispatch_targets.items[i];
+    if (!strcmp(target->op, op)) {
+      free(target->base);
+      target->base = xstrdup(base);
+      return;
+    }
+  }
+  DispatchTarget *target = (DispatchTarget *)xmalloc(sizeof(DispatchTarget));
+  target->op = xstrdup(op);
+  target->base = xstrdup(base);
+  vec_push(&tmpl->dispatch_targets, target);
+}
+
+static const char *dispatch_target_base(const TemplateDef *tmpl,
+                                        const char *op) {
+  if (!tmpl || !op)
+    return NULL;
+  for (size_t i = 0; i < tmpl->dispatch_targets.len; ++i) {
+    DispatchTarget *target =
+        (DispatchTarget *)tmpl->dispatch_targets.items[i];
+    if (!strcmp(target->op, op))
+      return target->base;
+  }
+  return NULL;
+}
+
 static size_t declaration_begin(const char *s, size_t ident) {
   for (size_t k = ident; k > 0; --k)
     if (s[k - 1] == ';' || s[k - 1] == '{' || s[k - 1] == '}')
@@ -1297,14 +1335,16 @@ static int signature_uses_template(const char *s, size_t begin, size_t end,
 }
 
 /* Finds associated functions in a template header. A declaration such as
- * vec_int_push(vec(int) *, ...) or VEC_FN(i_type, _push)(i_type *, ...)
- * contributes `push`. The template type must appear in the declaration, but
- * it need not be a pointer or the first parameter. */
+ * vec_int_push(vec(int) *, ...), VEC_FN(i_type, _push)(i_type *, ...), or
+ * box_alloc(T)(Box(T) *) contributes `push` or `alloc`. The template type must
+ * appear in the declaration, but it need not be a pointer or the first
+ * parameter. Declarations after `#ifndef TMPL_HEADER` are implementation-only
+ * and are ignored. */
 static void collect_dispatch_ops_from_header(const char *content,
-                                             const TemplateDef *tmpl,
-                                             Set *ops) {
+                                             TemplateDef *tmpl) {
   if (tmpl->kind != TEMPLATE_TYPE || !tmpl->name[0])
     return;
+  Set *ops = &tmpl->dispatch_ops;
   char *clean = strip_comments_literals(content);
   char *norm_tmpl = normal_macro_name(tmpl->name);
   size_t n = strlen(clean);
@@ -1315,15 +1355,28 @@ static void collect_dispatch_ops_from_header(const char *content,
                               clean[begin_line] == '\t'))
       ++begin_line;
     if (line_start && begin_line < n && clean[begin_line] == '#') {
+      size_t directive_end = i;
+      while (directive_end < n && clean[directive_end] != '\n')
+        ++directive_end;
+      char *directive = xstrdup_n(clean + i, directive_end - i);
+      int private_only = strstr(directive, "TMPL_HEADER") &&
+                         (strstr(directive, "#ifndef") ||
+                          strstr(directive, "#if !defined"));
+      free(directive);
+      if (private_only)
+        break;
       int continued;
       do {
-        size_t end = i;
-        while (end < n && clean[end] != '\n')
-          ++end;
+        size_t end = directive_end;
         continued = end > i && clean[end - 1] == '\\';
         i = end < n ? end + 1 : end;
-        line_start = 1;
-      } while (continued && i < n);
+        if (!continued)
+          break;
+        directive_end = i;
+        while (directive_end < n && clean[directive_end] != '\n')
+          ++directive_end;
+      } while (i < n);
+      line_start = 1;
       continue;
     }
     if (!is_ident_start(clean[i])) {
@@ -1336,6 +1389,7 @@ static void collect_dispatch_ops_from_header(const char *content,
     while (end < n && is_ident_char(clean[end]))
       ++end;
     char *ident = xstrdup_n(clean + i, end - i);
+    char *norm_ident = normal_macro_name(ident);
     size_t after = end;
     while (after < n && is_space(clean[after]))
       ++after;
@@ -1347,42 +1401,39 @@ static void collect_dispatch_ops_from_header(const char *content,
           ++after_macro;
         if (after_macro < n && clean[after_macro] == '(') {
           size_t call_close = matching_paren(clean, after_macro, n);
-          if (call_close < n) {
-            char *norm_ident = normal_macro_name(ident);
-            if (strstr(norm_ident, norm_tmpl)) {
-              size_t arg_begin = after + 1;
-              size_t arg_end = close;
-              size_t last_begin = arg_begin;
-              int depth = 0;
-              for (size_t k = arg_begin; k < close; ++k) {
-                if (clean[k] == '(' || clean[k] == '[')
-                  ++depth;
-                else if (clean[k] == ')' || clean[k] == ']')
-                  --depth;
-                else if (clean[k] == ',' && depth == 0)
-                  last_begin = k + 1;
-              }
-              char *last = trim_copy_n(clean + last_begin,
-                                       arg_end - last_begin);
-              if (last[0] == '_' && is_ident_start(last[1])) {
-                int valid = 1;
-                for (size_t k = 1; last[k]; ++k)
-                  if (!is_ident_char(last[k]))
-                    valid = 0;
-                if (valid &&
-                    signature_uses_template(
-                        clean, declaration_begin(clean, i), call_close, tmpl))
-                  set_add(ops, last + 1);
-              }
-              free(last);
-              free(norm_ident);
-            } else {
-              free(norm_ident);
+          if (call_close < n && strstr(norm_ident, norm_tmpl)) {
+            size_t arg_begin = after + 1;
+            size_t arg_end = close;
+            size_t last_begin = arg_begin;
+            int depth = 0;
+            for (size_t k = arg_begin; k < close; ++k) {
+              if (clean[k] == '(' || clean[k] == '[')
+                ++depth;
+              else if (clean[k] == ')' || clean[k] == ']')
+                --depth;
+              else if (clean[k] == ',' && depth == 0)
+                last_begin = k + 1;
             }
+            char *last =
+                trim_copy_n(clean + last_begin, arg_end - last_begin);
+            if (last[0] == '_' && is_ident_start(last[1])) {
+              int valid = 1;
+              for (size_t k = 1; last[k]; ++k)
+                if (!is_ident_char(last[k]))
+                  valid = 0;
+              if (valid &&
+                  signature_uses_template(
+                      clean, declaration_begin(clean, i), call_close, tmpl))
+                set_add(ops, last + 1);
+            }
+            free(last);
           }
         }
         size_t prefix = strlen(tmpl->name);
-        if (!strncmp(ident, tmpl->name, prefix) && ident[prefix] == '_') {
+        int direct = strlen(norm_ident) > prefix &&
+                     !strncmp(norm_ident, norm_tmpl, prefix) &&
+                     norm_ident[prefix] == '_';
+        if (direct) {
           const char *tail = ident + prefix + 1;
           const char *under = strrchr(tail, '_');
           const char *op = under && under[1] ? under + 1 : tail;
@@ -1392,11 +1443,19 @@ static void collect_dispatch_ops_from_header(const char *content,
               valid = 0;
           if (valid &&
               signature_uses_template(clean, declaration_begin(clean, i),
-                                      close, tmpl))
+                                      close, tmpl)) {
             set_add(ops, op);
+            char *norm_tail = normal_macro_name(tail);
+            char *norm_op = normal_macro_name(op);
+            if (!strcmp(norm_tail, norm_op) && close > after + 1)
+              set_dispatch_target(tmpl, op, ident);
+            free(norm_tail);
+            free(norm_op);
+          }
         }
       }
     }
+    free(norm_ident);
     free(ident);
     i = end;
   }
@@ -1956,7 +2015,7 @@ static int visit_template_file(const char *path, void *ctx) {
     rest = end + 1;
   }
   def.has_tmpl_header = has_tmpl_header_guard(content);
-  collect_dispatch_ops_from_header(content, &def, &def.dispatch_ops);
+  collect_dispatch_ops_from_header(content, &def);
   free(content);
   if (!ok || !def.name[0]) {
     free(def.name);
@@ -3221,27 +3280,52 @@ static void append_stc_adapters(Str *out, const TemplateDef *tmpl) {
 typedef struct {
   char *type;      /* canonical spelling used by the presence macro */
   char *container; /* concrete container type, e.g. vec_int */
+  Vec args;        /* canonical individual arguments */
 } DispatchCase;
 
-static char *dispatch_container_name(const TemplateDef *tmpl, Vec *args) {
+static void append_dispatch_arg(Str *out, const char *arg) {
   static const char hex[] = "0123456789ABCDEF";
+  str_append_char(out, '_');
+  for (size_t j = 0; arg[j]; ++j) {
+    unsigned char c = (unsigned char)arg[j];
+    if (is_ident_char((char)c))
+      str_append_char(out, (char)c);
+    else {
+      str_append_char(out, '_');
+      str_append_char(out, hex[c >> 4]);
+      str_append_char(out, hex[c & 0xF]);
+    }
+  }
+}
+
+static char *dispatch_container_name(const TemplateDef *tmpl, Vec *args) {
   Str out;
   str_init(&out);
   str_append(&out, tmpl->name);
   for (size_t i = 0; i < args->len; ++i) {
     char *arg = trim_copy((char *)args->items[i]);
-    str_append_char(&out, '_');
-    for (size_t j = 0; arg[j]; ++j) {
-      unsigned char c = (unsigned char)arg[j];
-      if (is_ident_char((char)c))
-        str_append_char(&out, (char)c);
-      else {
-        str_append_char(&out, '_');
-        str_append_char(&out, hex[c >> 4]);
-        str_append_char(&out, hex[c & 0xF]);
-      }
-    }
+    append_dispatch_arg(&out, arg);
     free(arg);
+  }
+  return str_take(&out);
+}
+
+static char *dispatch_call_target(const TemplateDef *tmpl, const char *op,
+                                  const DispatchCase *c) {
+  Str out;
+  str_init(&out);
+  const char *base = dispatch_target_base(tmpl, op);
+  if (base) {
+    str_append(&out, base);
+    for (size_t i = 0; i < c->args.len; ++i) {
+      char *arg = trim_copy((char *)c->args.items[i]);
+      append_dispatch_arg(&out, arg);
+      free(arg);
+    }
+  } else {
+    str_append(&out, c->container);
+    str_append_char(&out, '_');
+    str_append(&out, op);
   }
   return str_take(&out);
 }
@@ -3280,18 +3364,15 @@ static void append_params(Str *out, size_t arity) {
 static void append_dispatch_case_selector(Str *out, const DispatchConfig *cfg,
                                           const char *tmpl, const char *op,
                                           size_t case_index, size_t arity,
-                                          const char *container) {
-  Str name, previous, target, params, expr;
+                                          const char *container,
+                                          const char *target_name) {
+  Str name, previous, params, expr;
   str_init(&name);
   str_init(&previous);
-  str_init(&target);
   str_init(&params);
   str_init(&expr);
   append_selector_name(&name, tmpl, op, arity, case_index);
   append_selector_name(&previous, tmpl, op, arity, case_index - 1);
-  str_append(&target, container);
-  str_append_char(&target, '_');
-  str_append(&target, op);
   append_params(&params, arity);
   str_append(&expr, previous.data);
   str_append(&expr, "(");
@@ -3310,14 +3391,14 @@ static void append_dispatch_case_selector(Str *out, const DispatchConfig *cfg,
       str_append(&next, "), ");
       str_append(&next, container);
       str_append(&next, "), ");
-      str_append(&next, target.data);
+      str_append(&next, target_name);
       str_append(&next, ", __builtin_choose_expr(");
       str_append(&next, "__builtin_types_compatible_p(__typeof__(");
       str_append(&next, pname);
       str_append(&next, "), ");
       str_append(&next, container);
       str_append(&next, "*), ");
-      str_append(&next, target.data);
+      str_append(&next, target_name);
       str_append(&next, ", ");
       str_append(&next, expr.data);
       str_append(&next, "))");
@@ -3327,11 +3408,11 @@ static void append_dispatch_case_selector(Str *out, const DispatchConfig *cfg,
       str_append(&next, "), ");
       str_append(&next, container);
       str_append(&next, ": ");
-      str_append(&next, target.data);
+      str_append(&next, target_name);
       str_append(&next, ", ");
       str_append(&next, container);
       str_append(&next, "*: ");
-      str_append(&next, target.data);
+      str_append(&next, target_name);
       str_append(&next, ", default: ");
       str_append(&next, expr.data);
       str_append_char(&next, ')');
@@ -3349,7 +3430,6 @@ static void append_dispatch_case_selector(Str *out, const DispatchConfig *cfg,
   str_append_char(out, '\n');
   str_free(&name);
   str_free(&previous);
-  str_free(&target);
   str_free(&params);
   str_free(&expr);
 }
@@ -3403,8 +3483,10 @@ static char *make_dispatch_section(const TemplateDef *tmpl, Vec *cases,
         str_append(&out, "#ifdef ");
         str_append(&out, presence);
         str_append_char(&out, '\n');
+        char *target = dispatch_call_target(tmpl, op, c);
         append_dispatch_case_selector(&out, cfg, tmpl->name, op, j + 1,
-                                      arity, c->container);
+                                      arity, c->container, target);
+        free(target);
         str_append(&out, "#else\n");
         Str skip, previous;
         str_init(&skip);
@@ -4310,6 +4392,10 @@ static void add_dispatch_case(Vec *groups, const char *output,
   DispatchCase *c = (DispatchCase *)xmalloc(sizeof(DispatchCase));
   c->type = xstrdup(usage->type);
   c->container = dispatch_container_name(tmpl, &usage->args);
+  c->args.items = NULL;
+  c->args.len = c->args.cap = 0;
+  for (size_t i = 0; i < usage->args.len; ++i)
+    vec_push(&c->args, xstrdup((char *)usage->args.items[i]));
   vec_push(&group->cases, c);
 }
 
