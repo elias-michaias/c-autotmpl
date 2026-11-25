@@ -58,6 +58,8 @@ int main() {
           "typedef struct { T value; } Dispatch(T);\n"
           "static inline void Dispatch_int_push(Dispatch(int) *d, int x) "
           "{ d->value = x; }\n"
+          "static inline void Dispatch_int_set(int x, Dispatch(int) d) "
+          "{ d.value = x; }\n"
           "static inline int helper(int x) { return x; }\n";
   }
   {
@@ -265,6 +267,7 @@ int main() {
       Registry.findByName("Dispatch");
   assert(DispatchDef && DispatchDef->DispatchEnabled);
   assert(DispatchDef->DispatchOps.contains("push"));
+  assert(DispatchDef->DispatchOps.contains("set"));
   assert(!DispatchDef->DispatchOps.contains("helper"));
   SmallVector<c_autotmpl::DispatchCase, 1> DispatchCases{
       {"int", "Dispatch_int"}};
@@ -274,8 +277,9 @@ int main() {
   for (StringRef Needle : {
            "/* c-autotmpl dispatch begin Dispatch */",
            "#ifdef C_AUTOTMPL_Dispatch_int",
-           "Dispatch_int: Dispatch_int_push",
-           "#define Dispatch_push$(self, ...)",
+           "_Generic((p1), Dispatch_int: Dispatch_int_push",
+           "Dispatch_int*: Dispatch_int_push",
+           "#define Dispatch_push$(...)",
            "/* c-autotmpl dispatch end Dispatch */"})
     assert(DispatchSection.find(Needle.str()) != std::string::npos);
 

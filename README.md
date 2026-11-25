@@ -12,6 +12,7 @@
   <a href="#features">Features</a> &bull;
   <a href="#get-started">Get started</a> &bull;
   <a href="doc/USAGE.md">Usage</a> &bull;
+  <a href="#generated-dispatch-macros">Dispatch</a> &bull;
   <a href="doc/USAGE.md#stc-quick-start">STC guide</a>
 </p>
 
@@ -42,7 +43,7 @@ explicitly.
 | **Split implementations** | `#ifndef TMPL_HEADER` selects a grouped implementation source and public header. |
 | **Type-aware guards** | User types use real include guards; scalar types are emitted bare. |
 | **First-class [STC](https://github.com/stclib/STC) support** | Thin wrappers and generated adapters make STC containers read like parametric types. |
-| **Opt-in dispatch macros** | `vec_push$(&xs, 7)` resolves from the receiver type and tracked instantiations. |
+| **Opt-in dispatch macros** | `vec_push$` and `vec_at$` dispatch from any argument, value or pointer, first or later. Works with one or many template arguments. |
 
 ## Get started
 
@@ -132,6 +133,38 @@ Advanced behavior lives in the usage guide:
 - [Function templates](doc/USAGE.md#function-templates) spell every argument at the call site.
 - [Lexical HKTs](doc/USAGE.md#lexical-hkts) pass a template name as an argument.
 
+## Generated dispatch macros
+
+Set `C_AUTOTMPL_DISPATCH=1` to get method-like names for functions declared in
+type-template headers. A function qualifies when its declaration mentions the
+template type spelling. It does not need a pointer, and the container does not
+need to be the first argument. The same rule applies to `vec(T)` and to
+two-argument templates such as `pair(Key, Value)`.
+
+```c
+#include "gen/vec.h"
+#include "gen/pair.h"
+
+vec(int) xs = {0};
+pair(int, float) entry = {1, 2.5f};
+
+vec_push$(&xs, 7);      /* pointer, first argument */
+vec_at$(2, xs);         /* value, second argument */
+pair_sum$(3, entry);    /* two-argument template */
+```
+
+Dispatch cases come only from instantiations that exist in the generated header.
+Each case is guarded by its instantiation's presence macro, so a header never
+names a type that was not generated. The public macro is variadic and forwards
+arguments unchanged.
+
+The default backend uses C11 `_Generic`. Set
+`C_AUTOTMPL_DISPATCH_BACKEND=builtin` for GCC and Clang builtins, which work in
+C99. `C_AUTOTMPL_DISPATCH_SUFFIX=_method` changes `$` to an identifier suffix, and
+`C_AUTOTMPL_DISPATCH_TEMPLATES=vec,pair` limits generation to named templates.
+See [generated dispatch macros](doc/USAGE.md#generated-dispatch-macros) for the
+full header pattern and configuration details.
+
 ## STC with thin adapters
 
 c-autotmpl has first-class support for [STC](https://github.com/stclib/STC).
@@ -162,17 +195,13 @@ Adapters come from current call sites, so a new operation such as
 wrapper, source, generated adapter, and build command are in the
 [STC quick start](doc/USAGE.md#stc-quick-start).
 
-Method-style dispatch is opt-in too. Set `C_AUTOTMPL_DISPATCH=1` to emit macros
-such as `vec_push$(&xs, 7)`, with cases guarded by the instantiations that
-actually exist. See
-[generated dispatch macros](doc/USAGE.md#generated-dispatch-macros).
-
 ## Documentation
 
 | Document | Description |
 | --- | --- |
 | [**Usage guide**](doc/USAGE.md) | CLI, configuration, template authoring, guards, and generated files. |
 | [**STC quick start**](doc/USAGE.md#stc-quick-start) | Thin adapters, auto-detection, explicit template lists, and traits. |
+| [**Dispatch macros**](doc/USAGE.md#generated-dispatch-macros) | Association rule, argument forwarding, guard behavior, and configuration. |
 | [**Build guide**](doc/BUILD.md) | CLI build, clangd plugin build, loading, tests, and build errors. |
 | [**Polymorphism**](doc/POLYMORPHISM.md) | Generated functions, function templates, dispatch, and direct trait calls. |
 | [**Troubleshooting**](doc/TROUBLESHOOTING.md) | Common failures and fixes. |

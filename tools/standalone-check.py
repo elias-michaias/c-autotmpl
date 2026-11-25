@@ -359,23 +359,54 @@ def check_dispatch(cli):
 #define VEC_FN_I(A, B) VEC_FN_II(A, B)
 #define VEC_FN(A, B) VEC_FN_I(A, B)
 typedef struct { i_key value; } i_type;
-static inline void vec_int_push(vec(int) *v, int x) { v->value = x; }
+static inline void VEC_FN(i_type, _push)(i_type *v, i_key x) { v->value = x; }
 static inline void VEC_FN(i_type, _clear)(i_type *v) { v->value = 0; }
-static inline int vec_int_size(vec(int) *v) { (void)v; return 1; }
+static inline int VEC_FN(i_type, _size)(i_type *v) { (void)v; return 1; }
+static inline int VEC_FN(i_type, _pick)(int x, i_type v) { return x + (int)v.value; }
+#ifndef VEC_HELPER_DEFINED
+#define VEC_HELPER_DEFINED
 static inline int helper(int x) { return x; }
+#endif
+""")
+        write(os.path.join(root, "tmpl", "pair.h"), """\
+// -- template type pair(A, B)
+#define PAIR_CAT4_I(A, B, C, D) A##B##C##D
+#define PAIR_CAT4(A, B, C, D) PAIR_CAT4_I(A, B, C, D)
+#define pair(A, B) PAIR_CAT4(pair_, A, _, B)
+#define PAIR_FN_5(A, B, C, D, E) A##B##C##D##E
+#define PAIR_FN_2(A, B, C) PAIR_FN_5(pair_, A, _, B, C)
+#define PAIR_FN(A, B, C) PAIR_FN_2(A, B, C)
+#ifndef A
+typedef int A;
+#endif
+#ifndef B
+typedef float B;
+#endif
+typedef struct { A first; B second; } pair(A, B);
+static inline A PAIR_FN(A, B, _sum)(int extra, pair(A, B) p) {
+  return (A)(p.first + p.second + extra);
+}
 """)
         source = os.path.join(root, "main.c")
         write(source, """\
 #include "gen/vec.h"
+#include "gen/pair.h"
 
 int main(void) {
   vec(int) v = {0};
+  vec(float) f = {0};
+  pair(int, float) p = {1, 2.5f};
   vec_push$(&v, 7);
+  vec_push$(&f, 2);
   vec_clear$(&v);
-  return (vec_size$(&v) == 1 && v.value == 0) ? 0 : 1;
+  vec_pick$(7, v);
+  return (vec_size$(&v) == 1 && v.value == 0 && vec_pick$(7, v) == 7 &&
+          vec_size$(&f) == 1 && vec_pick$(3, f) == 5 &&
+          (int)pair_sum$(3, p) == 6) ? 0 : 1;
 }
 """)
         generated = os.path.join(root, "gen", "vec.h")
+        generated_pair = os.path.join(root, "gen", "pair.h")
         env = env_with(C_AUTOTMPL_PROFILE="stc",
                        C_AUTOTMPL_STC_TEMPLATES="vec",
                        C_AUTOTMPL_DISPATCH="1")
@@ -385,7 +416,8 @@ int main(void) {
         output = proc.stdout + proc.stderr
         require(proc.returncode == 0, "dispatch run exited with error", output)
         for needle in ("dispatch=1", "dispatch backend=generic",
-                       "dispatch suffix=$", "generated vec(int)"):
+                       "dispatch suffix=$", "generated vec(int)",
+                       "generated vec(float)", "generated pair(int, float)"):
             require(needle in output, "missing dispatch report: " + needle,
                     output)
 
@@ -397,14 +429,25 @@ int main(void) {
                        "vec_int: vec_int_push",
                        "vec_int: vec_int_clear",
                        "vec_int: vec_int_size",
-                       "#define vec_push$(self, ...)",
-                       "#define vec_clear$(self, ...)",
-                       "#define vec_size$(self, ...)"):
+                       "vec_int: vec_int_pick",
+                       "#define vec_push$(...)",
+                       "#define vec_clear$(...)",
+                       "#define vec_size$(...)",
+                       "#define vec_pick$(...)"):
             require(needle in content, "missing dispatch text: " + needle,
                     content)
         require("helper" not in content,
                 "ordinary helper was treated as a dispatch operation",
                 content)
+        with open(generated_pair) as f:
+            pair_content = f.read()
+        for needle in ("/* c-autotmpl dispatch begin pair */",
+                       "#ifdef C_AUTOTMPL_pair_int_2C_20float",
+                       "_Generic((p2), pair_int_float: pair_int_float_sum",
+                       "#define pair_sum$(...)"):
+            require(needle in pair_content,
+                    "two-arity dispatch text is missing: " + needle,
+                    pair_content)
         require("c-autotmpl dispatch begin vec_push" not in content,
                 "dispatch macro call was scanned as a mangled type", content)
 
@@ -436,6 +479,7 @@ int main(void) {
                 "dispatch section was duplicated", content)
 
         os.remove(generated)
+        os.remove(generated_pair)
         builtin_env = dict(env)
         builtin_env["C_AUTOTMPL_DISPATCH_BACKEND"] = "builtin"
         proc = subprocess.run(args, cwd=root, capture_output=True, text=True,
@@ -445,9 +489,12 @@ int main(void) {
                 "builtin dispatch backend was not selected", output)
         with open(generated) as f:
             content = f.read()
-        require("__builtin_types_compatible_p(__typeof__(*(self)), vec_int)"
-                in content and "__builtin_choose_expr" in content,
-                "builtin dispatch selectors were not generated", content)
+        for needle in ("__builtin_types_compatible_p(__typeof__(p1), vec_int)",
+                       "__builtin_types_compatible_p(__typeof__(p1), vec_int*)",
+                       "__builtin_choose_expr"):
+            require(needle in content,
+                    "builtin dispatch selectors are missing: " + needle,
+                    content)
         if compiler:
             built = subprocess.run(
                 [compiler, "-std=c99", "-Wall", "-Wextra", "-Werror",
@@ -459,6 +506,7 @@ int main(void) {
                     built.stdout + built.stderr)
 
         os.remove(generated)
+        os.remove(generated_pair)
         write(source, """\
 #include "gen/vec.h"
 
@@ -488,8 +536,8 @@ int main(void) {
                 "custom dispatch suffix run exited with error", output)
         with open(generated) as f:
             content = f.read()
-        require("#define vec_push_dispatch(self, ...)" in content and
-                "#define vec_push$(self, ...)" not in content,
+        require("#define vec_push_dispatch(...)" in content and
+                "#define vec_push$(...)" not in content,
                 "custom dispatch suffix was not used", content)
         if compiler:
             built = subprocess.run(
@@ -502,12 +550,16 @@ int main(void) {
                     built.stdout + built.stderr)
 
         os.remove(generated)
+        if os.path.exists(generated_pair):
+            os.remove(generated_pair)
         write(source, """\
 #include "gen/vec.h"
+#include "gen/pair.h"
 
 int main(void) {
   vec(int) v = {0};
-  return v.value == 0 ? 0 : 1;
+  pair(int, float) p = {1, 2.5f};
+  return v.value == 0 && p.first == 1 ? 0 : 1;
 }
 """)
         proc = subprocess.run(args, cwd=root, capture_output=True, text=True,
@@ -521,7 +573,6 @@ int main(void) {
                 "dispatch was enabled without opt-in", content)
     finally:
         shutil.rmtree(root, ignore_errors=True)
-
 
 def main():
     cli = os.path.abspath(

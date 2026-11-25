@@ -153,6 +153,7 @@ def check_dispatch(plugin):
 #define vec(T) VEC_CAT(vec_, T)
 typedef struct { i_key value; } i_type;
 static inline void vec_int_push(i_type *v, int x) { v->value = x; }
+static inline void vec_int_set(int x, i_type v) { v.value = x; }
 """)
         source = os.path.join(root, "main.c")
         write(source, "int main(void) { return 0; }\n")
@@ -162,6 +163,7 @@ static inline void vec_int_push(i_type *v, int x) { v->value = x; }
 int main(void) {
   vec(int) v = {0};
   vec_push$(&v, 7);
+  vec_set$(7, v);
   return v.value == 7 ? 0 : 1;
 }
 """
@@ -202,7 +204,8 @@ int main(void) {
                 content = wait_for_content(generated, lambda c: (
                     "/* c-autotmpl dispatch begin vec */" in c and
                     "#ifdef C_AUTOTMPL_vec_int" in c and
-                    "#define vec_push$(self, ...)" in c
+                    "#define vec_push$(...)" in c and
+                    "#define vec_set$(...)" in c
                 ))
                 if content is None:
                     print("plugin dispatch was not generated", file=sys.stderr)

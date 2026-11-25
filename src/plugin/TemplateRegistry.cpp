@@ -52,20 +52,49 @@ size_t matchingParen(StringRef S, size_t Open) {
   return S.size();
 }
 
-bool firstParamIsContainer(StringRef S, size_t Begin, size_t End,
-                           const TemplateDef &Template) {
-  StringRef Param = S.substr(Begin, End - Begin).trim();
-  if (Param.find('*') == StringRef::npos)
-    return false;
-  std::string Call = Template.Name + "(";
-  std::string Mangled = Template.Name + "_";
-  return Param.contains("i_type") || Param.contains(Call) ||
-         Param.contains(Mangled);
+size_t declarationBegin(StringRef S, size_t Ident) {
+  for (size_t I = Ident; I > 0; --I)
+    if (S[I - 1] == ';' || S[I - 1] == '{' || S[I - 1] == '}')
+      return I;
+  return 0;
 }
 
-/// Finds method-shaped associated operations in a template header. A direct
-/// declaration such as vec_int_push(vec(int) *, ...) and a paste macro such as
-/// VEC_FN(i_type, _push)(i_type *, ...) both contribute `push`.
+/// A function belongs to a type template when its declaration uses that
+/// template's type spelling anywhere. Pointer-ness and argument position are
+/// irrelevant. Every decorator parameter and generated macro is checked as a
+/// whole token, which covers one-arity and multi-arity templates.
+bool signatureUsesTemplate(StringRef S, size_t Begin, size_t End,
+                           const TemplateDef &Template) {
+  std::string Signature = S.substr(Begin, End - Begin).trim().str();
+  std::string Call = Template.Name + "(";
+  std::string Mangled = Template.Name + "_";
+  if (Signature.find(Call) != std::string::npos ||
+      Signature.find(Mangled) != std::string::npos)
+    return true;
+  for (size_t I = 0; I < Signature.size();) {
+    if (!isIdentStart(Signature[I])) {
+      ++I;
+      continue;
+    }
+    size_t J = I + 1;
+    while (J < Signature.size() && isIdentChar(Signature[J]))
+      ++J;
+    StringRef Token(Signature.data() + I, J - I);
+    if (Token == "i_type")
+      return true;
+    for (size_t K = 0; K < Template.Params.size(); ++K)
+      if (Token == parameterName(Template, K) ||
+          Token == argumentMacroName(Template, K))
+        return true;
+    I = J;
+  }
+  return false;
+}
+
+/// Finds associated functions in a template header. A declaration such as
+/// vec_int_push(vec(int) *, ...) or VEC_FN(i_type, _push)(i_type *, ...)
+/// contributes `push`. The template type must appear in the declaration, but
+/// it need not be a pointer or the first parameter.
 void collectDispatchOps(StringRef Content, TemplateDef &Out) {
   if (Out.Kind != TemplateKind::Type || Out.Name.empty())
     return;
@@ -125,7 +154,6 @@ void collectDispatchOps(StringRef Content, TemplateDef &Out) {
               else if (Clean[K] == ',' && Depth == 0)
                 LastBegin = K + 1;
             }
-            StringRef First = Clean.substr(ArgBegin, Close - ArgBegin).trim();
             StringRef Last = Clean.substr(LastBegin, Close - LastBegin).trim();
             if (Last.starts_with("_") && Last.size() > 1 &&
                 isIdentStart(Last[1])) {
@@ -133,28 +161,28 @@ void collectDispatchOps(StringRef Content, TemplateDef &Out) {
               for (size_t K = 1; K < Last.size(); ++K)
                 if (!isIdentChar(Last[K]))
                   Valid = false;
-              if (Valid && firstParamIsContainer(Clean, AfterMacro + 1,
-                                                 CallClose, Out))
+              if (Valid && signatureUsesTemplate(
+                               Clean, declarationBegin(Clean, I), CallClose,
+                               Out))
                 Out.DispatchOps.insert(Last.drop_front().str());
             }
-            (void)First;
           }
         }
         if (Ident.starts_with(Out.Name) && Ident.size() > Out.Name.size() &&
             Ident[Out.Name.size()] == '_') {
           StringRef Tail = Ident.drop_front(Out.Name.size() + 1);
           size_t Under = Tail.rfind('_');
-          if (Under != StringRef::npos && Under != 0 &&
-              Under + 1 < Tail.size()) {
-            StringRef Op = Tail.drop_front(Under + 1);
-            bool Valid = true;
-            for (char C : Op)
-              if (!isIdentChar(C))
-                Valid = false;
-            if (Valid &&
-                firstParamIsContainer(Clean, After + 1, Close, Out))
-              Out.DispatchOps.insert(Op.str());
-          }
+          StringRef Op = Under != StringRef::npos && Under + 1 < Tail.size()
+                             ? Tail.drop_front(Under + 1)
+                             : Tail;
+          bool Valid = !Op.empty() && isIdentStart(Op[0]);
+          for (char C : Op)
+            if (!isIdentChar(C))
+              Valid = false;
+          if (Valid &&
+              signatureUsesTemplate(Clean, declarationBegin(Clean, I), Close,
+                                    Out))
+            Out.DispatchOps.insert(Op.str());
         }
       }
     }

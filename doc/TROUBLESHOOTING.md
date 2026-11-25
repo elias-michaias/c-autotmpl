@@ -30,7 +30,7 @@ line.
 | Usage produced only by a macro expansion | The CLI cannot see it. Use the plugin, which has an AST diagnostic fallback, or spell the usage directly. |
 | Two identical blocks in a generated header | The hand-written block used a different macro parameter name, or its `C_AUTOTMPL_...` macro was removed. |
 | Split template produces no object file | Include `gen/impl/c-autotmpl.mk` and link `C_AUTOTMPL_IMPL_SRCS`. Both the CLI and plugin write that fragment when a split template has usages. |
-| Dispatch macro was not generated | Set `C_AUTOTMPL_DISPATCH=1` and restart clangd after env changes. The operation must be declared with a container pointer first argument or used as `vec_push(int)(...)`. |
+| Dispatch macro was not generated | Set `C_AUTOTMPL_DISPATCH=1` and restart clangd after env changes. The operation must be declared in a type-template header, and its declaration must mention the template type spelling such as `vec(int)`, `i_type`, or a decorator parameter. |
 | Editor generation creates no `gen/impl/` | The template needs a lexical `#ifndef TMPL_HEADER` and a scanned usage. Open a source that uses it, then check the `[c-autotmpl]` log for `generated implementation`. |
 | Duplicate types in an implementation source | Put public declarations in the `#else` branch. Keep only implementation code under `#ifndef TMPL_HEADER`. |
 | Nested block exists but is inactive | Include the outermost generated header. Its flattened chain defines the inner blocks first. |

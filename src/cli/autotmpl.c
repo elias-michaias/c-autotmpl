@@ -1246,30 +1246,58 @@ static char *normal_macro_name(const char *s) {
   return str_take(&out);
 }
 
-static int first_param_is_container(const char *s, size_t begin, size_t end,
-                                    const TemplateDef *tmpl) {
-  char *arg = xstrdup_n(s + begin, end - begin);
-  char *param = trim_copy(arg);
-  free(arg);
+static size_t declaration_begin(const char *s, size_t ident) {
+  for (size_t k = ident; k > 0; --k)
+    if (s[k - 1] == ';' || s[k - 1] == '{' || s[k - 1] == '}')
+      return k;
+  return 0;
+}
+
+/* A function belongs to a type template when its declaration uses that
+ * template's type spelling anywhere. Pointer-ness and argument position are
+ * irrelevant. This covers one-arity and multi-arity templates because every
+ * decorator parameter and its generated macro are checked as whole tokens. */
+static int signature_uses_template(const char *s, size_t begin, size_t end,
+                                   const TemplateDef *tmpl) {
+  char *sig = xstrdup_n(s + begin, end - begin);
   size_t n = strlen(tmpl->name);
   char *call = (char *)xmalloc(n + 2);
   char *mangled = (char *)xmalloc(n + 2);
   snprintf(call, n + 2, "%s(", tmpl->name);
   snprintf(mangled, n + 2, "%s_", tmpl->name);
-  int result = strchr(param, '*') != NULL &&
-               (strstr(param, "i_type") != NULL ||
-                strstr(param, call) != NULL || strstr(param, mangled) != NULL);
-  free(param);
+  int result = strstr(sig, call) != NULL || strstr(sig, mangled) != NULL;
+  if (!result) {
+    for (size_t i = 0; i < strlen(sig);) {
+      if (!is_ident_start(sig[i])) {
+        ++i;
+        continue;
+      }
+      size_t j = i + 1;
+      while (is_ident_char(sig[j]))
+        ++j;
+      char *token = xstrdup_n(sig + i, j - i);
+      if (strcmp(token, "i_type") == 0)
+        result = 1;
+      for (size_t k = 0; !result && k < tmpl->nparams; ++k)
+        if (strcmp(token, parameter_name(tmpl, k)) == 0 ||
+            strcmp(token, arg_macro_name(tmpl, k)) == 0)
+          result = 1;
+      free(token);
+      if (result)
+        break;
+      i = j;
+    }
+  }
+  free(sig);
   free(call);
   free(mangled);
   return result;
 }
 
-/* Finds method-shaped associated operations in a template header. A direct
- * declaration such as vec_int_push(vec(int) *, ...) contributes `push`; a
- * paste macro such as VEC_FN(i_type, _push)(i_type *, ...) contributes the
- * same operation. Both forms require a pointer to the container as the first
- * parameter so ordinary helper functions are not treated as methods. */
+/* Finds associated functions in a template header. A declaration such as
+ * vec_int_push(vec(int) *, ...) or VEC_FN(i_type, _push)(i_type *, ...)
+ * contributes `push`. The template type must appear in the declaration, but
+ * it need not be a pointer or the first parameter. */
 static void collect_dispatch_ops_from_header(const char *content,
                                              const TemplateDef *tmpl,
                                              Set *ops) {
@@ -1332,8 +1360,6 @@ static void collect_dispatch_ops_from_header(const char *content,
                 else if (clean[k] == ',' && depth == 0)
                   last_begin = k + 1;
               }
-              char *first = trim_copy_n(clean + arg_begin,
-                                        close - arg_begin);
               char *last = trim_copy_n(clean + last_begin,
                                        arg_end - last_begin);
               if (last[0] == '_' && is_ident_start(last[1])) {
@@ -1342,11 +1368,10 @@ static void collect_dispatch_ops_from_header(const char *content,
                   if (!is_ident_char(last[k]))
                     valid = 0;
                 if (valid &&
-                    first_param_is_container(clean, after_macro + 1,
-                                             call_close, tmpl))
+                    signature_uses_template(
+                        clean, declaration_begin(clean, i), call_close, tmpl))
                   set_add(ops, last + 1);
               }
-              free(first);
               free(last);
               free(norm_ident);
             } else {
@@ -1358,15 +1383,15 @@ static void collect_dispatch_ops_from_header(const char *content,
         if (!strncmp(ident, tmpl->name, prefix) && ident[prefix] == '_') {
           const char *tail = ident + prefix + 1;
           const char *under = strrchr(tail, '_');
-          if (under && under != tail && under[1]) {
-            int valid = 1;
-            for (const char *p = under + 1; *p; ++p)
-              if (!is_ident_char(*p))
-                valid = 0;
-            if (valid && first_param_is_container(clean, after + 1, close,
-                                                  tmpl))
-              set_add(ops, under + 1);
-          }
+          const char *op = under && under[1] ? under + 1 : tail;
+          int valid = *op && is_ident_start(op[0]);
+          for (const char *p = op; valid && *p; ++p)
+            if (!is_ident_char(*p))
+              valid = 0;
+          if (valid &&
+              signature_uses_template(clean, declaration_begin(clean, i),
+                                      close, tmpl))
+            set_add(ops, op);
         }
       }
     }
@@ -3065,45 +3090,116 @@ static char *dispatch_container_name(const TemplateDef *tmpl, Vec *args) {
   return str_take(&out);
 }
 
-static void append_dispatch_selector(Str *out, const DispatchConfig *cfg,
-                                     const char *tmpl, const char *op,
-                                     size_t index, const char *container) {
-  char name[256];
-  char previous[256];
-  snprintf(name, sizeof(name), "C_AUTOTMPL_DISPATCH_SEL_%s_%s_%zu", tmpl, op,
-           index);
-  snprintf(previous, sizeof(previous), "C_AUTOTMPL_DISPATCH_SEL_%s_%s_%zu",
-           tmpl, op, index - 1);
-  str_append(out, "#define ");
-  str_append(out, name);
-  str_append(out, "(self) ");
-  if (cfg->backend == DISPATCH_BUILTIN) {
-    str_append(out, "__builtin_choose_expr(");
-    str_append(out, "__builtin_types_compatible_p(__typeof__(*(self)), ");
-    str_append(out, container);
-    str_append(out, "), ");
-    str_append(out, container);
+#define DISPATCH_MAX_ARGS 8
+
+static void append_size(Str *out, size_t value) {
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%zu", value);
+  str_append(out, buf);
+}
+
+static void append_selector_name(Str *out, const char *tmpl, const char *op,
+                                 size_t arity, size_t index) {
+  str_append(out, "C_AUTOTMPL_DISPATCH_SEL_");
+  str_append(out, tmpl);
+  str_append_char(out, '_');
+  str_append(out, op);
+  str_append_char(out, '_');
+  append_size(out, arity);
+  if (index) {
     str_append_char(out, '_');
-    str_append(out, op);
-    str_append(out, ", ");
-    str_append(out, previous);
-    str_append(out, "(self))");
-  } else {
-    str_append(out, "_Generic((*(self)), ");
-    str_append(out, container);
-    str_append(out, ": ");
-    str_append(out, container);
-    str_append_char(out, '_');
-    str_append(out, op);
-    str_append(out, ", default: ");
-    str_append(out, previous);
-    str_append(out, "(self))");
+    append_size(out, index);
   }
+}
+
+static void append_params(Str *out, size_t arity) {
+  for (size_t i = 1; i <= arity; ++i) {
+    if (i > 1)
+      str_append(out, ", ");
+    str_append(out, "p");
+    append_size(out, i);
+  }
+}
+
+static void append_dispatch_case_selector(Str *out, const DispatchConfig *cfg,
+                                          const char *tmpl, const char *op,
+                                          size_t case_index, size_t arity,
+                                          const char *container) {
+  Str name, previous, target, params, expr;
+  str_init(&name);
+  str_init(&previous);
+  str_init(&target);
+  str_init(&params);
+  str_init(&expr);
+  append_selector_name(&name, tmpl, op, arity, case_index);
+  append_selector_name(&previous, tmpl, op, arity, case_index - 1);
+  str_append(&target, container);
+  str_append_char(&target, '_');
+  str_append(&target, op);
+  append_params(&params, arity);
+  str_append(&expr, previous.data);
+  str_append(&expr, "(");
+  str_append(&expr, params.data);
+  str_append(&expr, ")");
+
+  for (size_t k = arity; k > 0; --k) {
+    char pname[16];
+    snprintf(pname, sizeof(pname), "p%zu", k);
+    Str next;
+    str_init(&next);
+    if (cfg->backend == DISPATCH_BUILTIN) {
+      str_append(&next, "__builtin_choose_expr(");
+      str_append(&next, "__builtin_types_compatible_p(__typeof__(");
+      str_append(&next, pname);
+      str_append(&next, "), ");
+      str_append(&next, container);
+      str_append(&next, "), ");
+      str_append(&next, target.data);
+      str_append(&next, ", __builtin_choose_expr(");
+      str_append(&next, "__builtin_types_compatible_p(__typeof__(");
+      str_append(&next, pname);
+      str_append(&next, "), ");
+      str_append(&next, container);
+      str_append(&next, "*), ");
+      str_append(&next, target.data);
+      str_append(&next, ", ");
+      str_append(&next, expr.data);
+      str_append(&next, "))");
+    } else {
+      str_append(&next, "_Generic((");
+      str_append(&next, pname);
+      str_append(&next, "), ");
+      str_append(&next, container);
+      str_append(&next, ": ");
+      str_append(&next, target.data);
+      str_append(&next, ", ");
+      str_append(&next, container);
+      str_append(&next, "*: ");
+      str_append(&next, target.data);
+      str_append(&next, ", default: ");
+      str_append(&next, expr.data);
+      str_append_char(&next, ')');
+    }
+    str_free(&expr);
+    expr = next;
+  }
+
+  str_append(out, "#define ");
+  str_append(out, name.data);
+  str_append_char(out, '(');
+  str_append(out, params.data);
+  str_append(out, ") ");
+  str_append(out, expr.data);
   str_append_char(out, '\n');
+  str_free(&name);
+  str_free(&previous);
+  str_free(&target);
+  str_free(&params);
+  str_free(&expr);
 }
 
 static char *make_dispatch_section(const TemplateDef *tmpl, Vec *cases,
-                                   const DispatchConfig *cfg) {
+                                    const DispatchConfig *cfg) {
   if (!cfg->enabled || !tmpl->dispatch_enabled || !cases->len ||
       !tmpl->dispatch_ops.len)
     return NULL;
@@ -3116,8 +3212,8 @@ static char *make_dispatch_section(const TemplateDef *tmpl, Vec *cases,
   str_append(&out, "#ifndef C_AUTOTMPL_DISPATCH_MISSING\n");
   str_append(&out, "#define C_AUTOTMPL_DISPATCH_MISSING\n");
   str_append(&out,
-             "static inline void c_autotmpl_dispatch_missing(void *self, ...) "
-             "{ (void)self; }\n");
+             "static inline int c_autotmpl_dispatch_missing(void) "
+             "{ return 0; }\n");
   str_append(&out, "#endif\n");
 
   for (size_t i = 0; i < tmpl->dispatch_ops.len; ++i) {
@@ -3132,35 +3228,95 @@ static char *make_dispatch_section(const TemplateDef *tmpl, Vec *cases,
     str_append_char(&out, '_');
     str_append(&out, op);
     str_append_char(&out, '\n');
-    char base[256];
-    snprintf(base, sizeof(base), "#define C_AUTOTMPL_DISPATCH_SEL_%s_%s_0(self) "
-                                 "c_autotmpl_dispatch_missing\n",
-             tmpl->name, op);
-    str_append(&out, base);
-    for (size_t j = 0; j < cases->len; ++j) {
-      DispatchCase *c = (DispatchCase *)cases->items[j];
-      char *presence = presence_macro(tmpl->name, c->type);
-      str_append(&out, "#ifdef ");
-      str_append(&out, presence);
-      str_append_char(&out, '\n');
-      append_dispatch_selector(&out, cfg, tmpl->name, op, j + 1,
-                               c->container);
-      str_append(&out, "#else\n");
-      char skip[256];
-      snprintf(skip, sizeof(skip),
-               "#define C_AUTOTMPL_DISPATCH_SEL_%s_%s_%zu(self) "
-               "C_AUTOTMPL_DISPATCH_SEL_%s_%s_%zu(self)\n",
-               tmpl->name, op, j + 1, tmpl->name, op, j);
-      str_append(&out, skip);
-      str_append(&out, "#endif\n");
-      free(presence);
+
+    for (size_t arity = 1; arity <= DISPATCH_MAX_ARGS; ++arity) {
+      Str base, params;
+      str_init(&base);
+      str_init(&params);
+      append_selector_name(&base, tmpl->name, op, arity, 0);
+      append_params(&params, arity);
+      str_append(&out, "#define ");
+      str_append(&out, base.data);
+      str_append_char(&out, '(');
+      str_append(&out, params.data);
+      str_append(&out, ") c_autotmpl_dispatch_missing\n");
+
+      for (size_t j = 0; j < cases->len; ++j) {
+        DispatchCase *c = (DispatchCase *)cases->items[j];
+        char *presence = presence_macro(tmpl->name, c->type);
+        str_append(&out, "#ifdef ");
+        str_append(&out, presence);
+        str_append_char(&out, '\n');
+        append_dispatch_case_selector(&out, cfg, tmpl->name, op, j + 1,
+                                      arity, c->container);
+        str_append(&out, "#else\n");
+        Str skip, previous;
+        str_init(&skip);
+        str_init(&previous);
+        append_selector_name(&skip, tmpl->name, op, arity, j + 1);
+        append_selector_name(&previous, tmpl->name, op, arity, j);
+        str_append(&out, "#define ");
+        str_append(&out, skip.data);
+        str_append_char(&out, '(');
+        str_append(&out, params.data);
+        str_append(&out, ") ");
+        str_append(&out, previous.data);
+        str_append_char(&out, '(');
+        str_append(&out, params.data);
+        str_append(&out, ")\n");
+        str_free(&skip);
+        str_free(&previous);
+        str_append(&out, "#endif\n");
+        free(presence);
+      }
+      str_free(&base);
+      str_free(&params);
     }
-    char final[320];
-    snprintf(final, sizeof(final), "#define %s_%s%s(self, ...) "
-                                   "C_AUTOTMPL_DISPATCH_SEL_%s_%s_%zu(self)"
-                                   "(self, ##__VA_ARGS__)\n",
-             tmpl->name, op, cfg->suffix, tmpl->name, op, cases->len);
-    str_append(&out, final);
+
+    str_append(&out, "#define C_AUTOTMPL_DISPATCH_PICK_");
+    str_append(&out, tmpl->name);
+    str_append_char(&out, '_');
+    str_append(&out, op);
+    str_append(&out, "(");
+    for (size_t k = 1; k <= DISPATCH_MAX_ARGS + 1; ++k) {
+      if (k > 1)
+        str_append(&out, ", ");
+      str_append(&out, "_");
+      append_size(&out, k);
+    }
+    str_append(&out, ", ...) _");
+    append_size(&out, DISPATCH_MAX_ARGS + 1);
+    str_append(&out, "\n");
+
+    str_append(&out, "#define ");
+    str_append(&out, tmpl->name);
+    str_append_char(&out, '_');
+    str_append(&out, op);
+    str_append(&out, cfg->suffix);
+    str_append(&out, "(...) C_AUTOTMPL_DISPATCH_PICK_");
+    str_append(&out, tmpl->name);
+    str_append_char(&out, '_');
+    str_append(&out, op);
+    str_append(&out, "(__VA_ARGS__");
+    for (size_t k = DISPATCH_MAX_ARGS; k > 0; --k) {
+      str_append(&out, ", C_AUTOTMPL_DISPATCH_SEL_");
+      str_append(&out, tmpl->name);
+      str_append_char(&out, '_');
+      str_append(&out, op);
+      str_append_char(&out, '_');
+      append_size(&out, k);
+      str_append_char(&out, '_');
+      append_size(&out, cases->len);
+    }
+    str_append(&out, ", C_AUTOTMPL_DISPATCH_SEL_");
+    str_append(&out, tmpl->name);
+    str_append_char(&out, '_');
+    str_append(&out, op);
+    str_append_char(&out, '_');
+    append_size(&out, 1);
+    str_append_char(&out, '_');
+    append_size(&out, cases->len);
+    str_append(&out, ")(__VA_ARGS__)(__VA_ARGS__)\n");
     str_append(&out, "#endif\n");
   }
   str_append(&out, "/* c-autotmpl dispatch end ");

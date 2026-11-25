@@ -404,19 +404,28 @@ implementation sources.
 ## Generated dispatch macros
 
 Set `C_AUTOTMPL_DISPATCH=1` to emit method-like macros such as `vec_push$`. An
-operation is eligible when a template header declares it with a pointer to the
-container as the first argument, or when a source uses
-`vec_push(int)(...)`. Helper functions without that container argument are
-ignored. Cases come only from tracked instantiations. Each case is guarded by
-its presence macro, so the header never names a type whose instantiation header
-was not included.
+operation is eligible when a type-template header declares a function whose
+declaration mentions that template's type spelling. The spelling can be the
+template call form such as `vec(int)`, a generated argument macro such as
+`i_type`, or a decorator parameter such as `Key`. Pointer-ness and argument
+position do not matter. Helper functions that never mention the template type
+are ignored.
+
+The rule covers direct declarations and paste-macro declarations, including
+two-argument templates such as `pair(Key, Value)`:
 
 ```c
 /* tmpl/vec.h */
 // -- template vec(T)
 #define vec(T) vec_##T
+#define VEC_FN_II(A, B) A##B
+#define VEC_FN(A, B) VEC_FN_II(A, B)
 typedef struct { i_key value; } i_type;
 static inline void vec_int_push(i_type *v, int x) { v->value = x; }
+static inline int VEC_FN(i_type, _at)(int i, i_type v) {
+  (void)i;
+  return v.value;
+}
 ```
 
 ```c
@@ -425,10 +434,15 @@ static inline void vec_int_push(i_type *v, int x) { v->value = x; }
 
 int main(void) {
   vec(int) nums = {0};
-  vec_push$(&nums, 7);
-  return nums.value == 7 ? 0 : 1;
+  vec_push$(&nums, 7); /* pointer, first argument */
+  return vec_at$(2, nums) == 7 ? 0 : 1; /* value, second argument */
 }
 ```
+
+Cases come only from tracked instantiations. Each case is guarded by its
+presence macro, so the header never names a type whose instantiation header was
+not included. The generated macro checks up to eight call arguments and forwards
+them unchanged.
 
 ```sh
 C_AUTOTMPL_PROFILE=stc C_AUTOTMPL_STC_TEMPLATES=vec C_AUTOTMPL_DISPATCH=1 \

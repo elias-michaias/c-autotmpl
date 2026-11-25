@@ -509,24 +509,57 @@ std::string dispatchContainerName(const TemplateDef &Template,
   return Out;
 }
 
-static void appendDispatchSelector(std::string &Out,
-                                   const DispatchConfig &Config,
-                                   StringRef TemplateName, StringRef Op,
-                                   size_t Index, StringRef Container) {
-  std::string Name = "C_AUTOTMPL_DISPATCH_SEL_" + TemplateName.str() + "_" +
-                     Op.str() + "_" + std::to_string(Index);
-  std::string Previous = "C_AUTOTMPL_DISPATCH_SEL_" + TemplateName.str() +
-                         "_" + Op.str() + "_" + std::to_string(Index - 1);
-  std::string Target = Container.str() + "_" + Op.str();
-  Out += "#define " + Name + "(self) ";
-  if (Config.Backend == DispatchBackend::Builtin) {
-    Out += "__builtin_choose_expr(__builtin_types_compatible_p(__typeof__(*("
-           "self)), " + Container.str() + "), " + Target + ", " + Previous +
-           "(self))\n";
-  } else {
-    Out += "_Generic((*(self)), " + Container.str() + ": " + Target +
-           ", default: " + Previous + "(self))\n";
+static constexpr size_t DispatchMaxArgs = 8;
+
+static std::string dispatchSelectorName(StringRef TemplateName, StringRef Op,
+                                        size_t Arity, size_t Index) {
+  std::string Out = "C_AUTOTMPL_DISPATCH_SEL_" + TemplateName.str() + "_" +
+                    Op.str() + "_" + std::to_string(Arity);
+  if (Index)
+    Out += "_" + std::to_string(Index);
+  return Out;
+}
+
+static std::string dispatchParams(size_t Arity) {
+  std::string Out;
+  for (size_t I = 1; I <= Arity; ++I) {
+    if (I > 1)
+      Out += ", ";
+    Out += "p" + std::to_string(I);
   }
+  return Out;
+}
+
+static void appendDispatchCaseSelector(std::string &Out,
+                                       const DispatchConfig &Config,
+                                       StringRef TemplateName, StringRef Op,
+                                       size_t CaseIndex, size_t Arity,
+                                       StringRef Container) {
+  std::string Name = dispatchSelectorName(TemplateName, Op, Arity, CaseIndex);
+  std::string Previous =
+      dispatchSelectorName(TemplateName, Op, Arity, CaseIndex - 1);
+  std::string Params = dispatchParams(Arity);
+  std::string Target = Container.str() + "_" + Op.str();
+  std::string Expr = Previous + "(" + Params + ")";
+
+  for (size_t K = Arity; K > 0; --K) {
+    std::string Param = "p" + std::to_string(K);
+    std::string Next;
+    if (Config.Backend == DispatchBackend::Builtin) {
+      Next = "__builtin_choose_expr(__builtin_types_compatible_p(__typeof__(" +
+             Param + "), " + Container.str() + "), " + Target +
+             ", __builtin_choose_expr(__builtin_types_compatible_p(__typeof__(" +
+             Param + "), " + Container.str() + "*), " + Target + ", " + Expr +
+             "))";
+    } else {
+      Next = "_Generic((" + Param + "), " + Container.str() + ": " + Target +
+             ", " + Container.str() + "*: " + Target + ", default: " + Expr +
+             ")";
+    }
+    Expr = std::move(Next);
+  }
+
+  Out += "#define " + Name + "(" + Params + ") " + Expr + "\n";
 }
 
 std::string makeDispatchSection(const TemplateDef &Template,
@@ -547,31 +580,47 @@ std::string makeDispatchSection(const TemplateDef &Template,
   Out += "/* c-autotmpl dispatch begin " + Template.Name + " */\n";
   Out += "#ifndef C_AUTOTMPL_DISPATCH_MISSING\n";
   Out += "#define C_AUTOTMPL_DISPATCH_MISSING\n";
-  Out += "static inline void c_autotmpl_dispatch_missing(void *self, ...) "
-         "{ (void)self; }\n";
+  Out += "static inline int c_autotmpl_dispatch_missing(void) "
+         "{ return 0; }\n";
   Out += "#endif\n";
   for (const std::string &Op : UniqueOps) {
-    std::string Guard =
-        "C_AUTOTMPL_DISPATCH_" + Template.Name + "_" + Op;
+    std::string Guard = "C_AUTOTMPL_DISPATCH_" + Template.Name + "_" + Op;
     Out += "#ifndef " + Guard + "\n#define " + Guard + "\n";
-    Out += "#define C_AUTOTMPL_DISPATCH_SEL_" + Template.Name + "_" + Op +
-           "_0(self) c_autotmpl_dispatch_missing\n";
-    for (size_t I = 0; I < Cases.size(); ++I) {
-      std::string Presence = presenceMacro(Template.Name, Cases[I].Type);
-      Out += "#ifdef " + Presence + "\n";
-      appendDispatchSelector(Out, Config, Template.Name, Op, I + 1,
-                             Cases[I].Container);
-      Out += "#else\n";
-      Out += "#define C_AUTOTMPL_DISPATCH_SEL_" + Template.Name + "_" + Op +
-             "_" + std::to_string(I + 1) + "(self) C_AUTOTMPL_DISPATCH_SEL_" +
-             Template.Name + "_" + Op + "_" + std::to_string(I) +
-             "(self)\n";
-      Out += "#endif\n";
+
+    for (size_t Arity = 1; Arity <= DispatchMaxArgs; ++Arity) {
+      std::string Base = dispatchSelectorName(Template.Name, Op, Arity, 0);
+      std::string Params = dispatchParams(Arity);
+      Out += "#define " + Base + "(" + Params +
+             ") c_autotmpl_dispatch_missing\n";
+      for (size_t I = 0; I < Cases.size(); ++I) {
+        std::string Presence = presenceMacro(Template.Name, Cases[I].Type);
+        Out += "#ifdef " + Presence + "\n";
+        appendDispatchCaseSelector(Out, Config, Template.Name, Op, I + 1,
+                                   Arity, Cases[I].Container);
+        Out += "#else\n";
+        Out += "#define " +
+               dispatchSelectorName(Template.Name, Op, Arity, I + 1) + "(" +
+               Params + ") " +
+               dispatchSelectorName(Template.Name, Op, Arity, I) + "(" +
+               Params + ")\n";
+        Out += "#endif\n";
+      }
     }
+
+    std::string Pick = "C_AUTOTMPL_DISPATCH_PICK_" + Template.Name + "_" + Op;
+    Out += "#define " + Pick + "(";
+    for (size_t K = 1; K <= DispatchMaxArgs + 1; ++K) {
+      if (K > 1)
+        Out += ", ";
+      Out += "_" + std::to_string(K);
+    }
+    Out += ", ...) _" + std::to_string(DispatchMaxArgs + 1) + "\n";
     Out += "#define " + Template.Name + "_" + Op + Config.Suffix +
-           "(self, ...) C_AUTOTMPL_DISPATCH_SEL_" + Template.Name + "_" +
-           Op + "_" + std::to_string(Cases.size()) +
-           "(self)(self, ##__VA_ARGS__)\n";
+           "(...) " + Pick + "(__VA_ARGS__";
+    for (size_t K = DispatchMaxArgs; K > 0; --K)
+      Out += ", " + dispatchSelectorName(Template.Name, Op, K, Cases.size());
+    Out += ", " + dispatchSelectorName(Template.Name, Op, 1, Cases.size()) +
+           ")(__VA_ARGS__)(__VA_ARGS__)\n";
     Out += "#endif\n";
   }
   Out += "/* c-autotmpl dispatch end " + Template.Name + " */\n";
