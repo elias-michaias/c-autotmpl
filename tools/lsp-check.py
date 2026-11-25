@@ -211,10 +211,10 @@ static inline int box_secret(T)(Box(T) *b) { return b->value; }
 
 int main(void) {
   vec(int) v = {0};
-  $vec_push(&v, 7);
-  $vec_set(7, v);
+  $vec_int_push(&v, 7);
+  $vec_int_set(7, v);
   Box(int) *b = box_alloc(int)();
-  $Box_free(b);
+  $box_free(b);
   return v.value == 7 && b->value == 0 ? 0 : 1;
 }
 """
@@ -263,8 +263,8 @@ dispatch=1
                 content = wait_for_content(generated, lambda c: (
                     "/* c-autotmpl dispatch begin vec */" in c and
                     "#ifdef C_AUTOTMPL_vec_int" in c and
-                    "#define $vec_push(...)" in c and
-                    "#define $vec_set(...)" in c
+                    "#define $vec_int_push(...)" in c and
+                    "#define $vec_int_set(...)" in c
                 ))
                 if content is None:
                     print("plugin dispatch was not generated", file=sys.stderr)
@@ -277,13 +277,13 @@ dispatch=1
                     return 1
                 box_content = wait_for_content(generated_box, lambda c: (
                     "/* c-autotmpl dispatch begin Box */" in c and
-                    "#define $Box_alloc(...)" in c and
-                    "#define $Box_free(...)" in c and
+                    "#define $box_alloc(...)" in c and
+                    "#define $box_free(...)" in c and
                     "Box_int: box_alloc_int" in c and
                     "Box_int: box_free_int" in c
                 ))
                 if box_content is None:
-                    print("plugin lowercase dispatch was not generated",
+                    print("plugin signature-based dispatch was not generated",
                           file=sys.stderr)
                     with open(log_path, errors="replace") as f:
                         print(f.read()[-4000:], file=sys.stderr)
@@ -340,7 +340,7 @@ dispatch=1
                                    box_header.splitlines()[:start["line"]])
                 start_offset += start["character"]
                 if not box_header[start_offset:].startswith("box_free"):
-                    print("lowercase dispatch pointed at the wrong declaration",
+                    print("dispatch pointed at the wrong declaration",
                           file=sys.stderr)
                     print(response, file=sys.stderr)
                     return 1

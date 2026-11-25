@@ -517,10 +517,17 @@ static std::string dispatchCallTarget(const TemplateDef &Template,
   auto It = Template.DispatchTargets.find(Op);
   if (It == Template.DispatchTargets.end())
     return Case.Container + "_" + Op.str();
-  std::string Out = It->second;
-  for (const std::string &Arg : Case.Args)
-    appendDispatchArg(Out, Arg);
-  return Out;
+  const DispatchTargetInfo &Target = It->second;
+  if (!Target.Base.empty()) {
+    if (!Target.AppendArgs)
+      return Target.Base;
+    std::string Out = Target.Base;
+    for (const std::string &Arg : Case.Args)
+      appendDispatchArg(Out, Arg);
+    return Out;
+  }
+  return Case.Container + "_" +
+         (Target.Suffix.empty() ? Op.str() : Target.Suffix);
 }
 
 static constexpr size_t DispatchMaxArgs = 8;
@@ -629,7 +636,7 @@ std::string makeDispatchSection(const TemplateDef &Template,
       Out += "_" + std::to_string(K);
     }
     Out += ", ...) _" + std::to_string(DispatchMaxArgs + 1) + "\n";
-    std::string MacroName = Template.Name + "_" + Op;
+    std::string MacroName = Op;
     if (Config.Style == DispatchStyle::Prefix)
       MacroName = Config.Affix + MacroName;
     else

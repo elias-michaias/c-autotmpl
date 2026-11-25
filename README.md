@@ -123,26 +123,29 @@ you. [doc/USAGE.md](doc/USAGE.md#what-the-pattern-does) explains the pattern.
 ## Generated dispatch macros
 
 Set `dispatch=1` in `autotmpl.conf` to get method-like names for functions
-declared in type-template headers. A function qualifies when its declaration
-mentions the template type spelling. It does not need a pointer, and the
-container does not need to be the first argument. The same rule applies to
-`vec(T)` and to two-argument templates such as `pair(Key, Value)`. Lowercase
-helper bases such as `box_alloc(T)` are matched to `Box` case-insensitively and
-dispatch to `box_alloc_<Type>`.
+declared in type-template headers. A function qualifies when its parameter
+list mentions the template call spelling (`vec(int)`, `Box(T)`,
+`pair(Key, Value)`) or a template parameter/decorator (`T`, `U`, `i_type`).
+Function names are never compared with the template name, and the generated
+macro uses the function spelling: `box_alloc(T)` produces `$box_alloc` and
+calls `box_alloc_<Type>`. Declarations after `#ifndef TMPL_HEADER` are skipped.
 
 ```c
 #include "gen/vec.h"
 #include "gen/pair.h"
+#include "gen/box.h"
 
 vec(int) xs = {0};
 vec(float) ys = {0};
 pair(int, float) entry = {1, 2.5f};
+Box(int) box = {3};
 
 $vec_push(&xs, 7);      /* selects vec_int_push */
 $vec_push(&ys, 2.5f);   /* same macro, selects vec_float_push */
 $vec_at(2, xs);         /* value, second argument */
 $vec_at(2, ys);         /* same macro, selects vec_float_at */
 $pair_sum(3, entry);    /* two-argument template */
+$box_free(&box);        /* function spelling, any helper name */
 ```
 
 The same dispatch macro selects the operation for each tracked instantiation of

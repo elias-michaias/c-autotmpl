@@ -285,17 +285,20 @@ application needs an explicit wrapper template.
 
 Set `dispatch=1` in `autotmpl.conf` to emit method-like macros such as
 `$Vec_push`. An operation is eligible when a type-template header declares a
-function whose declaration mentions that template's type spelling. The spelling
-can be the template call form such as `Vec(T)`, a generated parameter macro such
-as `T`, or a decorator parameter such as `Key`. Pointer-ness and argument
-position do not matter. Helper functions that never mention the template type are
-ignored. Declarations inside `#ifndef TMPL_HEADER` are implementation-only and are
-also ignored.
+function whose parameter list mentions that template's call form such as
+`Vec(T)`, `Pair(T, U)`, or `Box(int)`; a template parameter such as `T` or `U`;
+or a generated decorator parameter such as `Key`, `i_type`, or `i_key`.
+Pointer-ness and argument position do not matter. Function names are not
+compared with the template name: `inspect(Box(T) *)` is eligible. Helper
+functions whose parameters never mention the template are ignored, and so are
+declarations inside `#ifndef TMPL_HEADER`.
 
-Function bases are matched case-insensitively against the template name. A
-lowercase base such as `box_alloc(T)` therefore yields `$Box_alloc`, and
-selectors call `box_alloc_<Type>`. Names that already contain the concrete
-type, such as `Vec_int_push`, keep the usual `<TypeContainer>_<op>` target.
+The public macro is the affix plus the declared function spelling. A
+`box_alloc(T)` helper therefore produces `$box_alloc` and its selector calls
+`box_alloc_<Type>`. A paste-macro declaration such as `VEC_FN(i_type, _push)`
+produces `<Template>_push`, so the example below yields `$Vec_push` targeting
+`Vec_int_push`. Names that already contain a concrete type, such as
+`Vec_int_push`, are used verbatim as the function spelling.
 
 The rule covers direct declarations and paste-macro declarations, including
 two-argument templates such as `pair(Key, Value)`:

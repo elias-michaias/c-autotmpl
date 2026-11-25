@@ -31,14 +31,6 @@ bool isSpace(char C) {
          C == '\v';
 }
 
-std::string normalMacroName(StringRef S) {
-  std::string Out;
-  for (char C : S)
-    if (isIdentChar(C))
-      Out.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(C))));
-  return Out;
-}
-
 size_t matchingParen(StringRef S, size_t Open) {
   int Depth = 0;
   for (size_t I = Open; I < S.size(); ++I) {
@@ -59,27 +51,91 @@ size_t declarationBegin(StringRef S, size_t Ident) {
   return 0;
 }
 
-/// A function belongs to a type template when its declaration uses that
-/// template's type spelling anywhere. Pointer-ness and argument position are
-/// irrelevant. Every decorator parameter and generated macro is checked as a
-/// whole token, which covers one-arity and multi-arity templates.
-bool signatureUsesTemplate(StringRef S, size_t Begin, size_t End,
-                           const TemplateDef &Template) {
-  std::string Signature = S.substr(Begin, End - Begin).trim().str();
-  std::string Call = Template.Name + "(";
-  std::string Mangled = Template.Name + "_";
-  if (Signature.find(Call) != std::string::npos ||
-      Signature.find(Mangled) != std::string::npos)
-    return true;
-  for (size_t I = 0; I < Signature.size();) {
-    if (!isIdentStart(Signature[I])) {
+bool isWord(StringRef S, size_t I, StringRef Word) {
+  if (I + Word.size() > S.size() || S.substr(I, Word.size()) != Word)
+    return false;
+  if (I && isIdentChar(S[I - 1]))
+    return false;
+  return I + Word.size() == S.size() || !isIdentChar(S[I + Word.size()]);
+}
+
+/// A lexical declaration defines a function when it is not a typedef or the
+/// closing brace of an aggregate type. This keeps generated type names such as
+/// Vec(T) from being mistaken for function declarations.
+bool declarationIsFunctional(StringRef S, size_t Begin, size_t End) {
+  StringRef Text = S.substr(Begin, End - Begin);
+  for (size_t I = 0; I < Text.size();) {
+    if (Text[I] == '}')
+      return false;
+    if (!isIdentStart(Text[I])) {
       ++I;
       continue;
     }
     size_t J = I + 1;
-    while (J < Signature.size() && isIdentChar(Signature[J]))
+    while (J < Text.size() && isIdentChar(Text[J]))
       ++J;
-    StringRef Token(Signature.data() + I, J - I);
+    if (isWord(Text, I, "typedef"))
+      return false;
+    I = J;
+  }
+  return true;
+}
+
+/// A declaration must have a return-type prefix before the call-like token and
+/// a function tail after it. This rejects struct attributes such as
+/// `_Alignas(T)`, whose argument list also mentions a template parameter.
+bool declarationHasPrefix(StringRef S, size_t Begin, size_t Ident) {
+  for (size_t I = Begin; I < Ident; ++I)
+    if (isIdentStart(S[I]))
+      return true;
+  return false;
+}
+
+bool declarationTailIsFunction(StringRef S, size_t Close) {
+  size_t I = Close + 1;
+  for (;;) {
+    while (I < S.size() && isSpace(S[I]))
+      ++I;
+    if (I >= S.size())
+      return false;
+    if (S[I] == ';' || S[I] == '{')
+      return true;
+    if (!isIdentStart(S[I]))
+      return false;
+    while (I < S.size() && isIdentChar(S[I]))
+      ++I;
+    while (I < S.size() && isSpace(S[I]))
+      ++I;
+    if (I >= S.size() || S[I] != '(')
+      return false;
+    size_t End = matchingParen(S, I);
+    if (End >= S.size())
+      return false;
+    I = End + 1;
+  }
+}
+
+/// Eligibility depends only on the function's parameter list. A parameter that
+/// mentions the template call spelling, a generated decorator parameter, or a
+/// decorator name such as Key makes the function eligible. Pointer-ness and
+/// argument position are irrelevant.
+bool paramsUseTemplate(StringRef S, size_t Begin, size_t End,
+                       const TemplateDef &Template) {
+  std::string Params = S.substr(Begin, End - Begin).trim().str();
+  std::string Call = Template.Name + "(";
+  std::string Mangled = Template.Name + "_";
+  if (Params.find(Call) != std::string::npos ||
+      Params.find(Mangled) != std::string::npos)
+    return true;
+  for (size_t I = 0; I < Params.size();) {
+    if (!isIdentStart(Params[I])) {
+      ++I;
+      continue;
+    }
+    size_t J = I + 1;
+    while (J < Params.size() && isIdentChar(Params[J]))
+      ++J;
+    StringRef Token(Params.data() + I, J - I);
     if (Token == "i_type")
       return true;
     for (size_t K = 0; K < Template.Params.size(); ++K)
@@ -91,24 +147,62 @@ bool signatureUsesTemplate(StringRef S, size_t Begin, size_t End,
   return false;
 }
 
-/// Finds associated functions in a template header. A declaration such as
-/// vec_int_push(vec(int) *, ...), VEC_FN(i_type, _push)(i_type *, ...), or
-/// box_alloc(T)(Box(T) *) contributes `push` or `alloc`. The template type must
-/// appear in the declaration, but it need not be a pointer or the first
-/// parameter. Declarations after `#ifndef TMPL_HEADER` are implementation-only
-/// and are ignored.
+/// Distinguishes a parameter declaration from a bare type used by a generated
+/// type name. T value and Box(T) *b qualify; T and Vec(T) alone do not.
+bool paramsDeclareArgument(StringRef S, size_t Begin, size_t End) {
+  std::string Params = S.substr(Begin, End - Begin).trim().str();
+  int Depth = 0;
+  size_t Part = 0;
+  for (size_t I = 0; I <= Params.size(); ++I) {
+    char C = I < Params.size() ? Params[I] : '\0';
+    if (C == '(' || C == '[')
+      ++Depth;
+    else if (C == ')' || C == ']')
+      --Depth;
+    if (C && !(C == ',' && Depth == 0))
+      continue;
+    StringRef Arg(Params.data() + Part, I - Part);
+    Arg = Arg.trim();
+    int Identifiers = 0;
+    for (size_t K = 0; K < Arg.size();) {
+      if (!isIdentStart(Arg[K])) {
+        ++K;
+        continue;
+      }
+      ++Identifiers;
+      while (K < Arg.size() && isIdentChar(Arg[K]))
+        ++K;
+    }
+    if (Identifiers < 2 && Arg.find('*') == StringRef::npos &&
+        Arg.find('[') == StringRef::npos)
+      return false;
+    Part = I + 1;
+  }
+  return true;
+}
+
+/// Finds functions generated by a type-template header. Eligibility depends
+/// only on the parameter list; function names are never compared with the
+/// template name. A paste-macro declaration such as VEC_FN(i_type, _push)(...)
+/// contributes `<Template>_push`, while box_alloc(T)(T value) and
+/// inspect(Box(T) *) keep their own spelling. Declarations after
+/// `#ifndef TMPL_HEADER` are implementation-only and are ignored.
 void collectDispatchOps(StringRef Content, TemplateDef &Out,
                         size_t BaseOffset = 0) {
   if (Out.Kind != TemplateKind::Type || Out.Name.empty())
     return;
   std::string Cleaned = stripCommentsAndLiterals(Content);
   StringRef Clean(Cleaned);
-  std::string NormTemplate = normalMacroName(Out.Name);
-  auto recordOp = [&](StringRef Op, size_t Offset) {
+  auto recordOp = [&](StringRef Op, size_t Offset, StringRef Base,
+                      StringRef Suffix, bool AppendArgs) {
     std::string Key = Op.str();
     Out.DispatchOps.insert(Key);
     Out.DispatchOpOffsets.try_emplace(
         Key, static_cast<unsigned>(BaseOffset + Offset));
+    DispatchTargetInfo &Target = Out.DispatchTargets[Key];
+    Target.Base = Base.str();
+    Target.Suffix = Suffix.str();
+    Target.AppendArgs = AppendArgs;
   };
   bool LineStart = true;
   for (size_t I = 0; I < Clean.size();) {
@@ -148,24 +242,23 @@ void collectDispatchOps(StringRef Content, TemplateDef &Out,
     while (End < Clean.size() && isIdentChar(Clean[End]))
       ++End;
     StringRef Ident = Clean.slice(I, End);
-    std::string NormIdent = normalMacroName(Ident);
     size_t After = End;
     while (After < Clean.size() && isSpace(Clean[After]))
       ++After;
     if (After < Clean.size() && Clean[After] == '(') {
       size_t Close = matchingParen(Clean, After);
       if (Close < Clean.size()) {
+        size_t DeclBegin = declarationBegin(Clean, I);
+        bool Functional = declarationIsFunctional(Clean, DeclBegin, I);
         size_t AfterMacro = Close + 1;
         while (AfterMacro < Clean.size() && isSpace(Clean[AfterMacro]))
           ++AfterMacro;
         if (AfterMacro < Clean.size() && Clean[AfterMacro] == '(') {
           size_t CallClose = matchingParen(Clean, AfterMacro);
-          if (CallClose < Clean.size() && NormIdent.find(NormTemplate) !=
-                                               std::string::npos) {
-            size_t ArgBegin = After + 1;
-            size_t LastBegin = ArgBegin;
+          if (CallClose < Clean.size()) {
+            size_t LastBegin = After + 1;
             int Depth = 0;
-            for (size_t K = ArgBegin; K < Close; ++K) {
+            for (size_t K = After + 1; K < Close; ++K) {
               if (Clean[K] == '(' || Clean[K] == '[')
                 ++Depth;
               else if (Clean[K] == ')' || Clean[K] == ']')
@@ -174,40 +267,34 @@ void collectDispatchOps(StringRef Content, TemplateDef &Out,
                 LastBegin = K + 1;
             }
             StringRef Last = Clean.substr(LastBegin, Close - LastBegin).trim();
-            if (Last.starts_with("_") && Last.size() > 1 &&
-                isIdentStart(Last[1])) {
-              bool Valid = true;
-              for (size_t K = 1; K < Last.size(); ++K)
-                if (!isIdentChar(Last[K]))
-                  Valid = false;
-              if (Valid && signatureUsesTemplate(
-                               Clean, declarationBegin(Clean, I), CallClose,
-                               Out))
-                recordOp(Last.drop_front(), I);
+            bool PasteOp = Last.starts_with("_") && Last.size() > 1 &&
+                           isIdentStart(Last[1]);
+            for (size_t K = 1; PasteOp && K < Last.size(); ++K)
+              if (!isIdentChar(Last[K]))
+                PasteOp = false;
+            bool MacroUses =
+                paramsUseTemplate(Clean, After + 1, Close, Out);
+            bool ArgsUse =
+                CallClose > AfterMacro + 1 &&
+                paramsUseTemplate(Clean, AfterMacro + 1, CallClose, Out) &&
+                paramsDeclareArgument(Clean, AfterMacro + 1, CallClose);
+            if (Functional && declarationHasPrefix(Clean, DeclBegin, I) &&
+                declarationTailIsFunction(Clean, CallClose) &&
+                (ArgsUse || MacroUses)) {
+              if (PasteOp) {
+                std::string PublicOp = (Out.Name + "_" + Last.drop_front()).str();
+                recordOp(PublicOp, I, "", Last.drop_front(), false);
+              } else {
+                recordOp(Ident, I, Ident, "", true);
+              }
             }
           }
-        }
-        bool Direct = NormIdent.size() > NormTemplate.size() &&
-                      StringRef(NormIdent).starts_with(NormTemplate) &&
-                      NormIdent[NormTemplate.size()] == '_';
-        if (Direct) {
-          StringRef Tail = Ident.drop_front(Out.Name.size() + 1);
-          size_t Under = Tail.rfind('_');
-          StringRef Op = Under != StringRef::npos && Under + 1 < Tail.size()
-                             ? Tail.drop_front(Under + 1)
-                             : Tail;
-          bool Valid = !Op.empty() && isIdentStart(Op[0]);
-          for (char C : Op)
-            if (!isIdentChar(C))
-              Valid = false;
-          if (Valid &&
-              signatureUsesTemplate(Clean, declarationBegin(Clean, I), Close,
-                                    Out)) {
-            recordOp(Op, I);
-            if (normalMacroName(Tail) == normalMacroName(Op) &&
-                Close > After + 1)
-              Out.DispatchTargets[Op.str()] = Ident.str();
-          }
+        } else if (Functional && Close > After + 1 &&
+                   declarationHasPrefix(Clean, DeclBegin, I) &&
+                   declarationTailIsFunction(Clean, Close) &&
+                   paramsUseTemplate(Clean, After + 1, Close, Out) &&
+                   paramsDeclareArgument(Clean, After + 1, Close)) {
+          recordOp(Ident, I, Ident, "", false);
         }
       }
     }

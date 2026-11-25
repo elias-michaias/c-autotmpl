@@ -55,6 +55,13 @@ struct ArgSpec {
 ///   // -- template List(T)
 ///   // -- template type Box(T)
 ///   // -- template function select(First, Second)
+/// How to form a concrete call target for a dispatch operation.
+struct DispatchTargetInfo {
+  std::string Base;        // stable function spelling, when name does not vary
+  std::string Suffix;      // generated suffix appended to the container
+  bool AppendArgs = false; // true for box_alloc(T)-style macro calls
+};
+
 struct TemplateDef {
   TemplateKind Kind = TemplateKind::Type;
   std::string Name;                            // "List"
@@ -69,7 +76,7 @@ struct TemplateDef {
   llvm::SmallVector<ArgSpec, 2> ArgSpecs;      // empty means legacy behavior
   llvm::StringSet<> DispatchOps;                // method-like operation names
   llvm::StringMap<unsigned> DispatchOpOffsets;  // declaration offsets in Header
-  llvm::StringMap<std::string> DispatchTargets; // op -> concrete call name base
+  llvm::StringMap<DispatchTargetInfo> DispatchTargets; // op -> call target
   bool DispatchEnabled = false;
 };
 

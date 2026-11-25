@@ -983,19 +983,29 @@ struct SharedState {
     }
 
     for (const DispatchGroup &Group : Groups) {
-      SmallVector<StringRef, 4> Ops;
+      TemplateDef DispatchTemplate = *Group.Template;
+      SmallVector<std::string, 4> OwnedOps;
       llvm::StringSet<> SeenOps;
       for (const auto &Entry : Group.Template->DispatchOps) {
         if (SeenOps.insert(Entry.getKey()).second)
-          Ops.push_back(Entry.getKey());
+          OwnedOps.push_back(Entry.getKey().str());
       }
       auto It = AdapterOps.find(Group.Template->Name);
       if (It != AdapterOps.end())
-        for (const auto &Entry : It->second)
-          if (SeenOps.insert(Entry.getKey()).second)
-            Ops.push_back(Entry.getKey());
+        for (const auto &Entry : It->second) {
+          std::string PublicOp =
+              (Group.Template->Name + "_" + Entry.getKey()).str();
+          DispatchTargetInfo Info;
+          Info.Suffix = Entry.getKey().str();
+          DispatchTemplate.DispatchTargets[PublicOp] = Info;
+          if (SeenOps.insert(PublicOp).second)
+            OwnedOps.push_back(PublicOp);
+        }
+      SmallVector<StringRef, 4> Ops;
+      for (const std::string &Op : OwnedOps)
+        Ops.push_back(Op);
       std::string Error;
-      Inst.ensureDispatch(*Group.Template, Group.Cases, Ops, Dispatch,
+      Inst.ensureDispatch(DispatchTemplate, Group.Cases, Ops, Dispatch,
                           Group.Output, Error);
       if (!Error.empty())
         log(std::string("failed dispatch: ") + Error);
@@ -1312,9 +1322,8 @@ static bool dispatchAffixIsIdent(const DispatchConfig &Config) {
   return !Config.Affix.empty() && navIdentStart(Config.Affix.front());
 }
 
-/// Recognizes `$vec_push(...)` or `vec_push$(...)` at the cursor and maps it
-/// back to a type template and operation. The longest matching template wins so
-/// `pair_sum` cannot be mistaken for an operation on `pair`-like prefixes.
+/// Recognizes `$vec_int_push(...)` or `vec_int_push$(...)` at the cursor and
+/// maps the function spelling back to its template and operation.
 static DispatchNavTarget dispatchTargetAt(StringRef Text, size_t Offset,
                                           const SharedState &State) {
   DispatchNavTarget Result;
@@ -1354,21 +1363,16 @@ static DispatchNavTarget dispatchTargetAt(StringRef Text, size_t Offset,
                 ? Ident.drop_front(Affix.size())
                 : Ident.drop_back(Affix.size());
 
+  if (!navIdent(Ident))
+    return Result;
   for (const auto &Owned : State.Registry.templates()) {
     const TemplateDef *Def = Owned.get();
-    if (!Def || !Def->DispatchEnabled ||
-        Def->Kind != TemplateKind::Type || Def->Name.empty())
-      continue;
-    StringRef Call = Def->Name;
-    if (!Ident.starts_with(Call) || Ident.size() <= Call.size() ||
-        Ident[Call.size()] != '_')
-      continue;
-    StringRef Op = Ident.drop_front(Call.size() + 1);
-    if (!navIdent(Op) || (Result.Template &&
-                          Def->Name.size() <= Result.Template->Name.size()))
+    if (!Def || !Def->DispatchEnabled || Def->Kind != TemplateKind::Type ||
+        Def->Name.empty() || !Def->DispatchOps.contains(Ident))
       continue;
     Result.Template = Def;
-    Result.Op = Op.str();
+    Result.Op = Ident.str();
+    break;
   }
   return Result;
 }

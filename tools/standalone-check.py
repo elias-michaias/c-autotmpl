@@ -453,12 +453,15 @@ static inline A PAIR_FN(A, B, _sum)(int extra, pair(A, B) p) {
 #define Box(T) BOX_CAT(Box_, T)
 #define box_alloc(T) BOX_CAT(box_alloc_, T)
 #define box_free(T) BOX_CAT(box_free_, T)
+#define BoxPad(T) BOX_CAT(BoxPad_, T)
 typedef struct { T value; } Box(T);
+typedef struct { _Alignas(T) char pad[sizeof(T)]; } BoxPad(T);
 static inline Box(T) *box_alloc(T)(void) {
   static Box(T) value;
   return &value;
 }
 static inline void box_free(T)(Box(T) *b) { b->value = 0; }
+static inline int inspect(Box(T) *b) { return b->value; }
 #ifndef TMPL_HEADER
 #define box_secret(T) BOX_CAT(box_secret_, T)
 static inline int box_secret(T)(Box(T) *b) { return b->value; }
@@ -479,10 +482,11 @@ int main(void) {
   $vec_push(&f, 2);
   $vec_clear(&v);
   $vec_pick(7, v);
-  $Box_free(&b);
+  int seen = $inspect(&b);
+  $box_free(&b);
   return ($vec_size(&v) == 1 && v.value == 0 && $vec_pick(7, v) == 7 &&
           $vec_size(&f) == 1 && $vec_pick(3, f) == 5 &&
-          (int)$pair_sum(3, p) == 6 && b.value == 0) ? 0 : 1;
+          (int)$pair_sum(3, p) == 6 && seen == 7 && b.value == 0) ? 0 : 1;
 }
 """)
         generated = os.path.join(root, "gen", "vec.h")
@@ -543,12 +547,20 @@ dispatch=1
         for needle in ("/* c-autotmpl dispatch begin Box */",
                        "Box_int: box_alloc_int", "Box_int*: box_alloc_int",
                        "Box_int: box_free_int", "Box_int*: box_free_int",
-                       "#define $Box_alloc(...)", "#define $Box_free(...)"):
+                       "Box_int: inspect", "Box_int*: inspect",
+                       "#define $box_alloc(...)", "#define $box_free(...)",
+                       "#define $inspect(...)"):
             require(needle in box_content,
-                    "lowercase dispatch text is missing: " + needle,
+                    "signature-based dispatch text is missing: " + needle,
                     box_content)
+        require("$Box_alloc(...)" not in box_content and
+                "$Box_free(...)" not in box_content,
+                "dispatch macro did not use the function spelling", box_content)
+        require("$_Alignas(...)" not in box_content,
+                "struct alignment attribute was treated as a function",
+                box_content)
         require("box_secret" not in box_content and
-                "$Box_secret(...)" not in box_content,
+                "$box_secret(...)" not in box_content,
                 "implementation-only helper was treated as a dispatch op",
                 box_content)
 

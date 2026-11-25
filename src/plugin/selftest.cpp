@@ -55,11 +55,14 @@ int main() {
     raw_fd_ostream OS(join(Root, "tmpl/dispatch.h"), EC);
     OS << "// -- template type Dispatch(T)\n"
           "#define Dispatch(T) Dispatch_##T\n"
+          "#define DISPATCH_FN(A, B) A##B\n"
           "typedef struct { T value; } Dispatch(T);\n"
           "static inline void Dispatch_int_push(Dispatch(int) *d, int x) "
           "{ d->value = x; }\n"
           "static inline void Dispatch_int_set(int x, Dispatch(int) d) "
           "{ d.value = x; }\n"
+          "static inline void DISPATCH_FN(Dispatch(T), _clear)(Dispatch(T) *d) "
+          "{ d->value = 0; }\n"
           "static inline int helper(int x) { return x; }\n";
   }
   {
@@ -69,12 +72,16 @@ int main() {
           "#define Crate(T) Crate_##T\n"
           "#define crate_alloc(T) crate_alloc_##T\n"
           "#define crate_free(T) crate_free_##T\n"
+          "#define CratePad(T) CratePad_##T\n"
           "typedef struct { T value; } Crate(T);\n"
-          "static inline Crate(T) *crate_alloc(T)(void) {\n"
-          "  static Crate(T) value;\n"
-          "  return &value;\n"
+          "typedef struct { _Alignas(T) char pad[sizeof(T)]; } CratePad(T);\n"
+          "static inline Crate(T) *crate_alloc(T)(T value) {\n"
+          "  static Crate(T) slot;\n"
+          "  slot.value = value;\n"
+          "  return &slot;\n"
           "}\n"
           "static inline void crate_free(T)(Crate(T) *c) { c->value = 0; }\n"
+          "static inline int observe(Crate(T) *c) { return c->value; }\n"
           "#ifndef TMPL_HEADER\n"
           "#define crate_secret(T) crate_secret_##T\n"
           "static inline int crate_secret(T)(Crate(T) *c) { return c->value; }\n"
@@ -284,18 +291,25 @@ int main() {
   const c_autotmpl::TemplateDef *DispatchDef =
       Registry.findByName("Dispatch");
   assert(DispatchDef && DispatchDef->DispatchEnabled);
-  assert(DispatchDef->DispatchOps.contains("push"));
-  assert(DispatchDef->DispatchOps.contains("set"));
+  assert(DispatchDef->DispatchOps.contains("Dispatch_int_push"));
+  assert(DispatchDef->DispatchOps.contains("Dispatch_int_set"));
+  assert(DispatchDef->DispatchOps.contains("Dispatch_clear"));
   assert(!DispatchDef->DispatchOps.contains("helper"));
   const c_autotmpl::TemplateDef *CrateDef = Registry.findByName("Crate");
   assert(CrateDef && CrateDef->DispatchEnabled);
-  assert(CrateDef->DispatchOps.contains("alloc"));
-  assert(CrateDef->DispatchOps.contains("free"));
+  assert(CrateDef->DispatchOps.contains("crate_alloc"));
+  assert(CrateDef->DispatchOps.contains("crate_free"));
+  assert(CrateDef->DispatchOps.contains("observe"));
   assert(!CrateDef->DispatchOps.contains("secret"));
-  auto AllocTarget = CrateDef->DispatchTargets.find("alloc");
+  assert(!CrateDef->DispatchOps.contains("_Alignas"));
+  auto AllocTarget = CrateDef->DispatchTargets.find("crate_alloc");
   assert(AllocTarget != CrateDef->DispatchTargets.end());
-  assert(AllocTarget->second == "crate_alloc");
-  auto AllocOffset = CrateDef->DispatchOpOffsets.find("alloc");
+  assert(AllocTarget->second.Base == "crate_alloc" &&
+         AllocTarget->second.AppendArgs);
+  auto ObserveTarget = CrateDef->DispatchTargets.find("observe");
+  assert(ObserveTarget != CrateDef->DispatchTargets.end());
+  assert(ObserveTarget->second.Base == "observe");
+  auto AllocOffset = CrateDef->DispatchOpOffsets.find("crate_alloc");
   assert(AllocOffset != CrateDef->DispatchOpOffsets.end());
   auto CrateHeader = MemoryBuffer::getFile(CrateDef->Header);
   assert(CrateHeader);
@@ -304,12 +318,15 @@ int main() {
              .starts_with("crate_alloc"));
   SmallVector<c_autotmpl::DispatchCase, 1> CrateCases{
       {"int", "Crate_int", {"int"}}};
-  SmallVector<StringRef, 2> CrateOps{"alloc", "free"};
+  SmallVector<StringRef, 3> CrateOps{"crate_alloc", "crate_free", "observe"};
   std::string CrateSection = c_autotmpl::makeDispatchSection(
       *CrateDef, CrateCases, CrateOps, DispatchCfg);
-  assert(CrateSection.find("Crate_int: crate_alloc_int") != std::string::npos);
-  assert(CrateSection.find("Crate_int: crate_free_int") != std::string::npos);
-  auto PushOffset = DispatchDef->DispatchOpOffsets.find("push");
+  for (StringRef Needle : {
+           "Crate_int: crate_alloc_int", "Crate_int: crate_free_int",
+           "Crate_int: observe", "#define $crate_alloc(...)",
+           "#define $crate_free(...)", "#define $observe(...)"})
+    assert(CrateSection.find(Needle.str()) != std::string::npos);
+  auto PushOffset = DispatchDef->DispatchOpOffsets.find("Dispatch_int_push");
   assert(PushOffset != DispatchDef->DispatchOpOffsets.end());
   auto DispatchHeader = MemoryBuffer::getFile(DispatchDef->Header);
   assert(DispatchHeader);
@@ -318,7 +335,7 @@ int main() {
              .starts_with("Dispatch_int_push"));
   SmallVector<c_autotmpl::DispatchCase, 1> DispatchCases{
       {"int", "Dispatch_int"}};
-  SmallVector<StringRef, 1> DispatchOps{"push"};
+  SmallVector<StringRef, 1> DispatchOps{"Dispatch_int_push"};
   std::string DispatchSection = c_autotmpl::makeDispatchSection(
       *DispatchDef, DispatchCases, DispatchOps, DispatchCfg);
   for (StringRef Needle : {
@@ -326,7 +343,7 @@ int main() {
            "#ifdef C_AUTOTMPL_Dispatch_int",
            "_Generic((p1), Dispatch_int: Dispatch_int_push",
            "Dispatch_int*: Dispatch_int_push",
-           "#define $Dispatch_push(...)",
+           "#define $Dispatch_int_push(...)",
            "/* c-autotmpl dispatch end Dispatch */"})
     assert(DispatchSection.find(Needle.str()) != std::string::npos);
 
@@ -334,9 +351,9 @@ int main() {
   DispatchCfg.Affix = "_method";
   std::string PostfixSection = c_autotmpl::makeDispatchSection(
       *DispatchDef, DispatchCases, DispatchOps, DispatchCfg);
-  assert(PostfixSection.find("#define Dispatch_push_method(...)") !=
+  assert(PostfixSection.find("#define Dispatch_int_push_method(...)") !=
          std::string::npos);
-  assert(PostfixSection.find("#define $Dispatch_push(...)") ==
+  assert(PostfixSection.find("#define $Dispatch_int_push(...)") ==
          std::string::npos);
   DispatchCfg.Style = c_autotmpl::DispatchStyle::Prefix;
   DispatchCfg.Affix = "$";
@@ -360,7 +377,7 @@ int main() {
                                       DispatchError));
   auto DispatchBuffer = MemoryBuffer::getFile(DispatchPath);
   assert(DispatchBuffer &&
-         (*DispatchBuffer)->getBuffer().contains("$Dispatch_push"));
+         (*DispatchBuffer)->getBuffer().contains("$Dispatch_int_push"));
 
   c_autotmpl::Instantiator Instantiator;
   std::string GenPath, Error;
