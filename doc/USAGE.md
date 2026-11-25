@@ -434,12 +434,17 @@ static inline int VEC_FN(i_type, _at)(int i, i_type v) {
 
 int main(void) {
   vec(int) nums = {0};
-  vec_push$(&nums, 7); /* pointer, first argument */
-  return vec_at$(2, nums) == 7 ? 0 : 1; /* value, second argument */
+  vec(float) floats = {0};
+  vec_push$(&nums, 7); /* selects vec_int_push */
+  vec_push$(&floats, 2.5f); /* same macro, selects vec_float_push */
+  if (vec_at$(2, nums) != 7) /* value, second argument */
+    return 1;
+  return vec_at$(2, floats) == 2.5f ? 0 : 1;
 }
 ```
 
-Cases come only from tracked instantiations. Each case is guarded by its
+The same dispatch macro works for every tracked instantiation of the generic
+type. Cases come only from tracked instantiations. Each case is guarded by its
 presence macro, so the header never names a type whose instantiation header was
 not included. The generated macro checks up to eight call arguments and forwards
 them unchanged.

@@ -146,14 +146,19 @@ two-argument templates such as `pair(Key, Value)`.
 #include "gen/pair.h"
 
 vec(int) xs = {0};
+vec(float) ys = {0};
 pair(int, float) entry = {1, 2.5f};
 
-vec_push$(&xs, 7);      /* pointer, first argument */
+vec_push$(&xs, 7);      /* selects vec_int_push */
+vec_push$(&ys, 2.5f);   /* same macro, selects vec_float_push */
 vec_at$(2, xs);         /* value, second argument */
+vec_at$(2, ys);         /* same macro, selects vec_float_at */
 pair_sum$(3, entry);    /* two-argument template */
 ```
 
-Dispatch cases come only from instantiations that exist in the generated header.
+The same dispatch macro selects the operation for each tracked instantiation of
+a generic type. Dispatch cases come only from instantiations that exist in the
+generated header.
 Each case is guarded by its instantiation's presence macro, so a header never
 names a type that was not generated. The public macro is variadic and forwards
 arguments unchanged.
