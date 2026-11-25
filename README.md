@@ -44,7 +44,7 @@ explicitly.
 | Feature | Description |
 | --- | --- |
 | **Single-file CLI** | One ISO C99 source. No LLVM, libclang, clang headers, C++ runtime, or compile database. |
-| **Editor integration** | clangd feature module generates from unsaved buffers and prunes stale blocks. |
+| **Editor integration** | clangd feature module generates from unsaved buffers, prunes stale blocks, routes dispatch go to definition to template declarations, and keeps `$` literal in completions. |
 | **Project config file** | `autotmpl.conf` gives the CLI and clangd the same `key=value` settings. |
 | **Nested generics** | `List(Box(int))` and deeper chains, flattened into one header. |
 | **Function templates** | `convert(int, float)(x)` from explicit call-site arguments. |
@@ -77,6 +77,11 @@ clangd --load=/absolute/path/to/build/libc-autotmpl.so
 For most editors, adding that `--load` flag is the only setup. The plugin is C++17
 built against clangd internals, so rebuild it when clangd changes. See
 [doc/BUILD.md](doc/BUILD.md).
+
+For dispatch calls, go to definition opens the operation declaration in the
+template header rather than the generated `#define`. Completion also escapes the
+configured affix in snippet text, so clients keep a `$` prefix literal instead
+of parsing it as a snippet variable and removing it.
 
 Both paths write the same public headers, grouped implementation sources, and
 makefile fragment for split templates. The plugin adds editor features and
@@ -155,7 +160,10 @@ a header never names a type that was not generated. The public macro is variadic
 and forwards arguments unchanged.
 
 With the clangd plugin, go to definition on a dispatch macro opens the matching
-operation in its template header.
+function declaration in its template header, not the generated `#define`. The
+plugin also escapes the configured affix in snippet completions, so a `$` prefix
+is inserted literally instead of being interpreted as a snippet variable and
+removed by the editor.
 
 The default backend uses C11 `_Generic`. In `autotmpl.conf`, set
 `dispatch_backend=builtin` for GCC and Clang builtins, which work in C99.

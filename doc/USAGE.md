@@ -348,8 +348,11 @@ cc -I. -std=c11 -Wall -Wextra -Werror src/main.c -o demo
 ```
 
 With the clangd plugin, go to definition on a dispatch macro opens the operation
-in the template header instead of the generated `#define`. No annotation is
-needed in source files.
+declaration in the template header instead of the generated `#define`. No
+annotation is needed in source files. When snippet completions are enabled, the
+plugin escapes the configured affix in completion text, so clients insert a `$`
+prefix literally instead of parsing it as snippet-variable syntax and dropping
+it.
 
 The default backend is `_Generic` and needs C11. Set
 `dispatch_backend=builtin` for the GCC/Clang builtin form, which also works in
@@ -545,6 +548,11 @@ answer.
 The plugin reads the same `autotmpl.conf` file as the CLI. Restart clangd after
 changing configuration. A compile database is not needed for generation, but
 clangd still needs correct include paths and defines to parse the project.
+
+For dispatch calls, the plugin also routes `textDocument/definition` to the
+template function declaration rather than the generated macro. It wraps
+`textDocument/completion` responses to escape the configured affix in snippet
+text, which keeps a `$` prefix intact in editors that parse completion snippets.
 
 ---
 
