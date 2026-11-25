@@ -1377,6 +1377,41 @@ static DispatchNavTarget dispatchTargetAt(StringRef Text, size_t Offset,
   return Result;
 }
 
+static std::string escapedSnippetAffix(StringRef Affix) {
+  std::string Out;
+  for (char C : Affix) {
+    if (C == '$')
+      Out.push_back('\\');
+    Out.push_back(C);
+  }
+  return Out;
+}
+
+/// clangd emits snippet completions with the raw macro name. Clients treat a
+/// leading `$` as snippet-variable syntax and drop it when accepting the item.
+/// Escape only the configured affix so clangd's `${1:...}` placeholders keep
+/// working.
+static std::string escapeDispatchAffixInSnippet(StringRef Text,
+                                                const DispatchConfig &Config) {
+  StringRef Affix(Config.Affix);
+  if (Affix.empty() || Affix.find('$') == StringRef::npos)
+    return Text.str();
+  std::string Escaped = escapedSnippetAffix(Affix);
+  if (Config.Style == DispatchStyle::Prefix) {
+    if (!Text.starts_with(Affix))
+      return Text.str();
+    return Escaped + Text.drop_front(Affix.size()).str();
+  }
+  size_t NameEnd = Text.find('(');
+  if (NameEnd == StringRef::npos)
+    NameEnd = Text.size();
+  StringRef Name = Text.take_front(NameEnd);
+  if (!Name.ends_with(Affix))
+    return Text.str();
+  return Name.drop_back(Affix.size()).str() + Escaped +
+         Text.substr(NameEnd).str();
+}
+
 class Listener final : public FeatureModule::ASTListener {
 public:
   explicit Listener(std::shared_ptr<SharedState> State)
@@ -1510,6 +1545,7 @@ public:
     wrapNotification(Bind, "textDocument/didClose",
                      &AutotmplModule::onDidClose);
     wrapMethod(Bind, "textDocument/definition");
+    wrapMethod(Bind, "textDocument/completion");
   }
 
 private:
@@ -1523,10 +1559,21 @@ private:
       return;
     Method Original = std::move(It->second);
     Bind.Raw.MethodHandlers[MethodName] =
-        [this, Original = std::move(Original)](
+        [this, MethodName, Original = std::move(Original)](
             llvm::json::Value Raw, Callback<llvm::json::Value> Reply) mutable {
-          if (goToTemplateFunction(Raw, std::move(Reply)))
+          if (MethodName == "textDocument/definition" &&
+              goToTemplateFunction(Raw, Reply))
             return;
+          if (MethodName == "textDocument/completion" && Original) {
+            Original(std::move(Raw),
+                     [this, Reply = std::move(Reply)](
+                         llvm::Expected<llvm::json::Value> Result) mutable {
+                       if (Result)
+                         patchCompletionSnippets(*Result);
+                       Reply(std::move(Result));
+                     });
+            return;
+          }
           if (Original)
             Original(std::move(Raw), std::move(Reply));
           else
@@ -1537,7 +1584,7 @@ private:
   /// Native clangd go-to-def lands on the generated `#define`. For a c-autotmpl
   /// dispatch call we answer with the template header operation instead.
   bool goToTemplateFunction(llvm::json::Value &Raw,
-                            Callback<llvm::json::Value> Reply) {
+                            Callback<llvm::json::Value> &Reply) {
     TextDocumentPositionParams Params;
     llvm::json::Path::Root Root;
     if (!fromJSON(Raw, Params, Root))
@@ -1592,6 +1639,48 @@ private:
     Result.push_back(toJSON(Loc));
     Reply(std::move(Result));
     return true;
+  }
+
+  /// Keep dispatch affixes literal inside snippet completions. clangd's raw
+  /// `$name` is consumed as a snippet variable by common LSP clients, which
+  /// removes the `$` when the completion is accepted.
+  void patchCompletionSnippets(llvm::json::Value &Result) {
+    if (!State->Dispatch.Enabled)
+      return;
+    StringRef Affix(State->Dispatch.Affix);
+    if (Affix.empty() || Affix.find('$') == StringRef::npos)
+      return;
+
+    llvm::json::Array *Items = nullptr;
+    if (auto *Object = Result.getAsObject())
+      Items = Object->getArray("items");
+    else
+      Items = Result.getAsArray();
+    if (!Items)
+      return;
+
+    for (llvm::json::Value &Entry : *Items) {
+      auto *Item = Entry.getAsObject();
+      if (!Item)
+        continue;
+      auto Format = Item->getInteger("insertTextFormat");
+      if (!Format || *Format != 2)
+        continue;
+      if (auto Insert = Item->getString("insertText")) {
+        std::string Fixed =
+            escapeDispatchAffixInSnippet(*Insert, State->Dispatch);
+        if (Fixed != *Insert)
+          (*Item)["insertText"] = std::move(Fixed);
+      }
+      if (auto *Edit = Item->getObject("textEdit")) {
+        if (auto NewText = Edit->getString("newText")) {
+          std::string Fixed =
+              escapeDispatchAffixInSnippet(*NewText, State->Dispatch);
+          if (Fixed != *NewText)
+            (*Edit)["newText"] = std::move(Fixed);
+        }
+      }
+    }
   }
 
   void wrapNotification(LSPBinder &Bind, llvm::StringLiteral Method,

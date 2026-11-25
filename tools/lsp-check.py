@@ -215,6 +215,7 @@ int main(void) {
   $vec_int_set(7, v);
   Box(int) *b = box_alloc(int)();
   $box_free(b);
+  $bo
   return v.value == 7 && b->value == 0 ? 0 : 1;
 }
 """
@@ -245,7 +246,15 @@ dispatch=1
                     "params": {
                         "processId": None,
                         "rootUri": "file://" + root,
-                        "capabilities": {},
+                        "capabilities": {
+                            "textDocument": {
+                                "completion": {
+                                    "completionItem": {
+                                        "snippetSupport": True,
+                                    },
+                                },
+                            },
+                        },
                     },
                 })
                 send(proc, {"jsonrpc": "2.0", "method": "initialized",
@@ -343,6 +352,37 @@ dispatch=1
                     print("dispatch pointed at the wrong declaration",
                           file=sys.stderr)
                     print(response, file=sys.stderr)
+                    return 1
+
+                send(proc, {
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "textDocument/completion",
+                    "params": {
+                        "textDocument": {"uri": uri},
+                        "position": {"line": 9, "character": 2},
+                    },
+                })
+                response = receive_response(proc, 5)
+                result = response.get("result") if response else None
+                items = result.get("items", []) if isinstance(result, dict) \
+                    else (result or [])
+                dispatch_items = [item for item in items
+                                  if item.get("filterText") == "$box_free"]
+                if len(dispatch_items) != 1:
+                    print("plugin did not offer dispatch completion",
+                          file=sys.stderr)
+                    print(response, file=sys.stderr)
+                    return 1
+                item = dispatch_items[0]
+                snippet = item.get("insertText", "")
+                edit_text = item.get("textEdit", {}).get("newText", "")
+                if (item.get("insertTextFormat") != 2 or
+                        not snippet.startswith("\\$box_free(") or
+                        edit_text != snippet):
+                    print("dispatch completion did not escape the '$' prefix",
+                          file=sys.stderr)
+                    print(item, file=sys.stderr)
                     return 1
 
                 send(proc, {
