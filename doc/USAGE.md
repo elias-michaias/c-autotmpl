@@ -278,6 +278,69 @@ Include only `gen/user.h`, as with any nested chain. This is lexical application
 not kind checking: a wrong argument count fails at compile time, and partial
 application needs an explicit wrapper template.
 
+## Generated dispatch macros
+
+Set `C_AUTOTMPL_DISPATCH=1` to emit method-like macros such as `Vec_push$`. An
+operation is eligible when a type-template header declares a function whose
+declaration mentions that template's type spelling. The spelling can be the
+template call form such as `Vec(T)`, a generated parameter macro such as `T`, or
+a decorator parameter such as `Key`. Pointer-ness and argument position do not
+matter. Helper functions that never mention the template type are ignored.
+
+The rule covers direct declarations and paste-macro declarations, including
+two-argument templates such as `pair(Key, Value)`:
+
+```c
+/* tmpl/vec.h */
+// -- template Vec(T)
+#define VEC_CAT_I(a, b) a##b
+#define VEC_CAT(a, b) VEC_CAT_I(a, b)
+#define Vec(T) VEC_CAT(Vec_, T)
+#define VEC_FN_II(a, b) a##b
+#define VEC_FN_I(a, b) VEC_FN_II(a, b)
+#define VEC_FN(a, b) VEC_FN_I(a, b)
+typedef struct { T data[8]; int len; } Vec(T);
+static inline void VEC_FN(Vec(T), _push)(Vec(T) *v, T x) {
+  v->data[v->len++] = x;
+}
+static inline T VEC_FN(Vec(T), _at)(int i, Vec(T) v) {
+  return v.data[i];
+}
+```
+
+```c
+/* src/main.c */
+#include "gen/vec.h"
+
+int main(void) {
+  Vec(int) nums = {0};
+  Vec(float) floats = {0};
+  Vec_push$(&nums, 7); /* selects Vec_int_push */
+  Vec_push$(&floats, 2.5f); /* same macro, selects Vec_float_push */
+  if (Vec_at$(0, nums) != 7) /* value, second argument */
+    return 1;
+  return Vec_at$(0, floats) == 2.5f ? 0 : 1;
+}
+```
+
+The same dispatch macro works for every tracked instantiation of the generic
+type. Cases come only from tracked instantiations. Each case is guarded by its
+presence macro, so the header never names a type whose instantiation header was
+not included. The generated macro checks up to eight call arguments and forwards
+them unchanged.
+
+```sh
+C_AUTOTMPL_DISPATCH=1 autotmpl --root . src
+cc -I. -std=c11 -Wall -Wextra -Werror src/main.c -o demo
+```
+
+The default backend is `_Generic` and needs C11. Set
+`C_AUTOTMPL_DISPATCH_BACKEND=builtin` for the GCC/Clang builtin form, which also
+works in C99. The default suffix `$` is accepted by GCC and Clang; set
+`C_AUTOTMPL_DISPATCH_SUFFIX=_method` if you prefer an identifier suffix. Without
+`C_AUTOTMPL_DISPATCH_TEMPLATES`, every eligible type template gets dispatch
+macros. The plugin rereads its environment only on clangd restart.
+
 ## STC quick start
 
 c-autotmpl has first-class support for [STC](https://github.com/stclib/STC)
@@ -401,66 +464,43 @@ those values map to `i_type` and `i_traits`. `--profile stc-shared` maps
 `TMPL_HEADER` to `i_header` in public blocks and `i_implement` in grouped
 implementation sources.
 
-## Generated dispatch macros
+### Dispatch with STC
 
-Set `C_AUTOTMPL_DISPATCH=1` to emit method-like macros such as `vec_push$`. An
-operation is eligible when a type-template header declares a function whose
-declaration mentions that template's type spelling. The spelling can be the
-template call form such as `vec(int)`, a generated argument macro such as
-`i_type`, or a decorator parameter such as `Key`. Pointer-ness and argument
-position do not matter. Helper functions that never mention the template type
-are ignored.
-
-The rule covers direct declarations and paste-macro declarations, including
-two-argument templates such as `pair(Key, Value)`:
-
-```c
-/* tmpl/vec.h */
-// -- template vec(T)
-#define vec(T) vec_##T
-#define VEC_FN_II(A, B) A##B
-#define VEC_FN(A, B) VEC_FN_II(A, B)
-typedef struct { i_key value; } i_type;
-static inline void vec_int_push(i_type *v, int x) { v->value = x; }
-static inline int VEC_FN(i_type, _at)(int i, i_type v) {
-  (void)i;
-  return v.value;
-}
-```
+Dispatch is independent of the STC profile. Set `C_AUTOTMPL_DISPATCH=1` with
+`C_AUTOTMPL_STC_AUTO=1` or `C_AUTOTMPL_STC_TEMPLATES=vec`. The same thin wrapper
+supports explicit adapter calls and method-style dispatch:
 
 ```c
 /* src/main.c */
 #include "gen/vec.h"
 
+#include <stdio.h>
+
 int main(void) {
   vec(int) nums = {0};
   vec(float) floats = {0};
-  vec_push$(&nums, 7); /* selects vec_int_push */
+
+  vec_push(int)(&nums, 7); /* keeps the adapter in gen/ */
+  vec_push$(&nums, 9); /* selects vec_int_push */
   vec_push$(&floats, 2.5f); /* same macro, selects vec_float_push */
-  if (vec_at$(2, nums) != 7) /* value, second argument */
-    return 1;
-  return vec_at$(2, floats) == 2.5f ? 0 : 1;
+
+  printf("%d %d %.1f\n", *vec_at(int)(&nums, 0), *vec_at$(&nums, 1),
+         *vec_at$(&floats, 0));
+  vec_drop(int)(&nums);
+  vec_drop(float)(&floats);
+  return 0;
 }
 ```
 
-The same dispatch macro works for every tracked instantiation of the generic
-type. Cases come only from tracked instantiations. Each case is guarded by its
-presence macro, so the header never names a type whose instantiation header was
-not included. The generated macro checks up to eight call arguments and forwards
-them unchanged.
-
 ```sh
-C_AUTOTMPL_PROFILE=stc C_AUTOTMPL_STC_TEMPLATES=vec C_AUTOTMPL_DISPATCH=1 \
-  autotmpl --root . src
-cc -I. -std=c11 -Wall -Wextra -Werror src/main.c -o demo
+C_AUTOTMPL_STC_AUTO=1 C_AUTOTMPL_DISPATCH=1 autotmpl --root . src
 ```
 
-The default backend is `_Generic` and needs C11. Set
-`C_AUTOTMPL_DISPATCH_BACKEND=builtin` for the GCC/Clang builtin form, which also
-works in C99. The default suffix `$` is accepted by GCC and Clang; set
-`C_AUTOTMPL_DISPATCH_SUFFIX=_method` if you prefer an identifier suffix. Without
-`C_AUTOTMPL_DISPATCH_TEMPLATES`, every eligible type template gets dispatch
-macros. The plugin rereads its environment only on clangd restart.
+One explicit call per operation is still enough to keep the adapter macro in
+`gen/`. Dispatch cases are guarded by presence macros such as
+`C_AUTOTMPL_vec_int`, so a header never names a specialization that was not
+included. The same rule covers two-argument wrappers, so `hashmap_insert$`
+dispatches from a tracked `hashmap(int, int)` case.
 
 ## Generated files
 
