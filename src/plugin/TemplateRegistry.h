@@ -8,6 +8,7 @@
 #include "llvm/ADT/StringSet.h"
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -25,13 +26,20 @@ enum class TemplatePreset { None, StcStatic, StcShared };
 
 enum class DispatchBackend { Generic, Builtin };
 
-/// Env-only configuration for generated method-dispatch macros.
+/// Configuration for generated method-dispatch macros. Values come from
+/// autotmpl.conf, then C_AUTOTMPL_* environment variables.
 struct DispatchConfig {
   bool Enabled = false;
   DispatchBackend Backend = DispatchBackend::Generic;
   std::string Suffix = "$";
   llvm::SmallVector<std::string, 2> Templates;
 };
+
+/// Loads short key=value settings from autotmpl.conf at or above Root.
+void loadConfig(llvm::StringRef Root);
+
+/// Returns a config value first, then the matching C_AUTOTMPL_* env variable.
+std::optional<std::string> configValue(llvm::StringRef Key);
 
 DispatchConfig resolveDispatch();
 

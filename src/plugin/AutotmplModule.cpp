@@ -234,9 +234,9 @@ static void addNameList(StringRef Text, std::vector<std::string> &Out) {
   }
 }
 
-/// Configuration comes only from environment variables. Projects can source
-/// an autotmpl.env file before launching clangd or the CLI. An absent or
-/// unknown value leaves the original behavior unchanged.
+/// Configuration comes from autotmpl.conf at the workspace root, then from
+/// C_AUTOTMPL_* environment variables. An absent or unknown value leaves the
+/// original behavior unchanged.
 StcConfig resolvePreset() {
   StcConfig Result;
   auto TryName = [&](StringRef Name, TemplatePreset &ParsedOut) {
@@ -251,18 +251,18 @@ StcConfig resolvePreset() {
 
   bool ProfileChosen = false;
   TemplatePreset ParsedProfile = TemplatePreset::None;
-  if (auto Env = sys::Process::GetEnv("C_AUTOTMPL_PROFILE")) {
-    if (TryName(*Env, ParsedProfile)) {
+  if (auto Value = configValue("profile")) {
+    if (TryName(*Value, ParsedProfile)) {
       Result.Preset = ParsedProfile;
       ProfileChosen = true;
     }
   }
 
-  if (auto Env = sys::Process::GetEnv("C_AUTOTMPL_STC_TEMPLATES"))
-    addNameList(*Env, Result.Templates);
+  if (auto Value = configValue("stc_templates"))
+    addNameList(*Value, Result.Templates);
 
-  if (auto Env = sys::Process::GetEnv("C_AUTOTMPL_STC_AUTO")) {
-    if (!parseBoolName(*Env, Result.Auto))
+  if (auto Value = configValue("stc_auto")) {
+    if (!parseBoolName(*Value, Result.Auto))
       Result.Auto = false;
   }
 
@@ -440,6 +440,7 @@ struct SharedState {
     auto Start = std::chrono::steady_clock::now();
 
     Root = findRoot(MainFile).str();
+    loadConfig(Root);
     StcConfig Config = resolvePreset();
     ProfileName = Config.Name;
     Registry.scanPreferTemplateDirs(Root);

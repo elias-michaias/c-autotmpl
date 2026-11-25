@@ -47,37 +47,38 @@ and it does not remove unused blocks.
 
 ## Configuration
 
-Profiles are opt-in. An explicit CLI profile wins over `C_AUTOTMPL_PROFILE`.
-Without either, output is unchanged. Configuration can live in an
-`autotmpl.env` file that a Makefile sources and exports:
-
-```make
--include autotmpl.env
-export C_AUTOTMPL_PROFILE C_AUTOTMPL_STC_TEMPLATES C_AUTOTMPL_STC_AUTO
-export C_AUTOTMPL_DISPATCH C_AUTOTMPL_DISPATCH_BACKEND
-export C_AUTOTMPL_DISPATCH_SUFFIX C_AUTOTMPL_DISPATCH_TEMPLATES
-```
+Profiles and dispatch are opt-in. Put project settings in `autotmpl.conf` at the
+workspace root:
 
 ```text
-# autotmpl.env
-C_AUTOTMPL_STC_AUTO=1
+# autotmpl.conf
+profile=stc
+stc_auto=1
+dispatch=1
+dispatch_templates=vec,pair
 ```
 
-| Variable | Effect |
-| --- | --- |
-| `C_AUTOTMPL_ROOT` | Force the clangd plugin workspace root. |
-| `C_AUTOTMPL_PROFILE` | Select an opt-in profile, such as `stc`. |
-| `C_AUTOTMPL_STC_TEMPLATES` | Comma-separated STC template names, such as `vec,hashmap`. |
-| `C_AUTOTMPL_STC_AUTO=1` | Detect STC wrappers from template-header contents. |
-| `C_AUTOTMPL_DISPATCH=1` | Generate method-like dispatch macros. |
-| `C_AUTOTMPL_DISPATCH_BACKEND` | Select `generic` (`_Generic`, default) or `builtin` (GCC/Clang builtins). |
-| `C_AUTOTMPL_DISPATCH_SUFFIX` | Set the macro suffix, default `$`. |
-| `C_AUTOTMPL_DISPATCH_TEMPLATES` | Comma-separated templates that get dispatch, such as `vec,list`. |
-| `C_AUTOTMPL_TIMING=1` | Log plugin phase timings. |
+The CLI and clangd plugin both read this file. No Makefile export or `lsp.sh`
+wrapper is needed. CLI flags take precedence over `autotmpl.conf`, the file takes
+precedence over environment variables, and environment variables take precedence
+over defaults. Restart clangd after changing configuration.
 
-CLI flags take precedence over environment variables. `--profile none` wins over
-every STC opt-in. STC auto-detection and explicit template lists are explained in
-the [STC quick start](#stc-quick-start).
+| Setting | Config key | Environment variable | Effect |
+| --- | --- | --- | --- |
+| Profile | `profile` | `C_AUTOTMPL_PROFILE` | Select an opt-in profile, such as `stc`. |
+| STC templates | `stc_templates` | `C_AUTOTMPL_STC_TEMPLATES` | Comma-separated names, such as `vec,hashmap`. |
+| STC auto | `stc_auto` | `C_AUTOTMPL_STC_AUTO` | Detect STC wrappers from template-header contents. |
+| Dispatch | `dispatch` | `C_AUTOTMPL_DISPATCH` | Generate method-like dispatch macros. |
+| Dispatch backend | `dispatch_backend` | `C_AUTOTMPL_DISPATCH_BACKEND` | Select `generic` (`_Generic`, default) or `builtin` (GCC/Clang builtins). |
+| Dispatch suffix | `dispatch_suffix` | `C_AUTOTMPL_DISPATCH_SUFFIX` | Set the macro suffix, default `$`. |
+| Dispatch templates | `dispatch_templates` | `C_AUTOTMPL_DISPATCH_TEMPLATES` | Comma-separated templates that get dispatch, such as `vec,list`. |
+| Plugin root | n/a | `C_AUTOTMPL_ROOT` | Force the clangd plugin workspace root. |
+| Plugin timing | n/a | `C_AUTOTMPL_TIMING` | Log plugin phase timings. |
+
+`--profile none` wins over every STC opt-in. The config file accepts comments
+starting with `#`, optional spaces around `=`, and quoted values. STC
+auto-detection and explicit template lists are explained in the
+[STC quick start](#stc-quick-start).
 
 ## What the pattern does
 
@@ -280,12 +281,13 @@ application needs an explicit wrapper template.
 
 ## Generated dispatch macros
 
-Set `C_AUTOTMPL_DISPATCH=1` to emit method-like macros such as `Vec_push$`. An
-operation is eligible when a type-template header declares a function whose
-declaration mentions that template's type spelling. The spelling can be the
-template call form such as `Vec(T)`, a generated parameter macro such as `T`, or
-a decorator parameter such as `Key`. Pointer-ness and argument position do not
-matter. Helper functions that never mention the template type are ignored.
+Set `dispatch=1` in `autotmpl.conf` to emit method-like macros such as
+`Vec_push$`. An operation is eligible when a type-template header declares a
+function whose declaration mentions that template's type spelling. The spelling
+can be the template call form such as `Vec(T)`, a generated parameter macro such
+as `T`, or a decorator parameter such as `Key`. Pointer-ness and argument
+position do not matter. Helper functions that never mention the template type are
+ignored.
 
 The rule covers direct declarations and paste-macro declarations, including
 two-argument templates such as `pair(Key, Value)`:
@@ -330,16 +332,16 @@ not included. The generated macro checks up to eight call arguments and forwards
 them unchanged.
 
 ```sh
-C_AUTOTMPL_DISPATCH=1 autotmpl --root . src
+autotmpl --root . src
 cc -I. -std=c11 -Wall -Wextra -Werror src/main.c -o demo
 ```
 
 The default backend is `_Generic` and needs C11. Set
-`C_AUTOTMPL_DISPATCH_BACKEND=builtin` for the GCC/Clang builtin form, which also
-works in C99. The default suffix `$` is accepted by GCC and Clang; set
-`C_AUTOTMPL_DISPATCH_SUFFIX=_method` if you prefer an identifier suffix. Without
-`C_AUTOTMPL_DISPATCH_TEMPLATES`, every eligible type template gets dispatch
-macros. The plugin rereads its environment only on clangd restart.
+`dispatch_backend=builtin` for the GCC/Clang builtin form, which also works in
+C99. The default suffix `$` is accepted by GCC and Clang; set
+`dispatch_suffix=_method` if you prefer an identifier suffix. Without
+`dispatch_templates`, every eligible type template gets dispatch macros. The
+plugin rereads `autotmpl.conf` only on clangd restart.
 
 ## STC quick start
 
@@ -351,8 +353,8 @@ the include path.
 
 ### Auto-detection first
 
-Set `C_AUTOTMPL_STC_AUTO=1` or pass `--stc-auto`. A wrapper that includes an STC
-header is detected in `tmpl/` or `templates/`; no name list is needed.
+Set `stc_auto=1` in `autotmpl.conf` or pass `--stc-auto`. A wrapper that includes
+an STC header is detected in `tmpl/` or `templates/`; no name list is needed.
 
 ```c
 /* tmpl/vec.h */
@@ -364,8 +366,8 @@ header is detected in `tmpl/` or `templates/`; no name list is needed.
 ```
 
 ```text
-# autotmpl.env
-C_AUTOTMPL_STC_AUTO=1
+# autotmpl.conf
+stc_auto=1
 ```
 
 ```c
@@ -386,11 +388,10 @@ int main(void) {
 }
 ```
 
-With that file sourced and exported by a Makefile, generation is
-`autotmpl --root . src`. The direct shell equivalent is:
+Generation and compilation are:
 
 ```sh
-C_AUTOTMPL_STC_AUTO=1 autotmpl --root . src
+autotmpl --root . src
 cc -I. -Ithird_party/stc/include -std=c11 -Wall -Wextra -Werror \
   src/main.c -o demo
 ./demo
@@ -435,11 +436,11 @@ changing c-autotmpl.
 
 ### Explicit template list second
 
-If you prefer naming wrappers, set `C_AUTOTMPL_STC_TEMPLATES=vec` or pass
+If you prefer naming wrappers, set `stc_templates=vec` in `autotmpl.conf` or pass
 `--stc-template vec`. The same wrapper and source compile with:
 
 ```sh
-C_AUTOTMPL_STC_TEMPLATES=vec autotmpl --root . src
+autotmpl --root . src
 ```
 
 An explicit list opts in unprefixed names even when the wrapper has no STC
@@ -466,9 +467,9 @@ implementation sources.
 
 ### Dispatch with STC
 
-Dispatch is independent of the STC profile. Set `C_AUTOTMPL_DISPATCH=1` with
-`C_AUTOTMPL_STC_AUTO=1` or `C_AUTOTMPL_STC_TEMPLATES=vec`. The same thin wrapper
-supports explicit adapter calls and method-style dispatch:
+Dispatch is independent of the STC profile. Set `dispatch=1` with
+`stc_auto=1` or `stc_templates=vec`. The same thin wrapper supports explicit
+adapter calls and method-style dispatch:
 
 ```c
 /* src/main.c */
@@ -493,7 +494,7 @@ int main(void) {
 ```
 
 ```sh
-C_AUTOTMPL_STC_AUTO=1 C_AUTOTMPL_DISPATCH=1 autotmpl --root . src
+autotmpl --root . src
 ```
 
 One explicit call per operation is still enough to keep the adapter macro in
@@ -525,10 +526,9 @@ file. It prunes unused blocks after its background workspace scan finishes and
 can find a type's declaring header through the AST when the text index has no
 answer.
 
-The plugin reads the same environment variables as the CLI. Start clangd from an
-environment that has `autotmpl.env` exported, and restart it after changing
-configuration. A compile database is not needed for generation, but clangd still
-needs correct include paths and defines to parse the project.
+The plugin reads the same `autotmpl.conf` file as the CLI. Restart clangd after
+changing configuration. A compile database is not needed for generation, but
+clangd still needs correct include paths and defines to parse the project.
 
 ---
 

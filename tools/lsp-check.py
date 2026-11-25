@@ -169,9 +169,15 @@ int main(void) {
 """
         generated = os.path.join(root, "gen", "vec.h")
         log_path = os.path.join(root, "clangd.log")
-        env = plugin_env(C_AUTOTMPL_PROFILE="stc",
-                         C_AUTOTMPL_STC_TEMPLATES="vec",
-                         C_AUTOTMPL_DISPATCH="1")
+        write(os.path.join(root, "autotmpl.conf"), """\
+# project settings
+profile=stc
+stc_templates=vec
+dispatch=1
+""")
+        env = plugin_env(C_AUTOTMPL_PROFILE="none",
+                         C_AUTOTMPL_STC_TEMPLATES="nope",
+                         C_AUTOTMPL_DISPATCH="0")
         with open(log_path, "wb") as log:
             proc = subprocess.Popen(
                 ["clangd", "--log=verbose", "--load=" + plugin],

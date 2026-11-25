@@ -618,23 +618,110 @@ bool looksLikeStcHeader(const TemplateDef &Template) {
   return Score >= 2;
 }
 
+namespace {
+
+StringMap<std::string> &configValues() {
+  static StringMap<std::string> Values;
+  return Values;
+}
+
+bool &configLoaded() {
+  static bool Loaded = false;
+  return Loaded;
+}
+
+std::string lowerKey(StringRef Key) {
+  std::string Out;
+  for (char C : Key)
+    Out.push_back(static_cast<char>(
+        std::tolower(static_cast<unsigned char>(C))));
+  return Out;
+}
+
+void addConfigLine(StringRef Line, StringMap<std::string> &Values) {
+  Line = Line.trim();
+  if (Line.empty() || Line[0] == '#')
+    return;
+  size_t Eq = Line.find('=');
+  if (Eq == StringRef::npos)
+    return;
+  StringRef Key = Line.substr(0, Eq).trim();
+  StringRef Value = Line.substr(Eq + 1).trim();
+  if (Value.size() >= 2 &&
+      ((Value[0] == '"' && Value[Value.size() - 1] == '"') ||
+       (Value[0] == '\'' && Value[Value.size() - 1] == '\'')))
+    Value = Value.substr(1, Value.size() - 2);
+  if (!Key.empty())
+    Values[lowerKey(Key)] = Value.str();
+}
+
+bool findConfigPath(StringRef Start, SmallString<256> &Out) {
+  SmallString<256> Dir(Start);
+  for (int I = 0; I < 12 && !Dir.empty(); ++I) {
+    SmallString<256> Candidate(Dir);
+    sys::path::append(Candidate, "autotmpl.conf");
+    if (sys::fs::exists(Candidate)) {
+      Out = Candidate;
+      return true;
+    }
+    SmallString<256> Parent(sys::path::parent_path(Dir));
+    if (Parent == Dir)
+      break;
+    Dir = Parent;
+  }
+  return false;
+}
+
+} // namespace
+
+void loadConfig(StringRef Root) {
+  if (configLoaded())
+    return;
+  configLoaded() = true;
+  SmallString<256> Path;
+  if (!findConfigPath(Root, Path))
+    return;
+  auto Buffer = MemoryBuffer::getFile(Path, /*IsText=*/true);
+  if (!Buffer)
+    return;
+  SmallVector<StringRef, 16> Lines;
+  (*Buffer)->getBuffer().split(Lines, '\n');
+  for (StringRef Line : Lines)
+    addConfigLine(Line, configValues());
+}
+
+std::optional<std::string> configValue(StringRef Key) {
+  std::string Normalized = lowerKey(Key);
+  auto It = configValues().find(Normalized);
+  if (It != configValues().end())
+    return It->second;
+
+  std::string EnvName = "C_AUTOTMPL_";
+  for (char C : Normalized)
+    EnvName.push_back(
+        static_cast<char>(std::toupper(static_cast<unsigned char>(C))));
+  if (auto Env = sys::Process::GetEnv(EnvName))
+    return std::string(*Env);
+  return std::nullopt;
+}
+
 DispatchConfig resolveDispatch() {
   DispatchConfig Config;
-  if (auto Env = sys::Process::GetEnv("C_AUTOTMPL_DISPATCH"))
-    parseDispatchBool(*Env, Config.Enabled);
-  if (auto Env = sys::Process::GetEnv("C_AUTOTMPL_DISPATCH_BACKEND")) {
-    if (StringRef(*Env).trim() == "builtin")
+  if (auto Value = configValue("dispatch"))
+    parseDispatchBool(*Value, Config.Enabled);
+  if (auto Value = configValue("dispatch_backend")) {
+    if (StringRef(*Value).trim() == "builtin")
       Config.Backend = DispatchBackend::Builtin;
   }
-  if (auto Env = sys::Process::GetEnv("C_AUTOTMPL_DISPATCH_SUFFIX")) {
-    StringRef Suffix = StringRef(*Env).trim();
+  if (auto Value = configValue("dispatch_suffix")) {
+    StringRef Suffix = StringRef(*Value).trim();
     if (!Suffix.empty() && Suffix.find_first_of(" \t\r\n,()#") ==
                                StringRef::npos)
       Config.Suffix = Suffix.str();
   }
-  if (auto Env = sys::Process::GetEnv("C_AUTOTMPL_DISPATCH_TEMPLATES")) {
+  if (auto Value = configValue("dispatch_templates")) {
     SmallVector<StringRef, 4> Names;
-    StringRef(*Env).split(Names, ',');
+    StringRef(*Value).split(Names, ',');
     for (StringRef Name : Names) {
       Name = Name.trim();
       if (!Name.empty())

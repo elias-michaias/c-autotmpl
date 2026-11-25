@@ -98,6 +98,15 @@ int main(void) {
         env = env_with()
         if mode == "env":
             env["C_AUTOTMPL_PROFILE"] = "stc"
+        elif mode == "conf":
+            write(os.path.join(root, "autotmpl.conf"),
+                  "# project settings\nprofile = stc\n")
+        elif mode == "conf-over-env":
+            write(os.path.join(root, "autotmpl.conf"), "profile=stc\n")
+            env["C_AUTOTMPL_PROFILE"] = "none"
+        elif mode == "flag-over-conf":
+            write(os.path.join(root, "autotmpl.conf"), "profile=none\n")
+            args += ["--profile", "stc"]
         elif mode == "profile":
             args += ["--profile", "stc"]
         else:
@@ -172,6 +181,54 @@ int main(void) {
             require(ran.returncode == 0, "STC profile output did not run")
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+
+def check_none_over_config(cli):
+    root = tempfile.mkdtemp(prefix="c-autotmpl-none-")
+    try:
+        os.makedirs(os.path.join(root, "tmpl"))
+        os.makedirs(os.path.join(root, "gen"))
+        write(os.path.join(root, "tmpl", "vec.h"), """\
+// -- template vec(T)
+#define VEC_CAT_I(A, B) A##B
+#define VEC_CAT(A, B) VEC_CAT_I(A, B)
+#define vec(T) VEC_CAT(vec_, T)
+typedef struct { T value; } vec(T);
+""")
+        write(os.path.join(root, "autotmpl.conf"), """\
+profile=stc
+stc_templates=vec
+dispatch=1
+""")
+        write(os.path.join(root, "main.c"), """\
+#include "gen/vec.h"
+
+int main(void) {
+  vec(int) v = {0};
+  return v.value == 0 ? 0 : 1;
+}
+""")
+        env = env_with(C_AUTOTMPL_PROFILE="stc",
+                       C_AUTOTMPL_STC_TEMPLATES="vec",
+                       C_AUTOTMPL_DISPATCH="1")
+        args = [cli, "--root", root, "--verbose", "--profile", "none",
+                os.path.join(root, "main.c")]
+        proc = subprocess.run(args, cwd=root, capture_output=True, text=True,
+                              env=env)
+        output = proc.stdout + proc.stderr
+        require(proc.returncode == 0, "--profile none run exited with error",
+                output)
+        with open(os.path.join(root, "gen", "vec.h")) as f:
+            content = f.read()
+        require("#define T int" in content,
+                "plain template block was not generated", content)
+        require("#define i_type vec_int" not in content,
+                "--profile none did not override config STC opt-ins", content)
+        require("#define vec_push(...) " not in content,
+                "--profile none generated an STC adapter", content)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
 
 def check_unprefixed_stc(cli):
     root = tempfile.mkdtemp(prefix="c-autotmpl-unprefixed-")
@@ -407,9 +464,15 @@ int main(void) {
 """)
         generated = os.path.join(root, "gen", "vec.h")
         generated_pair = os.path.join(root, "gen", "pair.h")
-        env = env_with(C_AUTOTMPL_PROFILE="stc",
-                       C_AUTOTMPL_STC_TEMPLATES="vec",
-                       C_AUTOTMPL_DISPATCH="1")
+        write(os.path.join(root, "autotmpl.conf"), """\
+# project settings
+profile=stc
+stc_templates=vec
+dispatch=1
+""")
+        env = env_with(C_AUTOTMPL_PROFILE="none",
+                       C_AUTOTMPL_STC_TEMPLATES="nope",
+                       C_AUTOTMPL_DISPATCH="0")
         args = [cli, "--root", root, "--verbose", source]
         proc = subprocess.run(args, cwd=root, capture_output=True, text=True,
                               env=env)
@@ -552,6 +615,7 @@ int main(void) {
         os.remove(generated)
         if os.path.exists(generated_pair):
             os.remove(generated_pair)
+        os.remove(os.path.join(root, "autotmpl.conf"))
         write(source, """\
 #include "gen/vec.h"
 #include "gen/pair.h"
@@ -582,8 +646,10 @@ def main():
         print("executable not found: " + cli, file=sys.stderr)
         return 1
 
-    for mode in ("profile", "env", "stc"):
+    for mode in ("profile", "env", "stc", "conf", "conf-over-env",
+                 "flag-over-conf"):
         check_stc_profile(cli, mode)
+    check_none_over_config(cli)
     check_unprefixed_stc(cli)
     check_stc_auto(cli)
     check_dispatch(cli)

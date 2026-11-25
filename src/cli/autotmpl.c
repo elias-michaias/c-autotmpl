@@ -1525,6 +1525,118 @@ static DispatchBackend parse_dispatch_backend(const char *text) {
   return DISPATCH_GENERIC;
 }
 
+/* Project settings live in autotmpl.conf at the workspace root. The file is a
+ * plain key=value list with # comments and short names such as dispatch=1.
+ * Explicit CLI options still win; the file wins over the environment, and the
+ * environment wins over defaults. */
+static Map g_config;
+static char *g_config_path;
+static int g_config_loaded;
+
+static void config_init(void) {
+  g_config.items = NULL;
+  g_config.len = g_config.cap = 0;
+  g_config_path = NULL;
+  g_config_loaded = 0;
+}
+
+static void config_lower_key(char *key) {
+  for (; *key; ++key)
+    *key = (char)tolower((unsigned char)*key);
+}
+
+static char *config_find_path(const char *root) {
+  char *dir = path_absolute(root);
+  for (;;) {
+    char *candidate = path_join(dir, "autotmpl.conf");
+    if (path_is_file(candidate)) {
+      free(dir);
+      return candidate;
+    }
+    free(candidate);
+    char *parent = path_dirname(dir);
+    if (strcmp(parent, dir) == 0) {
+      free(parent);
+      break;
+    }
+    free(dir);
+    dir = parent;
+  }
+  free(dir);
+  return NULL;
+}
+
+static void config_parse(const char *text) {
+  const char *p = text;
+  while (*p) {
+    const char *end = strchr(p, '\n');
+    size_t n = end ? (size_t)(end - p) : strlen(p);
+    char *line = trim_copy_n(p, n);
+    if (line[0] && line[0] != '#') {
+      char *eq = strchr(line, '=');
+      if (eq) {
+        *eq = '\0';
+        char *key = trim_copy(line);
+        char *val = trim_copy(eq + 1);
+        size_t len = strlen(val);
+        if (len >= 2 &&
+            ((val[0] == '"' && val[len - 1] == '"') ||
+             (val[0] == '\'' && val[len - 1] == '\''))) {
+          char *unquoted = xstrdup_n(val + 1, len - 2);
+          free(val);
+          val = unquoted;
+        }
+        if (key[0]) {
+          config_lower_key(key);
+          map_set(&g_config, key, val);
+        }
+        free(key);
+        free(val);
+      }
+    }
+    free(line);
+    if (!end)
+      break;
+    p = end + 1;
+  }
+}
+
+static void config_load(const char *root) {
+  if (g_config_loaded)
+    return;
+  g_config_loaded = 1;
+  g_config_path = config_find_path(root);
+  if (!g_config_path)
+    return;
+  char *text = read_file(g_config_path, NULL);
+  if (text) {
+    config_parse(text);
+    free(text);
+  }
+}
+
+static const char *config_value(const char *key) {
+  char short_key[96];
+  size_t n = 0;
+  for (; key[n] && n + 1 < sizeof(short_key); ++n)
+    short_key[n] = (char)tolower((unsigned char)key[n]);
+  short_key[n] = '\0';
+
+  const char *value = map_get(&g_config, short_key);
+  if (value)
+    return value;
+
+  static const char prefix[] = "C_AUTOTMPL_";
+  char env_key[128];
+  n = 0;
+  for (const char *p = prefix; *p && n + 1 < sizeof(env_key); ++p)
+    env_key[n++] = *p;
+  for (size_t i = 0; short_key[i] && n + 1 < sizeof(env_key); ++i)
+    env_key[n++] = (char)toupper((unsigned char)short_key[i]);
+  env_key[n] = '\0';
+  return getenv(env_key);
+}
+
 static int valid_dispatch_suffix(const char *text) {
   if (!text || !text[0])
     return 0;
@@ -1537,14 +1649,14 @@ static int valid_dispatch_suffix(const char *text) {
 
 static DispatchConfig resolve_dispatch(void) {
   DispatchConfig cfg;
-  cfg.enabled = parse_bool_text(getenv("C_AUTOTMPL_DISPATCH")) == 1;
-  cfg.backend = parse_dispatch_backend(getenv("C_AUTOTMPL_DISPATCH_BACKEND"));
-  const char *suffix = getenv("C_AUTOTMPL_DISPATCH_SUFFIX");
+  cfg.enabled = parse_bool_text(config_value("dispatch")) == 1;
+  cfg.backend = parse_dispatch_backend(config_value("dispatch_backend"));
+  const char *suffix = config_value("dispatch_suffix");
   cfg.suffix = xstrdup(valid_dispatch_suffix(suffix) ? suffix : "$");
   cfg.names.items = NULL;
   cfg.names.len = cfg.names.cap = 0;
   cfg.has_names = 0;
-  const char *list = getenv("C_AUTOTMPL_DISPATCH_TEMPLATES");
+  const char *list = config_value("dispatch_templates");
   if (list && list[0]) {
     add_name_list(&cfg.names, list);
     cfg.has_names = cfg.names.len != 0;
@@ -1552,14 +1664,12 @@ static DispatchConfig resolve_dispatch(void) {
   return cfg;
 }
 
-/* Configuration comes only from explicit CLI options and environment
- * variables. Projects can source an autotmpl.env file from their Makefile to
- * set the variables for a run. */
+/* Explicit CLI options win over autotmpl.conf, then environment variables. */
 static PresetKind resolve_preset(const char *configured, const Set *cli_names,
                                  int has_cli_names, int cli_auto,
                                  char **name_out, Set *names_out,
                                  int *has_names_out, int *auto_out) {
-  const char *env = getenv("C_AUTOTMPL_PROFILE");
+  const char *env = config_value("profile");
   PresetKind preset = PRESET_NONE;
   char *name = NULL;
   int profile_chosen = 0;
@@ -1580,7 +1690,7 @@ static PresetKind resolve_preset(const char *configured, const Set *cli_names,
       for (size_t i = 0; i < cli_names->len; ++i)
         set_add(names, cli_names->items[i]);
     } else {
-      const char *list = getenv("C_AUTOTMPL_STC_TEMPLATES");
+      const char *list = config_value("stc_templates");
       if (list && list[0])
         add_name_list(names, list);
     }
@@ -1590,7 +1700,7 @@ static PresetKind resolve_preset(const char *configured, const Set *cli_names,
 
   int auto_detect = cli_auto;
   if (!auto_detect)
-    auto_detect = parse_bool_text(getenv("C_AUTOTMPL_STC_AUTO"));
+    auto_detect = parse_bool_text(config_value("stc_auto"));
   if (auto_detect < 0)
     auto_detect = 0;
   if (auto_out)
@@ -4165,6 +4275,7 @@ static ImplGroup *find_impl_group(Vec *groups, const TemplateDef *tmpl) {
 
 int main(int argc, char **argv) {
   Options opt;
+  config_init();
   int parsed = parse_args(argc, argv, &opt);
   if (parsed < 0)
     return argc > 1 &&
@@ -4206,6 +4317,9 @@ int main(int argc, char **argv) {
   }
 
   char *root = determine_root(&opt, &files);
+  config_load(root);
+  if (opt.verbose && g_config_path)
+    printf("config %s\n", g_config_path);
   PresetKind preset = PRESET_NONE;
   char *preset_name = NULL;
   Set preset_names;
