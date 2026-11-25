@@ -12,6 +12,7 @@
   <a href="#what-you-get">What you get</a> &bull;
   <a href="#use-it">Use it</a> &bull;
   <a href="#generic-calls">Generic calls</a> &bull;
+  <a href="#configuration">Configuration</a> &bull;
   <a href="doc/USAGE.md">Usage</a> &bull;
   <a href="doc/USAGE.md#stc-quick-start">STC guide</a>
 </p>
@@ -25,7 +26,7 @@
 c-autotmpl writes the generated headers behind C template-style code such as
 `List(int)` or `Box(Point)`. It runs as a single-file ISO C99 CLI for builds, or
 as a clangd plugin that keeps headers current while you type. Both read the same
-`autotmpl.conf`.
+[project configuration](#configuration).
 
 ## What you get
 
@@ -87,26 +88,12 @@ generic call opens the template function declaration, not the generated macro,
 and completion keeps a `$` prefix literal instead of treating it as snippet
 syntax.
 
-### Configuration
-
-Put opt-ins in `autotmpl.conf` at the project root:
-
-```text
-# autotmpl.conf
-profile=stc
-stc_auto=1
-dispatch=1
-dispatch_templates=vec,pair
-```
-
-The CLI and clangd read the same file. CLI flags win over the file, and the file
-wins over environment variables. The `dispatch_*` keys configure generic calls;
-the names stay stable for compatibility.
+Both paths use the same project options; see [Configuration](#configuration).
 
 ## Generic calls
 
-Set `dispatch=1` to give generated operations one method-like spelling for
-every instantiation:
+Enable generic calls in [Configuration](#configuration) to give generated
+operations one method-like spelling for every instantiation:
 
 ```c
 vec(int) xs = {0};
@@ -128,14 +115,12 @@ plus the configured affix, so `box_alloc(T)` becomes `$box_alloc` and selects
 
 Each case is guarded by the presence macro of an instantiation that actually
 exists in the generated header, and the public macro forwards arguments
-unchanged. The default backend uses C11 `_Generic`; `dispatch_backend=builtin`
-uses GCC/Clang builtins for C99. Defaults are `dispatch_style=prefix` and
-`dispatch_affix=$`. `dispatch_style=postfix` with `dispatch_affix=_method`
-produces `vec_push_method`, and `dispatch_templates=vec,pair` limits generation
-to named templates.
+unchanged. Selection uses C11 `_Generic` by default, with a GCC/Clang builtin
+option for C99. The affix can lead (`$vec_push`) or trail (`vec_push_method`);
+all keys and defaults are in [Configuration](#configuration).
 
-See [Generic calls](doc/USAGE.md#generic-calls) for the association rule, header
-pattern, and full configuration.
+See [Generic calls](doc/USAGE.md#generic-calls) for the association rule and
+header pattern.
 
 ## STC with thin adapters
 
@@ -148,11 +133,10 @@ vec(int) nums = {0};
 vec_push(int)(&nums, 7);
 ```
 
-Use `stc_auto=1` (or `--stc-auto`) to detect wrappers from their includes or STC
-configuration macros, or list them with `stc_templates=vec,hashmap` (or
-`--stc-template vec`). Both paths select the STC profile. Adapters come from the
-current call sites, so a new operation works without a generator update. See the
-[STC quick start](doc/USAGE.md#stc-quick-start).
+STC can be enabled by auto-detection or an explicit template list; see
+[Configuration](#configuration). Both paths select the STC profile. Adapters come
+from the current call sites, so a new operation works without a generator
+update. See the [STC quick start](doc/USAGE.md#stc-quick-start).
 
 ## How generation works
 
@@ -187,6 +171,38 @@ Advanced generation lives in the usage guide:
 | [**Polymorphism**](doc/POLYMORPHISM.md) | Generated functions, function templates, static dispatch, and direct trait calls. |
 | [**Build guide**](doc/BUILD.md) | CLI build, clangd plugin build, loading, tests, and build errors. |
 | [**Troubleshooting**](doc/TROUBLESHOOTING.md) | Common failures and fixes. |
+
+## Configuration
+
+Project options live in `autotmpl.conf` at the workspace root. The CLI and
+clangd read the same file. CLI flags override the file, the file overrides
+environment variables, and environment variables override defaults. Restart
+clangd after changing the file.
+
+```text
+# autotmpl.conf
+profile=stc
+stc_auto=1
+dispatch=1
+dispatch_templates=vec,pair
+```
+
+| Area | Config key | Environment variable | Effect |
+| --- | --- | --- | --- |
+| Profile | `profile` | `C_AUTOTMPL_PROFILE` | `stc`, `stc-shared`, or `none`. |
+| STC templates | `stc_templates` | `C_AUTOTMPL_STC_TEMPLATES` | Comma-separated wrapper names, such as `vec,hashmap`. |
+| STC auto | `stc_auto` | `C_AUTOTMPL_STC_AUTO` | Detect wrappers from template-header contents. |
+| Generic calls | `dispatch` | `C_AUTOTMPL_DISPATCH` | Enable compile-time generic calls. |
+| Call backend | `dispatch_backend` | `C_AUTOTMPL_DISPATCH_BACKEND` | `generic` (`_Generic`, default) or `builtin`. |
+| Call style | `dispatch_style` | `C_AUTOTMPL_DISPATCH_STYLE` | `prefix` (default) or `postfix` affix placement. |
+| Call affix | `dispatch_affix` | `C_AUTOTMPL_DISPATCH_AFFIX` | Affix text; default `$`. |
+| Legacy suffix | `dispatch_suffix` | `C_AUTOTMPL_DISPATCH_SUFFIX` | Legacy alias for `dispatch_affix` that selects postfix. |
+| Call templates | `dispatch_templates` | `C_AUTOTMPL_DISPATCH_TEMPLATES` | Comma-separated templates that get generic calls. |
+| Plugin root | n/a | `C_AUTOTMPL_ROOT` | Force the clangd workspace root. |
+
+The `dispatch_*` names stay stable for compatibility. See
+[configuration in the usage guide](doc/USAGE.md#configuration) for CLI flags and
+template-authoring details.
 
 ## Build and test
 
