@@ -1808,13 +1808,9 @@ static DispatchConfig resolve_dispatch(void) {
   cfg.enabled = parse_bool_text(config_value("dispatch")) == 1;
   cfg.backend = parse_dispatch_backend(config_value("dispatch_backend"));
   const char *style = config_value("dispatch_style");
-  const char *legacy = config_value("dispatch_suffix");
   const char *affix = config_value("dispatch_affix");
   cfg.style = style && style[0] ? parse_dispatch_style(style)
-                                : (legacy && !affix ? DISPATCH_POSTFIX
-                                                    : DISPATCH_PREFIX);
-  if (!valid_dispatch_affix(affix))
-    affix = legacy;
+                                : DISPATCH_PREFIX;
   cfg.affix = xstrdup(valid_dispatch_affix(affix) ? affix : "$");
   cfg.names.items = NULL;
   cfg.names.len = cfg.names.cap = 0;

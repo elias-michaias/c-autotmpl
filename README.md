@@ -196,11 +196,10 @@ dispatch_templates=vec,pair
 | Call backend | `dispatch_backend` | `C_AUTOTMPL_DISPATCH_BACKEND` | `generic` (`_Generic`, default) or `builtin`. |
 | Call style | `dispatch_style` | `C_AUTOTMPL_DISPATCH_STYLE` | `prefix` (default) or `postfix` affix placement. |
 | Call affix | `dispatch_affix` | `C_AUTOTMPL_DISPATCH_AFFIX` | Affix text; default `$`. |
-| Legacy suffix | `dispatch_suffix` | `C_AUTOTMPL_DISPATCH_SUFFIX` | Legacy alias for `dispatch_affix` that selects postfix. |
 | Call templates | `dispatch_templates` | `C_AUTOTMPL_DISPATCH_TEMPLATES` | Comma-separated templates that get generic calls. |
 | Plugin root | n/a | `C_AUTOTMPL_ROOT` | Force the clangd workspace root. |
 
-The `dispatch_*` names stay stable for compatibility. See
+Use `dispatch_style` and `dispatch_affix` for custom call spellings. See
 [configuration in the usage guide](doc/USAGE.md#configuration) for CLI flags and
 template-authoring details.
 

@@ -828,19 +828,14 @@ DispatchConfig resolveDispatch() {
       Config.Backend = DispatchBackend::Builtin;
   }
   auto Style = configValue("dispatch_style");
-  auto Legacy = configValue("dispatch_suffix");
   auto Affix = configValue("dispatch_affix");
   Config.Style = Style && !Style->empty()
                      ? (StringRef(*Style).trim() == "postfix" ||
                                 StringRef(*Style).trim() == "post"
                             ? DispatchStyle::Postfix
                             : DispatchStyle::Prefix)
-                     : (Legacy && !Affix ? DispatchStyle::Postfix
-                                         : DispatchStyle::Prefix);
+                     : DispatchStyle::Prefix;
   StringRef AffixText = Affix ? StringRef(*Affix).trim() : StringRef();
-  if (AffixText.empty() || AffixText.find_first_of(" \t\r\n,()#") !=
-                               StringRef::npos)
-    AffixText = Legacy ? StringRef(*Legacy).trim() : StringRef();
   if (!AffixText.empty() && AffixText.find_first_of(" \t\r\n,()#") ==
                                 StringRef::npos)
     Config.Affix = AffixText.str();

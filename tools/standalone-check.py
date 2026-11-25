@@ -633,11 +633,12 @@ int main(void) {
   return v.value == 7 ? 0 : 1;
 }
 """)
-        suffix_env = dict(env)
-        suffix_env["C_AUTOTMPL_DISPATCH_SUFFIX"] = "_dispatch"
-        suffix_env["C_AUTOTMPL_DISPATCH_TEMPLATES"] = "box"
+        postfix_env = dict(env)
+        postfix_env["C_AUTOTMPL_DISPATCH_STYLE"] = "postfix"
+        postfix_env["C_AUTOTMPL_DISPATCH_AFFIX"] = "_dispatch"
+        postfix_env["C_AUTOTMPL_DISPATCH_TEMPLATES"] = "box"
         proc = subprocess.run(args, cwd=root, capture_output=True, text=True,
-                              env=suffix_env)
+                              env=postfix_env)
         require(proc.returncode == 0, "filtered dispatch run exited with error",
                 proc.stdout + proc.stderr)
         with open(generated) as f:
@@ -645,26 +646,53 @@ int main(void) {
         require("dispatch begin" not in content,
                 "template filter did not disable dispatch", content)
 
-        suffix_env["C_AUTOTMPL_DISPATCH_TEMPLATES"] = "vec"
+        postfix_env["C_AUTOTMPL_DISPATCH_TEMPLATES"] = "vec"
         proc = subprocess.run(args, cwd=root, capture_output=True, text=True,
-                              env=suffix_env)
+                              env=postfix_env)
         output = proc.stdout + proc.stderr
         require(proc.returncode == 0 and "dispatch templates=1" in output,
-                "custom dispatch suffix run exited with error", output)
+                "custom postfix dispatch run exited with error", output)
         with open(generated) as f:
             content = f.read()
         require("#define vec_push_dispatch(...)" in content and
                 "#define vec_push$(...)" not in content,
-                "custom dispatch suffix was not used", content)
+                "custom postfix affix was not used", content)
         if compiler:
             built = subprocess.run(
                 [compiler, "-std=c11", "-Wall", "-Wextra", "-Werror",
-                 "main.c", "-o", "suffix-demo"],
+                 "main.c", "-o", "postfix-demo"],
                 cwd=root, capture_output=True, text=True,
             )
             require(built.returncode == 0,
-                    "custom suffix dispatch output did not compile",
+                    "custom postfix dispatch output did not compile",
                     built.stdout + built.stderr)
+
+        os.remove(generated)
+        if os.path.exists(generated_pair):
+            os.remove(generated_pair)
+        write(source, """\
+#include "gen/vec.h"
+
+int main(void) {
+  vec(int) v = {0};
+  $vec_push(&v, 7);
+  return v.value == 7 ? 0 : 1;
+}
+""")
+        removed_env = dict(env)
+        removed_env["C_AUTOTMPL_DISPATCH_SUFFIX"] = "_dispatch"
+        removed_env["C_AUTOTMPL_DISPATCH_TEMPLATES"] = "vec"
+        proc = subprocess.run(args, cwd=root, capture_output=True, text=True,
+                              env=removed_env)
+        require(proc.returncode == 0,
+                "removed dispatch_suffix run exited with error",
+                proc.stdout + proc.stderr)
+        with open(generated) as f:
+            content = f.read()
+        require("#define $vec_push(...)" in content and
+                "#define vec_push_dispatch(...)" not in content,
+                "removed dispatch_suffix option still affected generation",
+                content)
 
         os.remove(generated)
         if os.path.exists(generated_pair):
