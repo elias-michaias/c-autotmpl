@@ -500,22 +500,46 @@ static void scanFunctionUsage(const TemplateDef &Template, StringRef RawType,
   appendUsageChain(Template, CanonArgs, Expanded, Out);
 }
 
-static std::string DispatchSuffix = "$";
+static std::string DispatchAffix = "$";
+static bool DispatchPrefix = true;
 
-void setDispatchSuffix(StringRef Suffix) { DispatchSuffix = Suffix.str(); }
-
-static bool dispatchSuffixAt(StringRef Source, unsigned Pos) {
-  return !DispatchSuffix.empty() &&
-         !isIdentStart(DispatchSuffix.front()) &&
-         Source.substr(Pos).starts_with(DispatchSuffix);
+void setDispatchAffix(StringRef Affix, bool Prefix) {
+  DispatchAffix = Affix.str();
+  DispatchPrefix = Prefix;
 }
 
-static StringRef stripDispatchSuffix(StringRef Ident) {
-  if (DispatchSuffix.empty() || !isIdentStart(DispatchSuffix.front()))
+static bool dispatchAffixIsIdent() {
+  return !DispatchAffix.empty() && isIdentStart(DispatchAffix.front());
+}
+
+static size_t dispatchNonidentPrefixAt(StringRef Source, unsigned Pos) {
+  if (!DispatchPrefix || DispatchAffix.empty() || dispatchAffixIsIdent())
+    return 0;
+  return Source.substr(Pos).starts_with(DispatchAffix) ? DispatchAffix.size()
+                                                       : 0;
+}
+
+static size_t dispatchNonidentPostfixAt(StringRef Source, unsigned Pos) {
+  if (DispatchPrefix || DispatchAffix.empty() || dispatchAffixIsIdent())
+    return 0;
+  return Source.substr(Pos).starts_with(DispatchAffix) ? DispatchAffix.size()
+                                                       : 0;
+}
+
+static bool identHasDispatchAffix(StringRef Ident) {
+  if (DispatchAffix.empty() || Ident.size() <= DispatchAffix.size() ||
+      !dispatchAffixIsIdent())
+    return false;
+  if (DispatchPrefix)
+    return Ident.starts_with(DispatchAffix);
+  return Ident.ends_with(DispatchAffix);
+}
+
+static StringRef stripDispatchAffix(StringRef Ident) {
+  if (!identHasDispatchAffix(Ident))
     return Ident;
-  return Ident.ends_with(DispatchSuffix)
-             ? Ident.drop_back(DispatchSuffix.size())
-             : Ident;
+  return DispatchPrefix ? Ident.drop_front(DispatchAffix.size())
+                        : Ident.drop_back(DispatchAffix.size());
 }
 
 static void scanUsagesImpl(StringRef Code, const TemplateRegistry &Registry,
@@ -541,7 +565,9 @@ static void scanUsagesImpl(StringRef Code, const TemplateRegistry &Registry,
       }
     }
 
-    if (!isIdentStart(S[I])) {
+    size_t PrefixLen = dispatchNonidentPrefixAt(S, I);
+    I += static_cast<unsigned>(PrefixLen);
+    if (I >= S.size() || !isIdentStart(S[I])) {
       ++I;
       continue;
     }
@@ -549,11 +575,13 @@ static void scanUsagesImpl(StringRef Code, const TemplateRegistry &Registry,
     unsigned End = I + 1;
     while (End < S.size() && isIdentChar(S[End]))
       ++End;
-    if (dispatchSuffixAt(S, End)) {
+    StringRef RawIdent = S.slice(I, End);
+    if (PrefixLen || dispatchNonidentPostfixAt(S, End) ||
+        identHasDispatchAffix(RawIdent)) {
       I = End;
       continue;
     }
-    StringRef Ident = stripDispatchSuffix(S.slice(I, End));
+    StringRef Ident = stripDispatchAffix(RawIdent);
 
     if (const TemplateDef *Def = Registry.findByName(Ident)) {
       unsigned K = End;

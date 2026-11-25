@@ -70,7 +70,9 @@ over defaults. Restart clangd after changing configuration.
 | STC auto | `stc_auto` | `C_AUTOTMPL_STC_AUTO` | Detect STC wrappers from template-header contents. |
 | Dispatch | `dispatch` | `C_AUTOTMPL_DISPATCH` | Generate method-like dispatch macros. |
 | Dispatch backend | `dispatch_backend` | `C_AUTOTMPL_DISPATCH_BACKEND` | Select `generic` (`_Generic`, default) or `builtin` (GCC/Clang builtins). |
-| Dispatch suffix | `dispatch_suffix` | `C_AUTOTMPL_DISPATCH_SUFFIX` | Set the macro suffix, default `$`. |
+| Dispatch style | `dispatch_style` | `C_AUTOTMPL_DISPATCH_STYLE` | Place the affix before the name (`prefix`, default) or after it (`postfix`). |
+| Dispatch affix | `dispatch_affix` | `C_AUTOTMPL_DISPATCH_AFFIX` | Set the macro affix, default `$`. |
+| Dispatch suffix | `dispatch_suffix` | `C_AUTOTMPL_DISPATCH_SUFFIX` | Legacy alias for `dispatch_affix` that also selects postfix style. |
 | Dispatch templates | `dispatch_templates` | `C_AUTOTMPL_DISPATCH_TEMPLATES` | Comma-separated templates that get dispatch, such as `vec,list`. |
 | Plugin root | n/a | `C_AUTOTMPL_ROOT` | Force the clangd plugin workspace root. |
 | Plugin timing | n/a | `C_AUTOTMPL_TIMING` | Log plugin phase timings. |
@@ -282,7 +284,7 @@ application needs an explicit wrapper template.
 ## Generated dispatch macros
 
 Set `dispatch=1` in `autotmpl.conf` to emit method-like macros such as
-`Vec_push$`. An operation is eligible when a type-template header declares a
+`$Vec_push`. An operation is eligible when a type-template header declares a
 function whose declaration mentions that template's type spelling. The spelling
 can be the template call form such as `Vec(T)`, a generated parameter macro such
 as `T`, or a decorator parameter such as `Key`. Pointer-ness and argument
@@ -317,11 +319,11 @@ static inline T VEC_FN(Vec(T), _at)(int i, Vec(T) v) {
 int main(void) {
   Vec(int) nums = {0};
   Vec(float) floats = {0};
-  Vec_push$(&nums, 7); /* selects Vec_int_push */
-  Vec_push$(&floats, 2.5f); /* same macro, selects Vec_float_push */
-  if (Vec_at$(0, nums) != 7) /* value, second argument */
+  $Vec_push(&nums, 7); /* selects Vec_int_push */
+  $Vec_push(&floats, 2.5f); /* same macro, selects Vec_float_push */
+  if ($Vec_at(0, nums) != 7) /* value, second argument */
     return 1;
-  return Vec_at$(0, floats) == 2.5f ? 0 : 1;
+  return $Vec_at(0, floats) == 2.5f ? 0 : 1;
 }
 ```
 
@@ -336,10 +338,15 @@ autotmpl --root . src
 cc -I. -std=c11 -Wall -Wextra -Werror src/main.c -o demo
 ```
 
+With the clangd plugin, go to definition on a dispatch macro opens the operation
+in the template header instead of the generated `#define`. No annotation is
+needed in source files.
+
 The default backend is `_Generic` and needs C11. Set
 `dispatch_backend=builtin` for the GCC/Clang builtin form, which also works in
-C99. The default suffix `$` is accepted by GCC and Clang; set
-`dispatch_suffix=_method` if you prefer an identifier suffix. Without
+C99. The default prefix `$` is accepted by GCC and Clang. Set
+`dispatch_style=postfix` and `dispatch_affix=_method` for `Vec_push_method`, or
+set only the legacy `dispatch_suffix=_method` to keep the old spelling. Without
 `dispatch_templates`, every eligible type template gets dispatch macros. The
 plugin rereads `autotmpl.conf` only on clangd restart.
 

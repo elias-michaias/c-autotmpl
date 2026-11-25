@@ -95,12 +95,19 @@ bool signatureUsesTemplate(StringRef S, size_t Begin, size_t End,
 /// vec_int_push(vec(int) *, ...) or VEC_FN(i_type, _push)(i_type *, ...)
 /// contributes `push`. The template type must appear in the declaration, but
 /// it need not be a pointer or the first parameter.
-void collectDispatchOps(StringRef Content, TemplateDef &Out) {
+void collectDispatchOps(StringRef Content, TemplateDef &Out,
+                        size_t BaseOffset = 0) {
   if (Out.Kind != TemplateKind::Type || Out.Name.empty())
     return;
   std::string Cleaned = stripCommentsAndLiterals(Content);
   StringRef Clean(Cleaned);
   std::string NormTemplate = normalMacroName(Out.Name);
+  auto recordOp = [&](StringRef Op, size_t Offset) {
+    std::string Key = Op.str();
+    Out.DispatchOps.insert(Key);
+    Out.DispatchOpOffsets.try_emplace(
+        Key, static_cast<unsigned>(BaseOffset + Offset));
+  };
   bool LineStart = true;
   for (size_t I = 0; I < Clean.size();) {
     size_t LinePos = I;
@@ -164,7 +171,7 @@ void collectDispatchOps(StringRef Content, TemplateDef &Out) {
               if (Valid && signatureUsesTemplate(
                                Clean, declarationBegin(Clean, I), CallClose,
                                Out))
-                Out.DispatchOps.insert(Last.drop_front().str());
+                recordOp(Last.drop_front(), I);
             }
           }
         }
@@ -182,7 +189,7 @@ void collectDispatchOps(StringRef Content, TemplateDef &Out) {
           if (Valid &&
               signatureUsesTemplate(Clean, declarationBegin(Clean, I), Close,
                                     Out))
-            Out.DispatchOps.insert(Op.str());
+            recordOp(Op, I);
         }
       }
     }
@@ -523,14 +530,16 @@ void TemplateRegistry::scanTree(StringRef Dir) {
     auto BufferOrErr = MemoryBuffer::getFile(It->path(), /*IsText=*/true);
     if (!BufferOrErr)
       continue;
-    StringRef Buffer = (*BufferOrErr)->getBuffer();
-    bool HasGuard = hasTmplHeaderGuard(Buffer);
+    std::string FullText = (*BufferOrErr)->getBuffer().str();
+    StringRef Full(FullText);
+    StringRef Cursor(FullText);
+    bool HasGuard = hasTmplHeaderGuard(Full);
 
     auto Def = std::make_unique<TemplateDef>();
     bool Found = false;
-    while (!Buffer.empty()) {
+    while (!Cursor.empty()) {
       StringRef Line;
-      std::tie(Line, Buffer) = Buffer.split('\n');
+      std::tie(Line, Cursor) = Cursor.split('\n');
       if (parseDecorator(Line, *Def)) {
         Found = true;
         break;
@@ -538,7 +547,7 @@ void TemplateRegistry::scanTree(StringRef Dir) {
     }
     if (!Found)
       continue;
-    collectDispatchOps(Buffer, *Def);
+    collectDispatchOps(Full, *Def);
 
     Def->Header = makeAbsolute(It->path());
     Def->GeneratedHeader = genHeaderPath(Def->Header, Def->Name);
@@ -713,12 +722,23 @@ DispatchConfig resolveDispatch() {
     if (StringRef(*Value).trim() == "builtin")
       Config.Backend = DispatchBackend::Builtin;
   }
-  if (auto Value = configValue("dispatch_suffix")) {
-    StringRef Suffix = StringRef(*Value).trim();
-    if (!Suffix.empty() && Suffix.find_first_of(" \t\r\n,()#") ==
+  auto Style = configValue("dispatch_style");
+  auto Legacy = configValue("dispatch_suffix");
+  auto Affix = configValue("dispatch_affix");
+  Config.Style = Style && !Style->empty()
+                     ? (StringRef(*Style).trim() == "postfix" ||
+                                StringRef(*Style).trim() == "post"
+                            ? DispatchStyle::Postfix
+                            : DispatchStyle::Prefix)
+                     : (Legacy && !Affix ? DispatchStyle::Postfix
+                                         : DispatchStyle::Prefix);
+  StringRef AffixText = Affix ? StringRef(*Affix).trim() : StringRef();
+  if (AffixText.empty() || AffixText.find_first_of(" \t\r\n,()#") !=
                                StringRef::npos)
-      Config.Suffix = Suffix.str();
-  }
+    AffixText = Legacy ? StringRef(*Legacy).trim() : StringRef();
+  if (!AffixText.empty() && AffixText.find_first_of(" \t\r\n,()#") ==
+                                StringRef::npos)
+    Config.Affix = AffixText.str();
   if (auto Value = configValue("dispatch_templates")) {
     SmallVector<StringRef, 4> Names;
     StringRef(*Value).split(Names, ',');

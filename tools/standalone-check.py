@@ -19,6 +19,8 @@ CONFIG_KEYS = (
     "C_AUTOTMPL_STC_AUTO",
     "C_AUTOTMPL_DISPATCH",
     "C_AUTOTMPL_DISPATCH_BACKEND",
+    "C_AUTOTMPL_DISPATCH_STYLE",
+    "C_AUTOTMPL_DISPATCH_AFFIX",
     "C_AUTOTMPL_DISPATCH_SUFFIX",
     "C_AUTOTMPL_DISPATCH_TEMPLATES",
 )
@@ -453,13 +455,13 @@ int main(void) {
   vec(int) v = {0};
   vec(float) f = {0};
   pair(int, float) p = {1, 2.5f};
-  vec_push$(&v, 7);
-  vec_push$(&f, 2);
-  vec_clear$(&v);
-  vec_pick$(7, v);
-  return (vec_size$(&v) == 1 && v.value == 0 && vec_pick$(7, v) == 7 &&
-          vec_size$(&f) == 1 && vec_pick$(3, f) == 5 &&
-          (int)pair_sum$(3, p) == 6) ? 0 : 1;
+  $vec_push(&v, 7);
+  $vec_push(&f, 2);
+  $vec_clear(&v);
+  $vec_pick(7, v);
+  return ($vec_size(&v) == 1 && v.value == 0 && $vec_pick(7, v) == 7 &&
+          $vec_size(&f) == 1 && $vec_pick(3, f) == 5 &&
+          (int)$pair_sum(3, p) == 6) ? 0 : 1;
 }
 """)
         generated = os.path.join(root, "gen", "vec.h")
@@ -479,8 +481,9 @@ dispatch=1
         output = proc.stdout + proc.stderr
         require(proc.returncode == 0, "dispatch run exited with error", output)
         for needle in ("dispatch=1", "dispatch backend=generic",
-                       "dispatch suffix=$", "generated vec(int)",
-                       "generated vec(float)", "generated pair(int, float)"):
+                       "dispatch style=prefix", "dispatch affix=$",
+                       "generated vec(int)", "generated vec(float)",
+                       "generated pair(int, float)"):
             require(needle in output, "missing dispatch report: " + needle,
                     output)
 
@@ -493,10 +496,10 @@ dispatch=1
                        "vec_int: vec_int_clear",
                        "vec_int: vec_int_size",
                        "vec_int: vec_int_pick",
-                       "#define vec_push$(...)",
-                       "#define vec_clear$(...)",
-                       "#define vec_size$(...)",
-                       "#define vec_pick$(...)"):
+                       "#define $vec_push(...)",
+                       "#define $vec_clear(...)",
+                       "#define $vec_size(...)",
+                       "#define $vec_pick(...)"):
             require(needle in content, "missing dispatch text: " + needle,
                     content)
         require("helper" not in content,
@@ -507,7 +510,7 @@ dispatch=1
         for needle in ("/* c-autotmpl dispatch begin pair */",
                        "#ifdef C_AUTOTMPL_pair_int_2C_20float",
                        "_Generic((p2), pair_int_float: pair_int_float_sum",
-                       "#define pair_sum$(...)"):
+                       "#define $pair_sum(...)"):
             require(needle in pair_content,
                     "two-arity dispatch text is missing: " + needle,
                     pair_content)
@@ -610,6 +613,43 @@ int main(void) {
             )
             require(built.returncode == 0,
                     "custom suffix dispatch output did not compile",
+                    built.stdout + built.stderr)
+
+        os.remove(generated)
+        if os.path.exists(generated_pair):
+            os.remove(generated_pair)
+        write(source, """\
+#include "gen/vec.h"
+
+int main(void) {
+  vec(int) v = {0};
+  mvec_push(&v, 7);
+  return v.value == 7 ? 0 : 1;
+}
+""")
+        prefix_env = dict(env)
+        prefix_env["C_AUTOTMPL_DISPATCH_AFFIX"] = "m"
+        prefix_env["C_AUTOTMPL_DISPATCH_STYLE"] = "prefix"
+        prefix_env["C_AUTOTMPL_DISPATCH_TEMPLATES"] = "vec"
+        proc = subprocess.run(args, cwd=root, capture_output=True, text=True,
+                              env=prefix_env)
+        output = proc.stdout + proc.stderr
+        require(proc.returncode == 0 and "dispatch affix=m" in output and
+                "dispatch style=prefix" in output,
+                "custom prefix dispatch run exited with error", output)
+        with open(generated) as f:
+            content = f.read()
+        require("#define mvec_push(...)" in content and
+                "#define $vec_push(...)" not in content,
+                "custom dispatch affix was not used as a prefix", content)
+        if compiler:
+            built = subprocess.run(
+                [compiler, "-std=c11", "-Wall", "-Wextra", "-Werror",
+                 "main.c", "-o", "prefix-demo"],
+                cwd=root, capture_output=True, text=True,
+            )
+            require(built.returncode == 0,
+                    "custom prefix dispatch output did not compile",
                     built.stdout + built.stderr)
 
         os.remove(generated)

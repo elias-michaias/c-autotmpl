@@ -269,6 +269,13 @@ int main() {
   assert(DispatchDef->DispatchOps.contains("push"));
   assert(DispatchDef->DispatchOps.contains("set"));
   assert(!DispatchDef->DispatchOps.contains("helper"));
+  auto PushOffset = DispatchDef->DispatchOpOffsets.find("push");
+  assert(PushOffset != DispatchDef->DispatchOpOffsets.end());
+  auto DispatchHeader = MemoryBuffer::getFile(DispatchDef->Header);
+  assert(DispatchHeader);
+  assert(StringRef((*DispatchHeader)->getBuffer())
+             .substr(PushOffset->second)
+             .starts_with("Dispatch_int_push"));
   SmallVector<c_autotmpl::DispatchCase, 1> DispatchCases{
       {"int", "Dispatch_int"}};
   SmallVector<StringRef, 1> DispatchOps{"push"};
@@ -279,9 +286,20 @@ int main() {
            "#ifdef C_AUTOTMPL_Dispatch_int",
            "_Generic((p1), Dispatch_int: Dispatch_int_push",
            "Dispatch_int*: Dispatch_int_push",
-           "#define Dispatch_push$(...)",
+           "#define $Dispatch_push(...)",
            "/* c-autotmpl dispatch end Dispatch */"})
     assert(DispatchSection.find(Needle.str()) != std::string::npos);
+
+  DispatchCfg.Style = c_autotmpl::DispatchStyle::Postfix;
+  DispatchCfg.Affix = "_method";
+  std::string PostfixSection = c_autotmpl::makeDispatchSection(
+      *DispatchDef, DispatchCases, DispatchOps, DispatchCfg);
+  assert(PostfixSection.find("#define Dispatch_push_method(...)") !=
+         std::string::npos);
+  assert(PostfixSection.find("#define $Dispatch_push(...)") ==
+         std::string::npos);
+  DispatchCfg.Style = c_autotmpl::DispatchStyle::Prefix;
+  DispatchCfg.Affix = "$";
 
   DispatchCfg.Templates.push_back("Nope");
   Registry.applyDispatch(DispatchCfg);
@@ -302,7 +320,7 @@ int main() {
                                       DispatchError));
   auto DispatchBuffer = MemoryBuffer::getFile(DispatchPath);
   assert(DispatchBuffer &&
-         (*DispatchBuffer)->getBuffer().contains("Dispatch_push$"));
+         (*DispatchBuffer)->getBuffer().contains("$Dispatch_push"));
 
   c_autotmpl::Instantiator Instantiator;
   std::string GenPath, Error;

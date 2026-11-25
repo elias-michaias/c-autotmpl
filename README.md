@@ -30,7 +30,7 @@ Project settings live in `autotmpl.conf` at the workspace root, so builds and
 clangd read the same short `key=value` options without environment exports.
 
 Opt-in dispatch macros give generated functions method-like names such as
-`vec_push$`. The same macro selects the right specialization from any argument,
+`$vec_push`. The same macro selects the right specialization from any argument,
 value or pointer, and works with one or many template arguments.
 
 First-class [STC](https://github.com/stclib/STC) support is opt-in. A thin
@@ -50,7 +50,7 @@ explicitly.
 | **Function templates** | `convert(int, float)(x)` from explicit call-site arguments. |
 | **Split implementations** | `#ifndef TMPL_HEADER` selects a grouped implementation source and public header. |
 | **Type-aware guards** | User types use real include guards; scalar types are emitted bare. |
-| **Opt-in dispatch macros** | `vec_push$` and `vec_at$` dispatch from any argument, value or pointer, first or later. Works with one or many template arguments. |
+| **Opt-in dispatch macros** | `$vec_push` and `$vec_at` dispatch from any argument, value or pointer, first or later. clangd go to definition follows the macro to its template operation. |
 | **First-class [STC](https://github.com/stclib/STC) support** | Thin wrappers and generated adapters make STC containers read like parametric types. |
 
 ## Get started
@@ -136,11 +136,11 @@ vec(int) xs = {0};
 vec(float) ys = {0};
 pair(int, float) entry = {1, 2.5f};
 
-vec_push$(&xs, 7);      /* selects vec_int_push */
-vec_push$(&ys, 2.5f);   /* same macro, selects vec_float_push */
-vec_at$(2, xs);         /* value, second argument */
-vec_at$(2, ys);         /* same macro, selects vec_float_at */
-pair_sum$(3, entry);    /* two-argument template */
+$vec_push(&xs, 7);      /* selects vec_int_push */
+$vec_push(&ys, 2.5f);   /* same macro, selects vec_float_push */
+$vec_at(2, xs);         /* value, second argument */
+$vec_at(2, ys);         /* same macro, selects vec_float_at */
+$pair_sum(3, entry);    /* two-argument template */
 ```
 
 The same dispatch macro selects the operation for each tracked instantiation of
@@ -149,12 +149,16 @@ generated header. Each case is guarded by its instantiation's presence macro, so
 a header never names a type that was not generated. The public macro is variadic
 and forwards arguments unchanged.
 
+With the clangd plugin, go to definition on a dispatch macro opens the matching
+operation in its template header.
+
 The default backend uses C11 `_Generic`. In `autotmpl.conf`, set
 `dispatch_backend=builtin` for GCC and Clang builtins, which work in C99.
-`dispatch_suffix=_method` changes `$` to an identifier suffix, and
-`dispatch_templates=vec,pair` limits generation to named templates.
-See [generated dispatch macros](doc/USAGE.md#generated-dispatch-macros) for the
-full header pattern and configuration details.
+`dispatch_style=postfix` and `dispatch_affix=_method` produce `vec_push_method`;
+the defaults are `prefix` and `$`. `dispatch_templates=vec,pair` limits
+generation to named templates. See
+[generated dispatch macros](doc/USAGE.md#generated-dispatch-macros) for the full
+header pattern and configuration details.
 
 ## Generated output
 

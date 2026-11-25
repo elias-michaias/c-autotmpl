@@ -1033,6 +1033,7 @@ typedef enum { TEMPLATE_TYPE, TEMPLATE_FUNCTION } TemplateKind;
 typedef enum { ARG_TYPE, ARG_NAME, ARG_FLAGS, ARG_OPAQUE, ARG_KEY, ARG_VALUE } ArgRole;
 typedef enum { PRESET_NONE, PRESET_STC_STATIC, PRESET_STC_SHARED } PresetKind;
 typedef enum { DISPATCH_GENERIC, DISPATCH_BUILTIN } DispatchBackend;
+typedef enum { DISPATCH_PREFIX, DISPATCH_POSTFIX } DispatchStyle;
 
 typedef struct {
   ArgRole role;
@@ -1065,7 +1066,8 @@ typedef struct {
 typedef struct {
   int enabled;
   DispatchBackend backend;
-  char *suffix;
+  DispatchStyle style;
+  char *affix;
   Set names;
   int has_names;
 } DispatchConfig;
@@ -1637,7 +1639,7 @@ static const char *config_value(const char *key) {
   return getenv(env_key);
 }
 
-static int valid_dispatch_suffix(const char *text) {
+static int valid_dispatch_affix(const char *text) {
   if (!text || !text[0])
     return 0;
   for (; *text; ++text)
@@ -1647,12 +1649,25 @@ static int valid_dispatch_suffix(const char *text) {
   return 1;
 }
 
+static DispatchStyle parse_dispatch_style(const char *text) {
+  if (text && (strcmp(text, "postfix") == 0 || strcmp(text, "post") == 0))
+    return DISPATCH_POSTFIX;
+  return DISPATCH_PREFIX;
+}
+
 static DispatchConfig resolve_dispatch(void) {
   DispatchConfig cfg;
   cfg.enabled = parse_bool_text(config_value("dispatch")) == 1;
   cfg.backend = parse_dispatch_backend(config_value("dispatch_backend"));
-  const char *suffix = config_value("dispatch_suffix");
-  cfg.suffix = xstrdup(valid_dispatch_suffix(suffix) ? suffix : "$");
+  const char *style = config_value("dispatch_style");
+  const char *legacy = config_value("dispatch_suffix");
+  const char *affix = config_value("dispatch_affix");
+  cfg.style = style && style[0] ? parse_dispatch_style(style)
+                                : (legacy && !affix ? DISPATCH_POSTFIX
+                                                    : DISPATCH_PREFIX);
+  if (!valid_dispatch_affix(affix))
+    affix = legacy;
+  cfg.affix = xstrdup(valid_dispatch_affix(affix) ? affix : "$");
   cfg.names.items = NULL;
   cfg.names.len = cfg.names.cap = 0;
   cfg.has_names = 0;
@@ -2610,22 +2625,50 @@ static void scan_header_deps(const TemplateDef *tmpl, Vec *args, Registry *reg,
   free(code);
 }
 
-static const char *g_dispatch_suffix = "$";
+static DispatchStyle g_dispatch_style = DISPATCH_PREFIX;
+static const char *g_dispatch_affix = "$";
 
-static char *ident_without_dispatch_suffix(const char *ident) {
-  const char *suffix = g_dispatch_suffix ? g_dispatch_suffix : "";
-  size_t n = strlen(suffix);
-  size_t len = strlen(ident);
-  if (n && len > n && is_ident_start(suffix[0]) &&
-      !strcmp(ident + len - n, suffix))
-    return xstrdup_n(ident, len - n);
-  return xstrdup(ident);
+static int dispatch_affix_is_ident(void) {
+  return g_dispatch_affix && g_dispatch_affix[0] &&
+         is_ident_start(g_dispatch_affix[0]);
 }
 
-static int dispatch_suffix_at(const char *code, size_t pos) {
-  const char *suffix = g_dispatch_suffix ? g_dispatch_suffix : "";
-  return suffix[0] && !is_ident_start(suffix[0]) &&
-         !strncmp(code + pos, suffix, strlen(suffix));
+static size_t dispatch_nonident_prefix_at(const char *code, size_t pos) {
+  const char *affix = g_dispatch_affix ? g_dispatch_affix : "";
+  size_t n = strlen(affix);
+  if (g_dispatch_style != DISPATCH_PREFIX || !n || dispatch_affix_is_ident())
+    return 0;
+  return !strncmp(code + pos, affix, n) ? n : 0;
+}
+
+static size_t dispatch_nonident_postfix_at(const char *code, size_t pos) {
+  const char *affix = g_dispatch_affix ? g_dispatch_affix : "";
+  size_t n = strlen(affix);
+  if (g_dispatch_style != DISPATCH_POSTFIX || !n || dispatch_affix_is_ident())
+    return 0;
+  return !strncmp(code + pos, affix, n) ? n : 0;
+}
+
+static int ident_has_dispatch_affix(const char *ident) {
+  const char *affix = g_dispatch_affix ? g_dispatch_affix : "";
+  size_t n = strlen(affix);
+  size_t len = strlen(ident);
+  if (!n || len <= n || !dispatch_affix_is_ident())
+    return 0;
+  if (g_dispatch_style == DISPATCH_PREFIX)
+    return !strncmp(ident, affix, n);
+  return !strcmp(ident + len - n, affix);
+}
+
+static char *ident_without_dispatch_affix(const char *ident) {
+  const char *affix = g_dispatch_affix ? g_dispatch_affix : "";
+  size_t n = strlen(affix);
+  size_t len = strlen(ident);
+  if (!ident_has_dispatch_affix(ident))
+    return xstrdup(ident);
+  if (g_dispatch_style == DISPATCH_PREFIX)
+    return xstrdup_n(ident + n, len - n);
+  return xstrdup_n(ident, len - n);
 }
 
 static void scan_usages_impl(const char *code, Registry *reg, Vec *out,
@@ -2645,7 +2688,9 @@ static void scan_usages_impl(const char *code, Registry *reg, Vec *out,
         continue;
       }
     }
-    if (!is_ident_start(clean[i])) {
+    size_t prefix_len = dispatch_nonident_prefix_at(clean, i);
+    i += prefix_len;
+    if (i >= n || !is_ident_start(clean[i])) {
       ++i;
       continue;
     }
@@ -2656,12 +2701,13 @@ static void scan_usages_impl(const char *code, Registry *reg, Vec *out,
     size_t after_ident = end;
     while (after_ident < n && is_space(clean[after_ident]))
       ++after_ident;
-    if (dispatch_suffix_at(clean, after_ident)) {
+    if (prefix_len || dispatch_nonident_postfix_at(clean, after_ident) ||
+        ident_has_dispatch_affix(ident)) {
       free(ident);
       i = end;
       continue;
     }
-    char *match_ident = ident_without_dispatch_suffix(ident);
+    char *match_ident = ident_without_dispatch_affix(ident);
     TemplateDef *def = registry_find(reg, match_ident);
     if (def) {
       size_t k = end;
@@ -3399,10 +3445,13 @@ static char *make_dispatch_section(const TemplateDef *tmpl, Vec *cases,
     str_append(&out, "\n");
 
     str_append(&out, "#define ");
+    if (cfg->style == DISPATCH_PREFIX)
+      str_append(&out, cfg->affix);
     str_append(&out, tmpl->name);
     str_append_char(&out, '_');
     str_append(&out, op);
-    str_append(&out, cfg->suffix);
+    if (cfg->style == DISPATCH_POSTFIX)
+      str_append(&out, cfg->affix);
     str_append(&out, "(...) C_AUTOTMPL_DISPATCH_PICK_");
     str_append(&out, tmpl->name);
     str_append_char(&out, '_');
@@ -4343,12 +4392,15 @@ int main(int argc, char **argv) {
     printf("stc auto=1\n");
 
   DispatchConfig dispatch_cfg = resolve_dispatch();
-  g_dispatch_suffix = dispatch_cfg.suffix;
+  g_dispatch_style = dispatch_cfg.style;
+  g_dispatch_affix = dispatch_cfg.affix;
   if (opt.verbose && dispatch_cfg.enabled) {
     printf("dispatch=1\n");
     printf("dispatch backend=%s\n",
            dispatch_cfg.backend == DISPATCH_BUILTIN ? "builtin" : "generic");
-    printf("dispatch suffix=%s\n", dispatch_cfg.suffix);
+    printf("dispatch style=%s\n",
+           dispatch_cfg.style == DISPATCH_PREFIX ? "prefix" : "postfix");
+    printf("dispatch affix=%s\n", dispatch_cfg.affix);
     if (dispatch_cfg.has_names)
       printf("dispatch templates=%zu\n", dispatch_cfg.names.len);
   }

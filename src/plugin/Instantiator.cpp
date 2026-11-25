@@ -615,8 +615,12 @@ std::string makeDispatchSection(const TemplateDef &Template,
       Out += "_" + std::to_string(K);
     }
     Out += ", ...) _" + std::to_string(DispatchMaxArgs + 1) + "\n";
-    Out += "#define " + Template.Name + "_" + Op + Config.Suffix +
-           "(...) " + Pick + "(__VA_ARGS__";
+    std::string MacroName = Template.Name + "_" + Op;
+    if (Config.Style == DispatchStyle::Prefix)
+      MacroName = Config.Affix + MacroName;
+    else
+      MacroName += Config.Affix;
+    Out += "#define " + MacroName + "(...) " + Pick + "(__VA_ARGS__";
     for (size_t K = DispatchMaxArgs; K > 0; --K)
       Out += ", " + dispatchSelectorName(Template.Name, Op, K, Cases.size());
     Out += ", " + dispatchSelectorName(Template.Name, Op, 1, Cases.size()) +

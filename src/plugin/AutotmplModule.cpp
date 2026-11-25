@@ -45,6 +45,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/Support/Error.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
@@ -449,13 +450,15 @@ struct SharedState {
       Names.push_back(Name);
     Registry.applyPreset(Config.Preset, Names, Config.Auto);
     Dispatch = resolveDispatch();
-    setDispatchSuffix(Dispatch.Suffix);
+    setDispatchAffix(Dispatch.Affix, Dispatch.Style == DispatchStyle::Prefix);
     Registry.applyDispatch(Dispatch);
     if (Dispatch.Enabled) {
       std::string Msg = "dispatch=1 backend=";
       Msg += Dispatch.Backend == DispatchBackend::Builtin ? "builtin"
                                                           : "generic";
-      Msg += " suffix=" + Dispatch.Suffix;
+      Msg += " style=";
+      Msg += Dispatch.Style == DispatchStyle::Prefix ? "prefix" : "postfix";
+      Msg += " affix=" + Dispatch.Affix;
       log(Msg);
     }
     if (!ProfileName.empty())
@@ -1281,6 +1284,93 @@ struct SharedState {
   }
 };
 
+struct DispatchNavTarget {
+  const TemplateDef *Template = nullptr;
+  std::string Op;
+};
+
+static bool navIdentStart(char C) {
+  return C == '_' || (C >= 'a' && C <= 'z') || (C >= 'A' && C <= 'Z');
+}
+
+static bool navIdentChar(char C) {
+  return navIdentStart(C) || (C >= '0' && C <= '9');
+}
+
+static bool navIdent(StringRef Text) {
+  if (Text.empty() || !navIdentStart(Text.front()))
+    return false;
+  for (char C : Text)
+    if (!navIdentChar(C))
+      return false;
+  return true;
+}
+
+static bool dispatchAffixIsIdent(const DispatchConfig &Config) {
+  return !Config.Affix.empty() && navIdentStart(Config.Affix.front());
+}
+
+/// Recognizes `$vec_push(...)` or `vec_push$(...)` at the cursor and maps it
+/// back to a type template and operation. The longest matching template wins so
+/// `pair_sum` cannot be mistaken for an operation on `pair`-like prefixes.
+static DispatchNavTarget dispatchTargetAt(StringRef Text, size_t Offset,
+                                          const SharedState &State) {
+  DispatchNavTarget Result;
+  if (!State.Dispatch.Enabled || Offset > Text.size())
+    return Result;
+
+  size_t Start = Offset;
+  while (Start > 0 && navIdentChar(Text[Start - 1]))
+    --Start;
+  size_t End = Offset;
+  while (End < Text.size() && navIdentChar(Text[End]))
+    ++End;
+  if (Start == End)
+    return Result;
+
+  StringRef Ident = Text.slice(Start, End);
+  StringRef Affix(State.Dispatch.Affix);
+  bool AffixIsIdent = dispatchAffixIsIdent(State.Dispatch);
+  bool IsDispatch = false;
+  if (State.Dispatch.Style == DispatchStyle::Prefix) {
+    if (AffixIsIdent)
+      IsDispatch = Affix.size() < Ident.size() && Ident.starts_with(Affix);
+    else
+      IsDispatch = Start >= Affix.size() &&
+                   Text.substr(Start - Affix.size(), Affix.size()) == Affix;
+  } else {
+    if (AffixIsIdent)
+      IsDispatch = Affix.size() < Ident.size() && Ident.ends_with(Affix);
+    else
+      IsDispatch = Text.substr(End).starts_with(Affix);
+  }
+  if (!IsDispatch)
+    return Result;
+
+  if (AffixIsIdent)
+    Ident = State.Dispatch.Style == DispatchStyle::Prefix
+                ? Ident.drop_front(Affix.size())
+                : Ident.drop_back(Affix.size());
+
+  for (const auto &Owned : State.Registry.templates()) {
+    const TemplateDef *Def = Owned.get();
+    if (!Def || !Def->DispatchEnabled ||
+        Def->Kind != TemplateKind::Type || Def->Name.empty())
+      continue;
+    StringRef Call = Def->Name;
+    if (!Ident.starts_with(Call) || Ident.size() <= Call.size() ||
+        Ident[Call.size()] != '_')
+      continue;
+    StringRef Op = Ident.drop_front(Call.size() + 1);
+    if (!navIdent(Op) || (Result.Template &&
+                          Def->Name.size() <= Result.Template->Name.size()))
+      continue;
+    Result.Template = Def;
+    Result.Op = Op.str();
+  }
+  return Result;
+}
+
 class Listener final : public FeatureModule::ASTListener {
 public:
   explicit Listener(std::shared_ptr<SharedState> State)
@@ -1413,10 +1503,90 @@ public:
                      &AutotmplModule::onDidChange);
     wrapNotification(Bind, "textDocument/didClose",
                      &AutotmplModule::onDidClose);
+    wrapMethod(Bind, "textDocument/definition");
   }
 
 private:
   using Notification = llvm::unique_function<void(llvm::json::Value)>;
+  using Method = llvm::unique_function<void(llvm::json::Value,
+                                            Callback<llvm::json::Value>)>;
+
+  void wrapMethod(LSPBinder &Bind, llvm::StringLiteral MethodName) {
+    auto It = Bind.Raw.MethodHandlers.find(MethodName);
+    if (It == Bind.Raw.MethodHandlers.end())
+      return;
+    Method Original = std::move(It->second);
+    Bind.Raw.MethodHandlers[MethodName] =
+        [this, Original = std::move(Original)](
+            llvm::json::Value Raw, Callback<llvm::json::Value> Reply) mutable {
+          if (goToTemplateFunction(Raw, std::move(Reply)))
+            return;
+          if (Original)
+            Original(std::move(Raw), std::move(Reply));
+          else
+            Reply(nullptr);
+        };
+  }
+
+  /// Native clangd go-to-def lands on the generated `#define`. For a c-autotmpl
+  /// dispatch call we answer with the template header operation instead.
+  bool goToTemplateFunction(llvm::json::Value &Raw,
+                            Callback<llvm::json::Value> Reply) {
+    TextDocumentPositionParams Params;
+    llvm::json::Path::Root Root;
+    if (!fromJSON(Raw, Params, Root))
+      return false;
+
+    StringRef MainFile = Params.textDocument.uri.file();
+    if (MainFile.empty())
+      return false;
+    State->ensureScanned(MainFile);
+
+    std::string Text = State->openText(MainFile);
+    if (Text.empty()) {
+      auto Buffer = MemoryBuffer::getFile(MainFile, /*IsText=*/true);
+      if (!Buffer)
+        return false;
+      Text = (*Buffer)->getBuffer().str();
+    }
+    auto Offset = positionToOffset(Text, Params.position);
+    if (!Offset) {
+      consumeError(Offset.takeError());
+      return false;
+    }
+
+    DispatchNavTarget Target =
+        dispatchTargetAt(Text, *Offset, *State);
+    if (!Target.Template)
+      return false;
+
+    auto HeaderBuffer =
+        MemoryBuffer::getFile(Target.Template->Header, /*IsText=*/true);
+    if (!HeaderBuffer)
+      return false;
+    StringRef HeaderText = (*HeaderBuffer)->getBuffer();
+    unsigned HeaderOffset = 0;
+    if (auto It = Target.Template->DispatchOpOffsets.find(Target.Op);
+        It != Target.Template->DispatchOpOffsets.end())
+      HeaderOffset = It->second;
+    else if (size_t Found = HeaderText.find(Target.Op);
+             Found != StringRef::npos)
+      HeaderOffset = static_cast<unsigned>(Found);
+    else if (size_t Found = HeaderText.find(Target.Template->Name);
+             Found != StringRef::npos)
+      HeaderOffset = static_cast<unsigned>(Found);
+    if (HeaderOffset >= HeaderText.size())
+      HeaderOffset = 0;
+
+    Location Loc;
+    Loc.uri = URIForFile::canonicalize(Target.Template->Header, MainFile);
+    Loc.range.start = offsetToPosition(HeaderText, HeaderOffset);
+    Loc.range.end = Loc.range.start;
+    llvm::json::Array Result;
+    Result.push_back(toJSON(Loc));
+    Reply(std::move(Result));
+    return true;
+  }
 
   void wrapNotification(LSPBinder &Bind, llvm::StringLiteral Method,
                         void (AutotmplModule::*Handler)(llvm::json::Value &)) {

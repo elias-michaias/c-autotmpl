@@ -16,6 +16,7 @@ LSP session. The plugin must:
 
 import json
 import os
+import select
 import shutil
 import subprocess
 import sys
@@ -31,6 +32,33 @@ def send(proc, message):
     proc.stdin.flush()
 
 
+def receive_response(proc, wanted_id, timeout=15):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not select.select([proc.stdout], [], [], 0.2)[0]:
+            continue
+        headers = {}
+        while True:
+            line = proc.stdout.readline()
+            if not line:
+                return None
+            if line in (b"\r\n", b"\n"):
+                break
+            key, _, value = line.decode("utf-8", "replace").partition(":")
+            headers[key.strip().lower()] = value.strip()
+        length = int(headers.get("content-length", "0"))
+        body = b""
+        while len(body) < length:
+            chunk = proc.stdout.read(length - len(body))
+            if not chunk:
+                return None
+            body += chunk
+        message = json.loads(body)
+        if message.get("id") == wanted_id:
+            return message
+    return None
+
+
 def write(path, text):
     with open(path, "w") as f:
         f.write(text)
@@ -42,6 +70,8 @@ CONFIG_KEYS = (
     "C_AUTOTMPL_STC_AUTO",
     "C_AUTOTMPL_DISPATCH",
     "C_AUTOTMPL_DISPATCH_BACKEND",
+    "C_AUTOTMPL_DISPATCH_STYLE",
+    "C_AUTOTMPL_DISPATCH_AFFIX",
     "C_AUTOTMPL_DISPATCH_SUFFIX",
     "C_AUTOTMPL_DISPATCH_TEMPLATES",
 )
@@ -162,13 +192,14 @@ static inline void vec_int_set(int x, i_type v) { v.value = x; }
 
 int main(void) {
   vec(int) v = {0};
-  vec_push$(&v, 7);
-  vec_set$(7, v);
+  $vec_push(&v, 7);
+  $vec_set(7, v);
   return v.value == 7 ? 0 : 1;
 }
 """
         generated = os.path.join(root, "gen", "vec.h")
         log_path = os.path.join(root, "clangd.log")
+        uri = "file://" + source
         write(os.path.join(root, "autotmpl.conf"), """\
 # project settings
 profile=stc
@@ -181,7 +212,7 @@ dispatch=1
         with open(log_path, "wb") as log:
             proc = subprocess.Popen(
                 ["clangd", "--log=verbose", "--load=" + plugin],
-                cwd=root, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=log, env=env,
             )
             try:
@@ -210,8 +241,8 @@ dispatch=1
                 content = wait_for_content(generated, lambda c: (
                     "/* c-autotmpl dispatch begin vec */" in c and
                     "#ifdef C_AUTOTMPL_vec_int" in c and
-                    "#define vec_push$(...)" in c and
-                    "#define vec_set$(...)" in c
+                    "#define $vec_push(...)" in c and
+                    "#define $vec_set(...)" in c
                 ))
                 if content is None:
                     print("plugin dispatch was not generated", file=sys.stderr)
@@ -221,6 +252,27 @@ dispatch=1
                 if "/* c-autotmpl dispatch begin vec_push */" in content:
                     print("plugin scanned a dispatch macro as a type",
                           file=sys.stderr)
+                    return 1
+
+                send(proc, {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "textDocument/definition",
+                    "params": {
+                        "textDocument": {"uri": uri},
+                        "position": {"line": 4, "character": 3},
+                    },
+                })
+                response = receive_response(proc, 3)
+                locations = response.get("result") if response else None
+                if (not locations or len(locations) != 1 or
+                        not locations[0]["uri"].endswith("tmpl/vec.h") or
+                        locations[0]["range"]["start"]["line"] != 5):
+                    print("plugin did not map dispatch macro to template "
+                          "function", file=sys.stderr)
+                    print(response, file=sys.stderr)
+                    with open(log_path, errors="replace") as f:
+                        print(f.read()[-4000:], file=sys.stderr)
                     return 1
 
                 send(proc, {

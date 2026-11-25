@@ -25,13 +25,15 @@ enum class ArgRole { Type, Name, Flags, Opaque, Key, Value };
 enum class TemplatePreset { None, StcStatic, StcShared };
 
 enum class DispatchBackend { Generic, Builtin };
+enum class DispatchStyle { Prefix, Postfix };
 
 /// Configuration for generated method-dispatch macros. Values come from
 /// autotmpl.conf, then C_AUTOTMPL_* environment variables.
 struct DispatchConfig {
   bool Enabled = false;
   DispatchBackend Backend = DispatchBackend::Generic;
-  std::string Suffix = "$";
+  DispatchStyle Style = DispatchStyle::Prefix;
+  std::string Affix = "$";
   llvm::SmallVector<std::string, 2> Templates;
 };
 
@@ -66,6 +68,7 @@ struct TemplateDef {
   TemplatePreset Preset = TemplatePreset::None;
   llvm::SmallVector<ArgSpec, 2> ArgSpecs;      // empty means legacy behavior
   llvm::StringSet<> DispatchOps;                // method-like operation names
+  llvm::StringMap<unsigned> DispatchOpOffsets;  // declaration offsets in Header
   bool DispatchEnabled = false;
 };
 
