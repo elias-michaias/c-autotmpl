@@ -395,6 +395,7 @@ struct SharedState {
   TemplateRegistry Registry;
   TypeIndex Types;
   Instantiator Inst;
+  DispatchConfig Dispatch;
 
   std::mutex ScanMutex;
   std::atomic<bool> Scanned{false};
@@ -446,6 +447,16 @@ struct SharedState {
     for (const std::string &Name : Config.Templates)
       Names.push_back(Name);
     Registry.applyPreset(Config.Preset, Names, Config.Auto);
+    Dispatch = resolveDispatch();
+    setDispatchSuffix(Dispatch.Suffix);
+    Registry.applyDispatch(Dispatch);
+    if (Dispatch.Enabled) {
+      std::string Msg = "dispatch=1 backend=";
+      Msg += Dispatch.Backend == DispatchBackend::Builtin ? "builtin"
+                                                          : "generic";
+      Msg += " suffix=" + Dispatch.Suffix;
+      log(Msg);
+    }
     if (!ProfileName.empty())
       log("using profile " + ProfileName);
     if (!Config.Templates.empty()) {
@@ -905,6 +916,84 @@ struct SharedState {
         Chain.push_back(&Usages[J]);
       generateChain(Chain, CI, nullptr, AdapterOps);
     }
+    generateDispatch(Usages, AdapterOps);
+  }
+
+  struct DispatchGroup {
+    const TemplateDef *Template;
+    std::string Output;
+    llvm::SmallVector<DispatchCase, 2> Cases;
+  };
+
+  static DispatchGroup *findDispatchGroup(
+      llvm::SmallVectorImpl<DispatchGroup> &Groups, const TemplateDef *Template,
+      StringRef Output) {
+    for (DispatchGroup &Group : Groups)
+      if (Group.Template == Template && Group.Output == Output)
+        return &Group;
+    return nullptr;
+  }
+
+  void addDispatchCase(llvm::SmallVectorImpl<DispatchGroup> &Groups,
+                       StringRef Output, const FoundUsage &Usage) {
+    const TemplateDef *Template = Usage.Template;
+    if (!Template || Template->Kind != TemplateKind::Type)
+      return;
+    DispatchGroup *Group = findDispatchGroup(Groups, Template, Output);
+    if (!Group) {
+      Groups.push_back({Template, Output.str(), {}});
+      Group = &Groups.back();
+    }
+    for (const DispatchCase &Case : Group->Cases)
+      if (Case.Type == Usage.TypeSpelling)
+        return;
+    Group->Cases.push_back(
+        {Usage.TypeSpelling, dispatchContainerName(*Template, Usage.Args)});
+  }
+
+  /// Rewrites every dispatch section from scratch so added specializations,
+  /// removed specializations, and env changes all stay in sync with the
+  /// current source scan.
+  void generateDispatch(ArrayRef<FoundUsage> Usages,
+                        const llvm::StringMap<llvm::StringSet<>> &AdapterOps =
+                            {}) {
+    llvm::SmallVector<DispatchGroup, 4> Groups;
+    for (const auto &Owned : Registry.templates()) {
+      const TemplateDef *Template = Owned.get();
+      if (Template->Kind == TemplateKind::Type)
+        Groups.push_back({Template, Template->GeneratedHeader, {}});
+    }
+    for (const FoundUsage &Usage : Usages)
+      addDispatchCase(Groups, Usage.Template->GeneratedHeader, Usage);
+    for (size_t I = 0; I < Usages.size(); ++I) {
+      if (Usages[I].IsNested)
+        continue;
+      size_t Begin = I;
+      while (Begin > 0 && Usages[Begin - 1].IsNested)
+        --Begin;
+      StringRef Output = Usages[I].Template->GeneratedHeader;
+      for (size_t J = Begin; J <= I; ++J)
+        addDispatchCase(Groups, Output, Usages[J]);
+    }
+
+    for (const DispatchGroup &Group : Groups) {
+      SmallVector<StringRef, 4> Ops;
+      llvm::StringSet<> SeenOps;
+      for (const auto &Entry : Group.Template->DispatchOps) {
+        if (SeenOps.insert(Entry.getKey()).second)
+          Ops.push_back(Entry.getKey());
+      }
+      auto It = AdapterOps.find(Group.Template->Name);
+      if (It != AdapterOps.end())
+        for (const auto &Entry : It->second)
+          if (SeenOps.insert(Entry.getKey()).second)
+            Ops.push_back(Entry.getKey());
+      std::string Error;
+      Inst.ensureDispatch(*Group.Template, Group.Cases, Ops, Dispatch,
+                          Group.Output, Error);
+      if (!Error.empty())
+        log(std::string("failed dispatch: ") + Error);
+    }
   }
 
   bool generateChain(ArrayRef<const FoundUsage *> Chain,
@@ -1247,6 +1336,7 @@ public:
 
     std::string GenPath;
     State->generateChain(Chain, CI, &GenPath);
+    State->generateDispatch(Usages);
     State->generateImplUsages(Usages, CI);
     State->writeImplMakefile();
     bool IncludePresent = sourceIncludesGeneratedHeader(SM, GenPath);

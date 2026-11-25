@@ -54,6 +54,8 @@ Without either, output is unchanged. Configuration can live in an
 ```make
 -include autotmpl.env
 export C_AUTOTMPL_PROFILE C_AUTOTMPL_STC_TEMPLATES C_AUTOTMPL_STC_AUTO
+export C_AUTOTMPL_DISPATCH C_AUTOTMPL_DISPATCH_BACKEND
+export C_AUTOTMPL_DISPATCH_SUFFIX C_AUTOTMPL_DISPATCH_TEMPLATES
 ```
 
 ```text
@@ -67,6 +69,10 @@ C_AUTOTMPL_STC_AUTO=1
 | `C_AUTOTMPL_PROFILE` | Select an opt-in profile, such as `stc`. |
 | `C_AUTOTMPL_STC_TEMPLATES` | Comma-separated STC template names, such as `vec,hashmap`. |
 | `C_AUTOTMPL_STC_AUTO=1` | Detect STC wrappers from template-header contents. |
+| `C_AUTOTMPL_DISPATCH=1` | Generate method-like dispatch macros. |
+| `C_AUTOTMPL_DISPATCH_BACKEND` | Select `generic` (`_Generic`, default) or `builtin` (GCC/Clang builtins). |
+| `C_AUTOTMPL_DISPATCH_SUFFIX` | Set the macro suffix, default `$`. |
+| `C_AUTOTMPL_DISPATCH_TEMPLATES` | Comma-separated templates that get dispatch, such as `vec,list`. |
 | `C_AUTOTMPL_TIMING=1` | Log plugin phase timings. |
 
 CLI flags take precedence over environment variables. `--profile none` wins over
@@ -394,6 +400,48 @@ A wrapper that declares `Name` or `Flags` keeps the advanced explicit form, wher
 those values map to `i_type` and `i_traits`. `--profile stc-shared` maps
 `TMPL_HEADER` to `i_header` in public blocks and `i_implement` in grouped
 implementation sources.
+
+## Generated dispatch macros
+
+Set `C_AUTOTMPL_DISPATCH=1` to emit method-like macros such as `vec_push$`. An
+operation is eligible when a template header declares it with a pointer to the
+container as the first argument, or when a source uses
+`vec_push(int)(...)`. Helper functions without that container argument are
+ignored. Cases come only from tracked instantiations. Each case is guarded by
+its presence macro, so the header never names a type whose instantiation header
+was not included.
+
+```c
+/* tmpl/vec.h */
+// -- template vec(T)
+#define vec(T) vec_##T
+typedef struct { i_key value; } i_type;
+static inline void vec_int_push(i_type *v, int x) { v->value = x; }
+```
+
+```c
+/* src/main.c */
+#include "gen/vec.h"
+
+int main(void) {
+  vec(int) nums = {0};
+  vec_push$(&nums, 7);
+  return nums.value == 7 ? 0 : 1;
+}
+```
+
+```sh
+C_AUTOTMPL_PROFILE=stc C_AUTOTMPL_STC_TEMPLATES=vec C_AUTOTMPL_DISPATCH=1 \
+  autotmpl --root . src
+cc -I. -std=c11 -Wall -Wextra -Werror src/main.c -o demo
+```
+
+The default backend is `_Generic` and needs C11. Set
+`C_AUTOTMPL_DISPATCH_BACKEND=builtin` for the GCC/Clang builtin form, which also
+works in C99. The default suffix `$` is accepted by GCC and Clang; set
+`C_AUTOTMPL_DISPATCH_SUFFIX=_method` if you prefer an identifier suffix. Without
+`C_AUTOTMPL_DISPATCH_TEMPLATES`, every eligible type template gets dispatch
+macros. The plugin rereads its environment only on clangd restart.
 
 ## Generated files
 

@@ -40,6 +40,10 @@ CONFIG_KEYS = (
     "C_AUTOTMPL_PROFILE",
     "C_AUTOTMPL_STC_TEMPLATES",
     "C_AUTOTMPL_STC_AUTO",
+    "C_AUTOTMPL_DISPATCH",
+    "C_AUTOTMPL_DISPATCH_BACKEND",
+    "C_AUTOTMPL_DISPATCH_SUFFIX",
+    "C_AUTOTMPL_DISPATCH_TEMPLATES",
 )
 
 
@@ -137,6 +141,112 @@ def no_template_errors(diags):
     return True
 
 
+def check_dispatch(plugin):
+    root = tempfile.mkdtemp(prefix="c-autotmpl-lsp-dispatch-")
+    try:
+        os.makedirs(os.path.join(root, "tmpl"))
+        os.makedirs(os.path.join(root, "gen"))
+        write(os.path.join(root, "tmpl", "vec.h"), """\
+// -- template vec(T)
+#define VEC_CAT_I(A, B) A##B
+#define VEC_CAT(A, B) VEC_CAT_I(A, B)
+#define vec(T) VEC_CAT(vec_, T)
+typedef struct { i_key value; } i_type;
+static inline void vec_int_push(i_type *v, int x) { v->value = x; }
+""")
+        source = os.path.join(root, "main.c")
+        write(source, "int main(void) { return 0; }\n")
+        text = """\
+#include "gen/vec.h"
+
+int main(void) {
+  vec(int) v = {0};
+  vec_push$(&v, 7);
+  return v.value == 7 ? 0 : 1;
+}
+"""
+        generated = os.path.join(root, "gen", "vec.h")
+        log_path = os.path.join(root, "clangd.log")
+        env = plugin_env(C_AUTOTMPL_PROFILE="stc",
+                         C_AUTOTMPL_STC_TEMPLATES="vec",
+                         C_AUTOTMPL_DISPATCH="1")
+        with open(log_path, "wb") as log:
+            proc = subprocess.Popen(
+                ["clangd", "--log=verbose", "--load=" + plugin],
+                cwd=root, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                stderr=log, env=env,
+            )
+            try:
+                send(proc, {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "processId": None,
+                        "rootUri": "file://" + root,
+                        "capabilities": {},
+                    },
+                })
+                send(proc, {"jsonrpc": "2.0", "method": "initialized",
+                            "params": {}})
+                send(proc, {
+                    "jsonrpc": "2.0",
+                    "method": "textDocument/didOpen",
+                    "params": {"textDocument": {
+                        "uri": "file://" + source,
+                        "languageId": "c",
+                        "version": 1,
+                        "text": text,
+                    }},
+                })
+                content = wait_for_content(generated, lambda c: (
+                    "/* c-autotmpl dispatch begin vec */" in c and
+                    "#ifdef C_AUTOTMPL_vec_int" in c and
+                    "#define vec_push$(self, ...)" in c
+                ))
+                if content is None:
+                    print("plugin dispatch was not generated", file=sys.stderr)
+                    with open(log_path, errors="replace") as f:
+                        print(f.read()[-4000:], file=sys.stderr)
+                    return 1
+                if "/* c-autotmpl dispatch begin vec_push */" in content:
+                    print("plugin scanned a dispatch macro as a type",
+                          file=sys.stderr)
+                    return 1
+
+                send(proc, {
+                    "jsonrpc": "2.0",
+                    "method": "textDocument/didChange",
+                    "params": {
+                        "textDocument": {"uri": "file://" + source,
+                                         "version": 2},
+                        "contentChanges": [{"text":
+                                            "int main(void) { return 0; }\n"}],
+                    },
+                })
+                content = wait_for_content(generated, lambda c: (
+                    "dispatch begin" not in c and
+                    "/* c-autotmpl: vec(int) */" not in c
+                ))
+                if content is None:
+                    print("plugin dispatch was not pruned", file=sys.stderr)
+                    with open(log_path, errors="replace") as f:
+                        print(f.read()[-4000:], file=sys.stderr)
+                    return 1
+            finally:
+                try:
+                    send(proc, {"jsonrpc": "2.0", "id": 2,
+                                "method": "shutdown", "params": None})
+                    send(proc, {"jsonrpc": "2.0", "method": "exit",
+                                "params": None})
+                    proc.wait(timeout=5)
+                except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
+                    proc.kill()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return 0
+
+
 def check_auto_config(plugin):
     root = tempfile.mkdtemp(prefix="c-autotmpl-lsp-auto-")
     try:
@@ -148,7 +258,7 @@ def check_auto_config(plugin):
 #define VEC_CAT(A, B) VEC_CAT_I(A, B)
 #define vec(T) VEC_CAT(vec_, T)
 typedef struct { i_key value; } i_type;
-static inline void vec_int_push(vec(int) *v, int x) { v->value = x; }
+static inline void vec_int_push(i_type *v, int x) { v->value = x; }
 """)
         source = os.path.join(root, "main.c")
         write(source, "int main(void) { return 0; }\n")
@@ -227,6 +337,8 @@ def main():
         print("plugin not found: " + plugin, file=sys.stderr)
         return 1
     if check_auto_config(plugin) != 0:
+        return 1
+    if check_dispatch(plugin) != 0:
         return 1
 
     root = tempfile.mkdtemp(prefix="c-autotmpl-lsp-")

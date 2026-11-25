@@ -17,6 +17,10 @@ CONFIG_KEYS = (
     "C_AUTOTMPL_PROFILE",
     "C_AUTOTMPL_STC_TEMPLATES",
     "C_AUTOTMPL_STC_AUTO",
+    "C_AUTOTMPL_DISPATCH",
+    "C_AUTOTMPL_DISPATCH_BACKEND",
+    "C_AUTOTMPL_DISPATCH_SUFFIX",
+    "C_AUTOTMPL_DISPATCH_TEMPLATES",
 )
 
 
@@ -341,6 +345,184 @@ int main(void) {
         shutil.rmtree(root, ignore_errors=True)
 
 
+def check_dispatch(cli):
+    root = tempfile.mkdtemp(prefix="c-autotmpl-dispatch-")
+    try:
+        os.makedirs(os.path.join(root, "tmpl"))
+        os.makedirs(os.path.join(root, "gen"))
+        write(os.path.join(root, "tmpl", "vec.h"), """\
+// -- template vec(T)
+#define VEC_CAT_I(A, B) A##B
+#define VEC_CAT(A, B) VEC_CAT_I(A, B)
+#define vec(T) VEC_CAT(vec_, T)
+#define VEC_FN_II(A, B) A##B
+#define VEC_FN_I(A, B) VEC_FN_II(A, B)
+#define VEC_FN(A, B) VEC_FN_I(A, B)
+typedef struct { i_key value; } i_type;
+static inline void vec_int_push(vec(int) *v, int x) { v->value = x; }
+static inline void VEC_FN(i_type, _clear)(i_type *v) { v->value = 0; }
+static inline int vec_int_size(vec(int) *v) { (void)v; return 1; }
+static inline int helper(int x) { return x; }
+""")
+        source = os.path.join(root, "main.c")
+        write(source, """\
+#include "gen/vec.h"
+
+int main(void) {
+  vec(int) v = {0};
+  vec_push$(&v, 7);
+  vec_clear$(&v);
+  return (vec_size$(&v) == 1 && v.value == 0) ? 0 : 1;
+}
+""")
+        generated = os.path.join(root, "gen", "vec.h")
+        env = env_with(C_AUTOTMPL_PROFILE="stc",
+                       C_AUTOTMPL_STC_TEMPLATES="vec",
+                       C_AUTOTMPL_DISPATCH="1")
+        args = [cli, "--root", root, "--verbose", source]
+        proc = subprocess.run(args, cwd=root, capture_output=True, text=True,
+                              env=env)
+        output = proc.stdout + proc.stderr
+        require(proc.returncode == 0, "dispatch run exited with error", output)
+        for needle in ("dispatch=1", "dispatch backend=generic",
+                       "dispatch suffix=$", "generated vec(int)"):
+            require(needle in output, "missing dispatch report: " + needle,
+                    output)
+
+        with open(generated) as f:
+            content = f.read()
+        for needle in ("/* c-autotmpl dispatch begin vec */",
+                       "/* c-autotmpl dispatch end vec */",
+                       "#ifdef C_AUTOTMPL_vec_int",
+                       "vec_int: vec_int_push",
+                       "vec_int: vec_int_clear",
+                       "vec_int: vec_int_size",
+                       "#define vec_push$(self, ...)",
+                       "#define vec_clear$(self, ...)",
+                       "#define vec_size$(self, ...)"):
+            require(needle in content, "missing dispatch text: " + needle,
+                    content)
+        require("helper" not in content,
+                "ordinary helper was treated as a dispatch operation",
+                content)
+        require("c-autotmpl dispatch begin vec_push" not in content,
+                "dispatch macro call was scanned as a mangled type", content)
+
+        compiler = os.environ.get("CC") or next(
+            (name for name in ("cc", "gcc", "clang") if shutil.which(name)),
+            None,
+        )
+        if compiler:
+            built = subprocess.run(
+                [compiler, "-std=c11", "-Wall", "-Wextra", "-Werror",
+                 "main.c", "-o", "dispatch-demo"],
+                cwd=root, capture_output=True, text=True,
+            )
+            build_output = built.stdout + built.stderr
+            require(built.returncode == 0, "dispatch output did not compile",
+                    build_output)
+            ran = subprocess.run([os.path.join(root, "dispatch-demo")],
+                                 cwd=root)
+            require(ran.returncode == 0, "dispatch output did not run")
+
+        rerun = subprocess.run(args, cwd=root, capture_output=True, text=True,
+                               env=env)
+        output = rerun.stdout + rerun.stderr
+        require(rerun.returncode == 0 and "added=0" in output,
+                "dispatch output was not idempotent", output)
+        with open(generated) as f:
+            content = f.read()
+        require(content.count("/* c-autotmpl dispatch begin vec */") == 1,
+                "dispatch section was duplicated", content)
+
+        os.remove(generated)
+        builtin_env = dict(env)
+        builtin_env["C_AUTOTMPL_DISPATCH_BACKEND"] = "builtin"
+        proc = subprocess.run(args, cwd=root, capture_output=True, text=True,
+                              env=builtin_env)
+        output = proc.stdout + proc.stderr
+        require(proc.returncode == 0 and "dispatch backend=builtin" in output,
+                "builtin dispatch backend was not selected", output)
+        with open(generated) as f:
+            content = f.read()
+        require("__builtin_types_compatible_p(__typeof__(*(self)), vec_int)"
+                in content and "__builtin_choose_expr" in content,
+                "builtin dispatch selectors were not generated", content)
+        if compiler:
+            built = subprocess.run(
+                [compiler, "-std=c99", "-Wall", "-Wextra", "-Werror",
+                 "main.c", "-o", "builtin-demo"],
+                cwd=root, capture_output=True, text=True,
+            )
+            require(built.returncode == 0,
+                    "builtin dispatch output did not compile",
+                    built.stdout + built.stderr)
+
+        os.remove(generated)
+        write(source, """\
+#include "gen/vec.h"
+
+int main(void) {
+  vec(int) v = {0};
+  vec_push_dispatch(&v, 7);
+  return v.value == 7 ? 0 : 1;
+}
+""")
+        suffix_env = dict(env)
+        suffix_env["C_AUTOTMPL_DISPATCH_SUFFIX"] = "_dispatch"
+        suffix_env["C_AUTOTMPL_DISPATCH_TEMPLATES"] = "box"
+        proc = subprocess.run(args, cwd=root, capture_output=True, text=True,
+                              env=suffix_env)
+        require(proc.returncode == 0, "filtered dispatch run exited with error",
+                proc.stdout + proc.stderr)
+        with open(generated) as f:
+            content = f.read()
+        require("dispatch begin" not in content,
+                "template filter did not disable dispatch", content)
+
+        suffix_env["C_AUTOTMPL_DISPATCH_TEMPLATES"] = "vec"
+        proc = subprocess.run(args, cwd=root, capture_output=True, text=True,
+                              env=suffix_env)
+        output = proc.stdout + proc.stderr
+        require(proc.returncode == 0 and "dispatch templates=1" in output,
+                "custom dispatch suffix run exited with error", output)
+        with open(generated) as f:
+            content = f.read()
+        require("#define vec_push_dispatch(self, ...)" in content and
+                "#define vec_push$(self, ...)" not in content,
+                "custom dispatch suffix was not used", content)
+        if compiler:
+            built = subprocess.run(
+                [compiler, "-std=c11", "-Wall", "-Wextra", "-Werror",
+                 "main.c", "-o", "suffix-demo"],
+                cwd=root, capture_output=True, text=True,
+            )
+            require(built.returncode == 0,
+                    "custom suffix dispatch output did not compile",
+                    built.stdout + built.stderr)
+
+        os.remove(generated)
+        write(source, """\
+#include "gen/vec.h"
+
+int main(void) {
+  vec(int) v = {0};
+  return v.value == 0 ? 0 : 1;
+}
+""")
+        proc = subprocess.run(args, cwd=root, capture_output=True, text=True,
+                              env=env_with(C_AUTOTMPL_PROFILE="stc",
+                                           C_AUTOTMPL_STC_TEMPLATES="vec"))
+        require(proc.returncode == 0, "default dispatch run exited with error",
+                proc.stdout + proc.stderr)
+        with open(generated) as f:
+            content = f.read()
+        require("dispatch begin" not in content,
+                "dispatch was enabled without opt-in", content)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main():
     cli = os.path.abspath(
         sys.argv[1] if len(sys.argv) > 1 else "build/autotmpl"
@@ -353,6 +535,7 @@ def main():
         check_stc_profile(cli, mode)
     check_unprefixed_stc(cli)
     check_stc_auto(cli)
+    check_dispatch(cli)
 
     root = tempfile.mkdtemp(prefix="c-autotmpl-standalone-")
     try:

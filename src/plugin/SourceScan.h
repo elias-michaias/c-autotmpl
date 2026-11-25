@@ -70,6 +70,10 @@ void scanTemplateUsage(const TemplateDef &Template, llvm::StringRef RawType,
 void scanUsages(llvm::StringRef Code, const TemplateRegistry &Registry,
                 llvm::SmallVectorImpl<FoundUsage> &Out);
 
+/// Suffix used by generated dispatch macros. Calls to `name$op_suffix(...)` are
+/// ignored by the usage scanner so they do not look like mangled types.
+void setDispatchSuffix(llvm::StringRef Suffix);
+
 llvm::StringRef lastIdentifier(llvm::StringRef Spelling);
 bool isBuiltinTypeName(llvm::StringRef Name);
 bool needsIncludeGuard(llvm::StringRef TypeSpelling);

@@ -1,11 +1,14 @@
 #include "TemplateRegistry.h"
+#include "SourceScan.h"
 
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/Process.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <algorithm>
 #include <cctype>
 #include <tuple>
 
@@ -26,6 +29,152 @@ bool isIdentChar(char C) {
 bool isSpace(char C) {
   return C == ' ' || C == '\t' || C == '\r' || C == '\n' || C == '\f' ||
          C == '\v';
+}
+
+std::string normalMacroName(StringRef S) {
+  std::string Out;
+  for (char C : S)
+    if (isIdentChar(C))
+      Out.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(C))));
+  return Out;
+}
+
+size_t matchingParen(StringRef S, size_t Open) {
+  int Depth = 0;
+  for (size_t I = Open; I < S.size(); ++I) {
+    if (S[I] == '(')
+      ++Depth;
+    else if (S[I] == ')') {
+      if (--Depth == 0)
+        return I;
+    }
+  }
+  return S.size();
+}
+
+bool firstParamIsContainer(StringRef S, size_t Begin, size_t End,
+                           const TemplateDef &Template) {
+  StringRef Param = S.substr(Begin, End - Begin).trim();
+  if (Param.find('*') == StringRef::npos)
+    return false;
+  std::string Call = Template.Name + "(";
+  std::string Mangled = Template.Name + "_";
+  return Param.contains("i_type") || Param.contains(Call) ||
+         Param.contains(Mangled);
+}
+
+/// Finds method-shaped associated operations in a template header. A direct
+/// declaration such as vec_int_push(vec(int) *, ...) and a paste macro such as
+/// VEC_FN(i_type, _push)(i_type *, ...) both contribute `push`.
+void collectDispatchOps(StringRef Content, TemplateDef &Out) {
+  if (Out.Kind != TemplateKind::Type || Out.Name.empty())
+    return;
+  std::string Cleaned = stripCommentsAndLiterals(Content);
+  StringRef Clean(Cleaned);
+  std::string NormTemplate = normalMacroName(Out.Name);
+  bool LineStart = true;
+  for (size_t I = 0; I < Clean.size();) {
+    size_t LinePos = I;
+    while (LinePos < Clean.size() &&
+           (Clean[LinePos] == ' ' || Clean[LinePos] == '\t'))
+      ++LinePos;
+    if (LineStart && LinePos < Clean.size() && Clean[LinePos] == '#') {
+      bool Continued;
+      do {
+        size_t End = Clean.find('\n', I);
+        if (End == StringRef::npos)
+          End = Clean.size();
+        Continued = End > I && Clean[End - 1] == '\\';
+        I = End < Clean.size() ? End + 1 : End;
+        LineStart = true;
+      } while (Continued && I < Clean.size());
+      continue;
+    }
+    if (!isIdentStart(Clean[I])) {
+      LineStart = Clean[I] == '\n';
+      ++I;
+      continue;
+    }
+    LineStart = false;
+    size_t End = I + 1;
+    while (End < Clean.size() && isIdentChar(Clean[End]))
+      ++End;
+    StringRef Ident = Clean.slice(I, End);
+    size_t After = End;
+    while (After < Clean.size() && isSpace(Clean[After]))
+      ++After;
+    if (After < Clean.size() && Clean[After] == '(') {
+      size_t Close = matchingParen(Clean, After);
+      if (Close < Clean.size()) {
+        size_t AfterMacro = Close + 1;
+        while (AfterMacro < Clean.size() && isSpace(Clean[AfterMacro]))
+          ++AfterMacro;
+        if (AfterMacro < Clean.size() && Clean[AfterMacro] == '(') {
+          size_t CallClose = matchingParen(Clean, AfterMacro);
+          std::string NormIdent = normalMacroName(Ident);
+          if (CallClose < Clean.size() && NormIdent.find(NormTemplate) !=
+                                               std::string::npos) {
+            size_t ArgBegin = After + 1;
+            size_t LastBegin = ArgBegin;
+            int Depth = 0;
+            for (size_t K = ArgBegin; K < Close; ++K) {
+              if (Clean[K] == '(' || Clean[K] == '[')
+                ++Depth;
+              else if (Clean[K] == ')' || Clean[K] == ']')
+                --Depth;
+              else if (Clean[K] == ',' && Depth == 0)
+                LastBegin = K + 1;
+            }
+            StringRef First = Clean.substr(ArgBegin, Close - ArgBegin).trim();
+            StringRef Last = Clean.substr(LastBegin, Close - LastBegin).trim();
+            if (Last.starts_with("_") && Last.size() > 1 &&
+                isIdentStart(Last[1])) {
+              bool Valid = true;
+              for (size_t K = 1; K < Last.size(); ++K)
+                if (!isIdentChar(Last[K]))
+                  Valid = false;
+              if (Valid && firstParamIsContainer(Clean, AfterMacro + 1,
+                                                 CallClose, Out))
+                Out.DispatchOps.insert(Last.drop_front().str());
+            }
+            (void)First;
+          }
+        }
+        if (Ident.starts_with(Out.Name) && Ident.size() > Out.Name.size() &&
+            Ident[Out.Name.size()] == '_') {
+          StringRef Tail = Ident.drop_front(Out.Name.size() + 1);
+          size_t Under = Tail.rfind('_');
+          if (Under != StringRef::npos && Under != 0 &&
+              Under + 1 < Tail.size()) {
+            StringRef Op = Tail.drop_front(Under + 1);
+            bool Valid = true;
+            for (char C : Op)
+              if (!isIdentChar(C))
+                Valid = false;
+            if (Valid &&
+                firstParamIsContainer(Clean, After + 1, Close, Out))
+              Out.DispatchOps.insert(Op.str());
+          }
+        }
+      }
+    }
+    I = End;
+  }
+}
+
+bool parseDispatchBool(StringRef Text, bool &Out) {
+  Text = Text.trim();
+  if (Text == "1" || Text.equals_insensitive("true") ||
+      Text.equals_insensitive("yes") || Text.equals_insensitive("on")) {
+    Out = true;
+    return true;
+  }
+  if (Text == "0" || Text.equals_insensitive("false") ||
+      Text.equals_insensitive("no") || Text.equals_insensitive("off")) {
+    Out = false;
+    return true;
+  }
+  return false;
 }
 
 StringRef stripStcQualifiers(StringRef S) {
@@ -361,6 +510,7 @@ void TemplateRegistry::scanTree(StringRef Dir) {
     }
     if (!Found)
       continue;
+    collectDispatchOps(Buffer, *Def);
 
     Def->Header = makeAbsolute(It->path());
     Def->GeneratedHeader = genHeaderPath(Def->Header, Def->Name);
@@ -438,6 +588,44 @@ bool looksLikeStcHeader(const TemplateDef &Template) {
     if (Content.contains(Marker))
       ++Score;
   return Score >= 2;
+}
+
+DispatchConfig resolveDispatch() {
+  DispatchConfig Config;
+  if (auto Env = sys::Process::GetEnv("C_AUTOTMPL_DISPATCH"))
+    parseDispatchBool(*Env, Config.Enabled);
+  if (auto Env = sys::Process::GetEnv("C_AUTOTMPL_DISPATCH_BACKEND")) {
+    if (StringRef(*Env).trim() == "builtin")
+      Config.Backend = DispatchBackend::Builtin;
+  }
+  if (auto Env = sys::Process::GetEnv("C_AUTOTMPL_DISPATCH_SUFFIX")) {
+    StringRef Suffix = StringRef(*Env).trim();
+    if (!Suffix.empty() && Suffix.find_first_of(" \t\r\n,()#") ==
+                               StringRef::npos)
+      Config.Suffix = Suffix.str();
+  }
+  if (auto Env = sys::Process::GetEnv("C_AUTOTMPL_DISPATCH_TEMPLATES")) {
+    SmallVector<StringRef, 4> Names;
+    StringRef(*Env).split(Names, ',');
+    for (StringRef Name : Names) {
+      Name = Name.trim();
+      if (!Name.empty())
+        Config.Templates.push_back(Name.str());
+    }
+  }
+  return Config;
+}
+
+void TemplateRegistry::applyDispatch(const DispatchConfig &Config) {
+  for (auto &OwnedDef : Owned) {
+    TemplateDef &Def = *OwnedDef;
+    bool Selected = Config.Enabled && Def.Kind == TemplateKind::Type &&
+                    Config.Templates.empty();
+    for (const std::string &Name : Config.Templates)
+      if (Name == Def.Name)
+        Selected = Config.Enabled && Def.Kind == TemplateKind::Type;
+    Def.DispatchEnabled = Selected;
+  }
 }
 
 void TemplateRegistry::applyPreset(TemplatePreset Preset,

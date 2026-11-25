@@ -52,6 +52,16 @@ int main() {
   }
   {
     std::error_code EC;
+    raw_fd_ostream OS(join(Root, "tmpl/dispatch.h"), EC);
+    OS << "// -- template type Dispatch(T)\n"
+          "#define Dispatch(T) Dispatch_##T\n"
+          "typedef struct { T value; } Dispatch(T);\n"
+          "static inline void Dispatch_int_push(Dispatch(int) *d, int x) "
+          "{ d->value = x; }\n"
+          "static inline int helper(int x) { return x; }\n";
+  }
+  {
+    std::error_code EC;
     raw_fd_ostream OS(join(Root, "tmpl/select.h"), EC);
     OS << "// -- template function select(First, Second)\n"
           "#define select(First, Second) select_##First##Second\n";
@@ -247,6 +257,48 @@ int main() {
   // Function templates use explicit call-site spellings only; helper names
   // such as select_impl must not be read as mangled instantiations.
   assert(Registry.matchMangled("select_int__float", Type) == nullptr);
+
+  c_autotmpl::DispatchConfig DispatchCfg;
+  DispatchCfg.Enabled = true;
+  Registry.applyDispatch(DispatchCfg);
+  const c_autotmpl::TemplateDef *DispatchDef =
+      Registry.findByName("Dispatch");
+  assert(DispatchDef && DispatchDef->DispatchEnabled);
+  assert(DispatchDef->DispatchOps.contains("push"));
+  assert(!DispatchDef->DispatchOps.contains("helper"));
+  SmallVector<c_autotmpl::DispatchCase, 1> DispatchCases{
+      {"int", "Dispatch_int"}};
+  SmallVector<StringRef, 1> DispatchOps{"push"};
+  std::string DispatchSection = c_autotmpl::makeDispatchSection(
+      *DispatchDef, DispatchCases, DispatchOps, DispatchCfg);
+  for (StringRef Needle : {
+           "/* c-autotmpl dispatch begin Dispatch */",
+           "#ifdef C_AUTOTMPL_Dispatch_int",
+           "Dispatch_int: Dispatch_int_push",
+           "#define Dispatch_push$(self, ...)",
+           "/* c-autotmpl dispatch end Dispatch */"})
+    assert(DispatchSection.find(Needle.str()) != std::string::npos);
+
+  DispatchCfg.Templates.push_back("Nope");
+  Registry.applyDispatch(DispatchCfg);
+  assert(!DispatchDef->DispatchEnabled);
+  DispatchCfg.Templates[0] = "Dispatch";
+  Registry.applyDispatch(DispatchCfg);
+  assert(DispatchDef->DispatchEnabled);
+
+  c_autotmpl::Instantiator DispatchInst;
+  std::string DispatchPath = join(Root, "gen/dispatch.h");
+  std::string DispatchError;
+  assert(DispatchInst.ensureDispatch(*DispatchDef, DispatchCases, DispatchOps,
+                                     DispatchCfg, DispatchPath,
+                                     DispatchError));
+  assert(DispatchError.empty());
+  assert(!DispatchInst.ensureDispatch(*DispatchDef, DispatchCases, DispatchOps,
+                                      DispatchCfg, DispatchPath,
+                                      DispatchError));
+  auto DispatchBuffer = MemoryBuffer::getFile(DispatchPath);
+  assert(DispatchBuffer &&
+         (*DispatchBuffer)->getBuffer().contains("Dispatch_push$"));
 
   c_autotmpl::Instantiator Instantiator;
   std::string GenPath, Error;

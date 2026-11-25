@@ -24,6 +24,12 @@ struct DependencyGuard {
   std::string Guard;
 };
 
+/// One concrete specialization used by a generated dispatch chain.
+struct DispatchCase {
+  std::string Type;      // canonical spelling used by the presence macro
+  std::string Container; // concrete container type, e.g. vec_int
+};
+
 /// Caches generated-header contents and append-only instantiation markers.
 /// Shared between AST worker threads; all mutations are serialized.
 class Instantiator {
@@ -38,6 +44,14 @@ public:
   /// generated header. Returns true when the file changed.
   bool ensureAdapters(const TemplateDef &Template,
                       llvm::ArrayRef<llvm::StringRef> Ops,
+                      llvm::StringRef OutputHeader, std::string &Error);
+
+  /// Rewrites the marked dispatch section so every case is guarded by the
+  /// presence macro of an instantiation already tracked in OutputHeader.
+  bool ensureDispatch(const TemplateDef &Template,
+                      llvm::ArrayRef<DispatchCase> Cases,
+                      llvm::ArrayRef<llvm::StringRef> Ops,
+                      const DispatchConfig &Config,
                       llvm::StringRef OutputHeader, std::string &Error);
 
   /// Removes generated blocks that are not in Keep. Returns true and fills
@@ -94,6 +108,14 @@ std::string makeInstantiationBlock(
     llvm::StringRef GuardMacro,
     llvm::ArrayRef<DependencyGuard> ExtraGuards = {},
     llvm::ArrayRef<llvm::StringRef> AdapterOps = {});
+
+std::string dispatchContainerName(const TemplateDef &Template,
+                                  llvm::ArrayRef<std::string> Args);
+
+std::string makeDispatchSection(const TemplateDef &Template,
+                                llvm::ArrayRef<DispatchCase> Cases,
+                                llvm::ArrayRef<llvm::StringRef> Ops,
+                                const DispatchConfig &Config);
 
 /// Presence macro used by generated implementation sources. It deliberately
 /// uses a different prefix from public headers so the two block sets cannot

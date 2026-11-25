@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <set>
 #include <tuple>
 #include <utility>
 
@@ -482,6 +483,101 @@ std::string makeInstantiationBlock(
   return Out;
 }
 
+static bool isDispatchIdentChar(char C) {
+  return C == '_' || (C >= 'a' && C <= 'z') || (C >= 'A' && C <= 'Z') ||
+         (C >= '0' && C <= '9');
+}
+
+std::string dispatchContainerName(const TemplateDef &Template,
+                                  ArrayRef<std::string> Args) {
+  static const char Hex[] = "0123456789ABCDEF";
+  std::string Out = Template.Name;
+  for (const std::string &Raw : Args) {
+    std::string Arg = StringRef(Raw).trim().str();
+    Out += '_';
+    for (char C : Arg) {
+      unsigned char Byte = static_cast<unsigned char>(C);
+      if (isDispatchIdentChar(C))
+        Out += C;
+      else {
+        Out += '_';
+        Out += Hex[Byte >> 4];
+        Out += Hex[Byte & 0xF];
+      }
+    }
+  }
+  return Out;
+}
+
+static void appendDispatchSelector(std::string &Out,
+                                   const DispatchConfig &Config,
+                                   StringRef TemplateName, StringRef Op,
+                                   size_t Index, StringRef Container) {
+  std::string Name = "C_AUTOTMPL_DISPATCH_SEL_" + TemplateName.str() + "_" +
+                     Op.str() + "_" + std::to_string(Index);
+  std::string Previous = "C_AUTOTMPL_DISPATCH_SEL_" + TemplateName.str() +
+                         "_" + Op.str() + "_" + std::to_string(Index - 1);
+  std::string Target = Container.str() + "_" + Op.str();
+  Out += "#define " + Name + "(self) ";
+  if (Config.Backend == DispatchBackend::Builtin) {
+    Out += "__builtin_choose_expr(__builtin_types_compatible_p(__typeof__(*("
+           "self)), " + Container.str() + "), " + Target + ", " + Previous +
+           "(self))\n";
+  } else {
+    Out += "_Generic((*(self)), " + Container.str() + ": " + Target +
+           ", default: " + Previous + "(self))\n";
+  }
+}
+
+std::string makeDispatchSection(const TemplateDef &Template,
+                                ArrayRef<DispatchCase> Cases,
+                                ArrayRef<StringRef> Ops,
+                                const DispatchConfig &Config) {
+  if (!Config.Enabled || !Template.DispatchEnabled || Cases.empty() ||
+      Ops.empty())
+    return {};
+  std::set<std::string> UniqueOps;
+  for (StringRef Op : Ops)
+    if (!Op.empty())
+      UniqueOps.insert(Op.str());
+  if (UniqueOps.empty())
+    return {};
+
+  std::string Out;
+  Out += "/* c-autotmpl dispatch begin " + Template.Name + " */\n";
+  Out += "#ifndef C_AUTOTMPL_DISPATCH_MISSING\n";
+  Out += "#define C_AUTOTMPL_DISPATCH_MISSING\n";
+  Out += "static inline void c_autotmpl_dispatch_missing(void *self, ...) "
+         "{ (void)self; }\n";
+  Out += "#endif\n";
+  for (const std::string &Op : UniqueOps) {
+    std::string Guard =
+        "C_AUTOTMPL_DISPATCH_" + Template.Name + "_" + Op;
+    Out += "#ifndef " + Guard + "\n#define " + Guard + "\n";
+    Out += "#define C_AUTOTMPL_DISPATCH_SEL_" + Template.Name + "_" + Op +
+           "_0(self) c_autotmpl_dispatch_missing\n";
+    for (size_t I = 0; I < Cases.size(); ++I) {
+      std::string Presence = presenceMacro(Template.Name, Cases[I].Type);
+      Out += "#ifdef " + Presence + "\n";
+      appendDispatchSelector(Out, Config, Template.Name, Op, I + 1,
+                             Cases[I].Container);
+      Out += "#else\n";
+      Out += "#define C_AUTOTMPL_DISPATCH_SEL_" + Template.Name + "_" + Op +
+             "_" + std::to_string(I + 1) + "(self) C_AUTOTMPL_DISPATCH_SEL_" +
+             Template.Name + "_" + Op + "_" + std::to_string(I) +
+             "(self)\n";
+      Out += "#endif\n";
+    }
+    Out += "#define " + Template.Name + "_" + Op + Config.Suffix +
+           "(self, ...) C_AUTOTMPL_DISPATCH_SEL_" + Template.Name + "_" +
+           Op + "_" + std::to_string(Cases.size()) +
+           "(self)(self, ##__VA_ARGS__)\n";
+    Out += "#endif\n";
+  }
+  Out += "/* c-autotmpl dispatch end " + Template.Name + " */\n";
+  return Out;
+}
+
 std::string makeImplInstantiationBlock(const TemplateDef &Template,
                                        StringRef TypeSpelling,
                                        ArrayRef<std::string> Args,
@@ -776,6 +872,83 @@ bool Instantiator::ensureAdapters(const TemplateDef &Template,
     return false;
   }
 
+  State.Content = std::move(NewContent);
+  State.Stamp = stampFor(Path);
+  return true;
+}
+
+bool Instantiator::ensureDispatch(const TemplateDef &Template,
+                                  ArrayRef<DispatchCase> Cases,
+                                  ArrayRef<StringRef> Ops,
+                                  const DispatchConfig &Config,
+                                  StringRef OutputHeader,
+                                  std::string &Error) {
+  std::lock_guard<std::mutex> Lock(Mutex);
+  StringRef Path =
+      OutputHeader.empty() ? Template.GeneratedHeader : OutputHeader;
+  FileState &State = getState(Path);
+  StringRef Content(State.Content);
+  std::string Section = makeDispatchSection(Template, Cases, Ops, Config);
+  std::string Begin = "/* c-autotmpl dispatch begin " + Template.Name + " */";
+  std::string End = "/* c-autotmpl dispatch end " + Template.Name + " */";
+  size_t B = Content.find(Begin);
+  size_t E = B == StringRef::npos ? StringRef::npos : Content.find(End, B);
+
+  std::string NewContent;
+  if (B != StringRef::npos && E != StringRef::npos) {
+    size_t After = Content.find('\n', E);
+    After = After == StringRef::npos ? E + End.size() : After + 1;
+    NewContent.append(Content.data(), B);
+    NewContent += Section;
+    NewContent.append(Content.data() + After, Content.size() - After);
+  } else {
+    if (Section.empty())
+      return false;
+    if (Content.empty()) {
+      NewContent += "#ifndef ";
+      NewContent += generatedHeaderFileGuard(Path);
+      NewContent += "\n#define ";
+      NewContent += generatedHeaderFileGuard(Path);
+      NewContent += "\n\n";
+      NewContent += Section;
+      NewContent += "#endif\n";
+    } else {
+      size_t Pos = Content.rfind("#endif");
+      size_t Insert = Content.size();
+      if (Pos != StringRef::npos) {
+        size_t LineStart = Content.rfind('\n', Pos);
+        Insert = LineStart == StringRef::npos ? 0 : LineStart + 1;
+        if (!Content.slice(Insert, Pos).trim().empty())
+          Insert = Content.size();
+      }
+      NewContent.append(Content.data(), Insert);
+      NewContent += Section;
+      NewContent.append(Content.data() + Insert, Content.size() - Insert);
+    }
+  }
+  if (NewContent == Content.str())
+    return false;
+
+  std::error_code EC;
+  SmallString<256> Dir(sys::path::parent_path(Path));
+  if (!Dir.empty()) {
+    EC = sys::fs::create_directories(Dir);
+    if (EC) {
+      Error = EC.message();
+      return false;
+    }
+  }
+  raw_fd_ostream OS(Path, EC, sys::fs::CD_CreateAlways);
+  if (EC) {
+    Error = EC.message();
+    return false;
+  }
+  OS << NewContent;
+  OS.close();
+  if (OS.has_error()) {
+    Error = "failed writing " + Path.str();
+    return false;
+  }
   State.Content = std::move(NewContent);
   State.Stamp = stampFor(Path);
   return true;

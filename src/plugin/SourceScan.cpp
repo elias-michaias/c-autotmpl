@@ -500,6 +500,24 @@ static void scanFunctionUsage(const TemplateDef &Template, StringRef RawType,
   appendUsageChain(Template, CanonArgs, Expanded, Out);
 }
 
+static std::string DispatchSuffix = "$";
+
+void setDispatchSuffix(StringRef Suffix) { DispatchSuffix = Suffix.str(); }
+
+static bool dispatchSuffixAt(StringRef Source, unsigned Pos) {
+  return !DispatchSuffix.empty() &&
+         !isIdentStart(DispatchSuffix.front()) &&
+         Source.substr(Pos).starts_with(DispatchSuffix);
+}
+
+static StringRef stripDispatchSuffix(StringRef Ident) {
+  if (DispatchSuffix.empty() || !isIdentStart(DispatchSuffix.front()))
+    return Ident;
+  return Ident.ends_with(DispatchSuffix)
+             ? Ident.drop_back(DispatchSuffix.size())
+             : Ident;
+}
+
 static void scanUsagesImpl(StringRef Code, const TemplateRegistry &Registry,
                            SmallVectorImpl<FoundUsage> &Out,
                            bool ScanHeaders) {
@@ -531,7 +549,11 @@ static void scanUsagesImpl(StringRef Code, const TemplateRegistry &Registry,
     unsigned End = I + 1;
     while (End < S.size() && isIdentChar(S[End]))
       ++End;
-    StringRef Ident = S.slice(I, End);
+    if (dispatchSuffixAt(S, End)) {
+      I = End;
+      continue;
+    }
+    StringRef Ident = stripDispatchSuffix(S.slice(I, End));
 
     if (const TemplateDef *Def = Registry.findByName(Ident)) {
       unsigned K = End;

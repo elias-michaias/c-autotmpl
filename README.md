@@ -42,6 +42,7 @@ explicitly.
 | **Split implementations** | `#ifndef TMPL_HEADER` selects a grouped implementation source and public header. |
 | **Type-aware guards** | User types use real include guards; scalar types are emitted bare. |
 | **First-class [STC](https://github.com/stclib/STC) support** | Thin wrappers and generated adapters make STC containers read like parametric types. |
+| **Opt-in dispatch macros** | `vec_push$(&xs, 7)` resolves from the receiver type and tracked instantiations. |
 
 ## Get started
 
@@ -160,6 +161,11 @@ Adapters come from current call sites, so a new operation such as
 `vec_new_op(int)(...)` works without a generator update. The compile-checked
 wrapper, source, generated adapter, and build command are in the
 [STC quick start](doc/USAGE.md#stc-quick-start).
+
+Method-style dispatch is opt-in too. Set `C_AUTOTMPL_DISPATCH=1` to emit macros
+such as `vec_push$(&xs, 7)`, with cases guarded by the instantiations that
+actually exist. See
+[generated dispatch macros](doc/USAGE.md#generated-dispatch-macros).
 
 ## Documentation
 

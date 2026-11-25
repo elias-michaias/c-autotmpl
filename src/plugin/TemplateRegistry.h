@@ -5,6 +5,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
 
 #include <memory>
 #include <string>
@@ -21,6 +22,18 @@ enum class ArgRole { Type, Name, Flags, Opaque, Key, Value };
 
 /// Opt-in emitter policy. None is the original, unchanged behavior.
 enum class TemplatePreset { None, StcStatic, StcShared };
+
+enum class DispatchBackend { Generic, Builtin };
+
+/// Env-only configuration for generated method-dispatch macros.
+struct DispatchConfig {
+  bool Enabled = false;
+  DispatchBackend Backend = DispatchBackend::Generic;
+  std::string Suffix = "$";
+  llvm::SmallVector<std::string, 2> Templates;
+};
+
+DispatchConfig resolveDispatch();
 
 struct ArgSpec {
   ArgRole Role = ArgRole::Type;
@@ -44,6 +57,8 @@ struct TemplateDef {
   bool HasTmplHeaderGuard = false;             // has `#ifndef TMPL_HEADER`
   TemplatePreset Preset = TemplatePreset::None;
   llvm::SmallVector<ArgSpec, 2> ArgSpecs;      // empty means legacy behavior
+  llvm::StringSet<> DispatchOps;                // method-like operation names
+  bool DispatchEnabled = false;
 };
 
 /// True for arguments that need include-guard and dependency handling.
@@ -90,6 +105,9 @@ public:
   void applyPreset(TemplatePreset Preset,
                    llvm::ArrayRef<llvm::StringRef> Names = {},
                    bool Auto = false);
+
+  /// Enables dispatch generation for selected type templates.
+  void applyDispatch(const DispatchConfig &Config);
 
   /// Scans `Root/tmpl` or `Root/templates` first and stops if decorators are
   /// found there. Falls back to the full recursive scan for other layouts.
