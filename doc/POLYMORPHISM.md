@@ -1,6 +1,6 @@
 <p align="center">
   <h1 align="center">Polymorphism with template headers</h1>
-  <p align="center">Checked constraints, generated functions, dispatch, and trait impls from one C header.</p>
+  <p align="center">Checked constraints, generated functions, static dispatch, and trait impls from one C header.</p>
 </p>
 
 <p align="center">
@@ -14,7 +14,7 @@
   <a href="BUILD.md">Build</a> &bull;
   <a href="#checked-constraints-and-generated-functions">Constraints</a> &bull;
   <a href="#function-templates">Function templates</a> &bull;
-  <a href="#extendible-generic-dispatch">Dispatch</a> &bull;
+  <a href="#extendible-generic-calls">Generic calls</a> &bull;
   <a href="#c-trait-generic-impls">Traits</a>
 </p>
 
@@ -22,15 +22,15 @@
 
 A template header is included once per type. c-autotmpl writes the
 `#define T` and `#include` block, so the header can generate more than a type.
-It can check `T`, write helper functions that take `T`, or register a dispatch
-entry and trait impl for that type.
+It can check `T`, write helper functions that take `T`, or register a generic
+call and trait impl for that type.
 
 Every example below is complete. Build the CLI from this repo, put it on your
 `PATH`, then run the commands shown with each example.
 
 - [Checked constraints and generated functions](#checked-constraints-and-generated-functions)
 - [Function templates](#function-templates)
-- [Extendible generic dispatch](#extendible-generic-dispatch)
+- [Extendible generic calls](#extendible-generic-calls)
 - [c-trait generic impls](#c-trait-generic-impls)
 - [Tagged unions with generated payloads](#tagged-unions-with-generated-payloads)
 
@@ -204,7 +204,7 @@ The generated names are plain C names with `T` pasted in:
 | `ops_add(T)` | fails the operator check | `ops_add_int` |
 
 The call site still names `T` in `pair_xy_sum(Point)` or `ops_add(int)`. These
-are generic functions by generation, not by dispatch.
+functions are generic by generation, not by call-site selection.
 
 ## Function templates
 
@@ -217,10 +217,10 @@ and there is no AST deduction. [USAGE.md](USAGE.md#function-templates) has the
 full header and generated-block rules.
 
 When the caller should not care which concrete function it calls, the next step
-is dispatch. The following section uses extendible `_Generic`. The one after
-that uses c-trait to generate the impl and the dispatcher together.
+is a generic call. The following section uses extendible `_Generic`. The one
+after that uses c-trait to generate the impl and the dispatcher together.
 
-## Extendible generic dispatch
+## Extendible generic calls
 
 C11 `_Generic` gives static dispatch, but its association list is fixed where
 the macro is defined. Jackson Allan's CC.h article describes a way to leave

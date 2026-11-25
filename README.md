@@ -9,10 +9,10 @@
 </p>
 
 <p align="center">
-  <a href="#features">Features</a> &bull;
-  <a href="#get-started">Get started</a> &bull;
+  <a href="#what-you-get">What you get</a> &bull;
+  <a href="#use-it">Use it</a> &bull;
+  <a href="#generic-calls">Generic calls</a> &bull;
   <a href="doc/USAGE.md">Usage</a> &bull;
-  <a href="#generated-dispatch-macros">Dispatch</a> &bull;
   <a href="doc/USAGE.md#stc-quick-start">STC guide</a>
 </p>
 
@@ -22,38 +22,44 @@
   <img src="assets/demo.gif" alt="c-autotmpl generating headers live in Neovim">
 </p>
 
-c-autotmpl generates C template-style re-include headers. It runs as a small,
-fast ISO C99 command line tool, or as a clangd plugin that works while you write
-C code.
+c-autotmpl writes the generated headers behind C template-style code such as
+`List(int)` or `Box(Point)`. It runs as a single-file ISO C99 CLI for builds, or
+as a clangd plugin that keeps headers current while you type. Both read the same
+`autotmpl.conf`.
 
-Project settings live in `autotmpl.conf` at the workspace root, so builds and
-clangd read the same short `key=value` options without environment exports.
+## What you get
 
-Opt-in dispatch macros give generated functions method-like names such as
-`$vec_push`. The same macro selects the right specialization from any argument,
-value or pointer, and works with one or many template arguments.
+- **Genericity in plain C.** Declare `List(T)` once; use `List(int)`,
+  `List(Box(int))`, or deeper chains without hand-written macro blocks.
+- **Generic calls.** `$vec_push(&xs, 7)` selects the concrete operation from its
+  arguments at compile time, with one spelling for every instantiation.
+- **Editor-aware generation.** The clangd plugin writes from unsaved buffers,
+  prunes stale blocks, follows generic calls to their template declarations, and
+  preserves the `$` prefix in completions.
+- **Builds without toolchain baggage.** The CLI is one portable C99 source with
+  no LLVM, libclang, C++ runtime, or compile database dependency.
+- **STC adapters.** Use [STC](https://github.com/stclib/STC) containers as
+  `vec(int)` with call sites such as `vec_push(int)(&nums, 7)`.
 
-First-class [STC](https://github.com/stclib/STC) support is opt-in. A thin
-wrapper keeps `vec(int)` and `vec_push(int)(...)` call sites, and adapters are
-generated from the operations your code uses. Start with
-[auto-detection](doc/USAGE.md#stc-quick-start), or list template names
-explicitly.
+## At a glance
 
-## Features
+```c
+#include "gen/box.h"
+#include "gen/vec.h"
 
-| Feature | Description |
-| --- | --- |
-| **Single-file CLI** | One ISO C99 source. No LLVM, libclang, clang headers, C++ runtime, or compile database. |
-| **Editor integration** | clangd feature module generates from unsaved buffers, prunes stale blocks, routes dispatch go to definition to template declarations, and keeps `$` literal in completions. |
-| **Project config file** | `autotmpl.conf` gives the CLI and clangd the same `key=value` settings. |
-| **Nested generics** | `List(Box(int))` and deeper chains, flattened into one header. |
-| **Function templates** | `convert(int, float)(x)` from explicit call-site arguments. |
-| **Split implementations** | `#ifndef TMPL_HEADER` selects a grouped implementation source and public header. |
-| **Type-aware guards** | User types use real include guards; scalar types are emitted bare. |
-| **Opt-in dispatch macros** | `$vec_push` and `$vec_at` dispatch from any argument, value or pointer, first or later. clangd go to definition follows the macro to its template operation. |
-| **First-class [STC](https://github.com/stclib/STC) support** | Thin wrappers and generated adapters make STC containers read like parametric types. |
+Box(int) box = {3};
+vec(int) xs = {0};
 
-## Get started
+$box_free(&box);      /* calls box_free_int */
+$vec_push(&xs, 7);    /* calls vec_int_push */
+```
+
+c-autotmpl finds the template headers, writes the instantiations into a sibling
+`gen/` directory, and adds the compile-time selectors for generic calls. A
+template header is just a decorator plus the usual preprocessor pattern; see
+[what the pattern does](doc/USAGE.md#what-the-pattern-does).
+
+## Use it
 
 ### CLI
 
@@ -63,9 +69,8 @@ cc -std=c99 -O2 src/cli/autotmpl.c -o autotmpl
 ./autotmpl --root . --dry-run --verbose src/main.c
 ```
 
-Copy `src/cli/autotmpl.c` anywhere and compile it. It contains a small
-POSIX/Win32 filesystem shim because ISO C99 has no directory API. Prebuilt
-binaries are produced by GitHub Actions.
+Copy `src/cli/autotmpl.c` anywhere and compile it. Prebuilt binaries are
+published by GitHub Actions.
 
 ### clangd plugin
 
@@ -74,20 +79,15 @@ make LLVM_SRC=/path/to/llvm-project LLVM_BUILD=/path/to/llvm-project/build
 clangd --load=/absolute/path/to/build/libc-autotmpl.so
 ```
 
-For most editors, adding that `--load` flag is the only setup. The plugin is C++17
-built against clangd internals, so rebuild it when clangd changes. See
-[doc/BUILD.md](doc/BUILD.md).
+For most editors, the `--load` flag is the only setup. Rebuild the module when
+clangd changes; see [BUILD.md](doc/BUILD.md). The plugin writes missing headers
+before clangd parses a file, prunes unused blocks after its workspace scan, and
+makes the editor experience match the generated code: go to definition on a
+generic call opens the template function declaration, not the generated macro,
+and completion keeps a `$` prefix literal instead of treating it as snippet
+syntax.
 
-For dispatch calls, go to definition opens the operation declaration in the
-template header rather than the generated `#define`. Completion also escapes the
-configured affix in snippet text, so clients keep a `$` prefix literal instead
-of parsing it as a snippet variable and removing it.
-
-Both paths write the same public headers, grouped implementation sources, and
-makefile fragment for split templates. The plugin adds editor features and
-pruning; the CLI is additive and idempotent for scripts.
-
-### Project configuration
+### Configuration
 
 Put opt-ins in `autotmpl.conf` at the project root:
 
@@ -99,83 +99,64 @@ dispatch=1
 dispatch_templates=vec,pair
 ```
 
-The CLI and clangd both read this file. CLI flags win over the file, and the
-file wins over environment variables.
+The CLI and clangd read the same file. CLI flags win over the file, and the file
+wins over environment variables. The `dispatch_*` keys configure generic calls;
+the names stay stable for compatibility.
 
-## Example
+## Generic calls
 
-```c
-#include "point.h"
-#include "gen/box.h"
-#include "gen/list.h"
-
-int main(void) {
-    Box(Point) p = {{3}};
-    List(int) xs = {7};
-    List(Box(int)) nested = {{9}};
-    return p.value.x + xs.value + nested.value.value;
-}
-```
-
-c-autotmpl finds the matching template headers and writes the instantiations into
-a sibling `gen/` directory. Function templates use the same explicit spelling:
-`convert(int, float)(x)`.
-
-Template headers are a preprocessor pattern: define `T`, re-include a header
-that pastes `T` into names, then undefine `T`. c-autotmpl writes those blocks for
-you. [doc/USAGE.md](doc/USAGE.md#what-the-pattern-does) explains the pattern.
-
-## Generated dispatch macros
-
-Set `dispatch=1` in `autotmpl.conf` to get method-like names for functions
-declared in type-template headers. A function qualifies when its parameter
-list mentions the template call spelling (`vec(int)`, `Box(T)`,
-`pair(Key, Value)`) or a template parameter/decorator (`T`, `U`, `i_type`).
-Function names are never compared with the template name, and the generated
-macro uses the function spelling: `box_alloc(T)` produces `$box_alloc` and
-calls `box_alloc_<Type>`. Declarations after `#ifndef TMPL_HEADER` are skipped.
+Set `dispatch=1` to give generated operations one method-like spelling for
+every instantiation:
 
 ```c
-#include "gen/vec.h"
-#include "gen/pair.h"
-#include "gen/box.h"
-
 vec(int) xs = {0};
 vec(float) ys = {0};
-pair(int, float) entry = {1, 2.5f};
-Box(int) box = {3};
 
-$vec_push(&xs, 7);      /* selects vec_int_push */
-$vec_push(&ys, 2.5f);   /* same macro, selects vec_float_push */
-$vec_at(2, xs);         /* value, second argument */
-$vec_at(2, ys);         /* same macro, selects vec_float_at */
-$pair_sum(3, entry);    /* two-argument template */
-$box_free(&box);        /* function spelling, any helper name */
+$vec_push(&xs, 7);      /* vec_int_push */
+$vec_push(&ys, 2.5f);   /* vec_float_push */
+$vec_at(2, xs);         /* vec_int_at, value as the second argument */
+$box_free(&box);        /* box_free_int, any helper spelling */
 ```
 
-The same dispatch macro selects the operation for each tracked instantiation of
-a generic type. Dispatch cases come only from instantiations that exist in the
-generated header. Each case is guarded by its instantiation's presence macro, so
-a header never names a type that was not generated. The public macro is variadic
-and forwards arguments unchanged.
+A type-template header contributes an operation when a function declaration's
+parameter list mentions the template call form (`vec(int)`, `Box(T)`,
+`pair(Key, Value)`) or a template parameter/decorator (`T`, `U`, `i_type`). The
+function name is not compared with the template name, and declarations after
+`#ifndef TMPL_HEADER` stay private. The public name is the function spelling
+plus the configured affix, so `box_alloc(T)` becomes `$box_alloc` and selects
+`box_alloc_<Type>`.
 
-With the clangd plugin, go to definition on a dispatch macro opens the matching
-function declaration in its template header, not the generated `#define`. The
-plugin also escapes the configured affix in snippet completions, so a `$` prefix
-is inserted literally instead of being interpreted as a snippet variable and
-removed by the editor.
+Each case is guarded by the presence macro of an instantiation that actually
+exists in the generated header, and the public macro forwards arguments
+unchanged. The default backend uses C11 `_Generic`; `dispatch_backend=builtin`
+uses GCC/Clang builtins for C99. Defaults are `dispatch_style=prefix` and
+`dispatch_affix=$`. `dispatch_style=postfix` with `dispatch_affix=_method`
+produces `vec_push_method`, and `dispatch_templates=vec,pair` limits generation
+to named templates.
 
-The default backend uses C11 `_Generic`. In `autotmpl.conf`, set
-`dispatch_backend=builtin` for GCC and Clang builtins, which work in C99.
-`dispatch_style=postfix` and `dispatch_affix=_method` produce `vec_push_method`;
-the defaults are `prefix` and `$`. `dispatch_templates=vec,pair` limits
-generation to named templates. See
-[generated dispatch macros](doc/USAGE.md#generated-dispatch-macros) for the full
-header pattern and configuration details.
+See [Generic calls](doc/USAGE.md#generic-calls) for the association rule, header
+pattern, and full configuration.
 
-## Generated output
+## STC with thin adapters
 
-A template header has a decorator:
+STC support is opt-in. A wrapper needs one decorator and one paste macro; the
+generated header adds configuration and thin adapters so call sites read like
+parametric C:
+
+```c
+vec(int) nums = {0};
+vec_push(int)(&nums, 7);
+```
+
+Use `stc_auto=1` (or `--stc-auto`) to detect wrappers from their includes or STC
+configuration macros, or list them with `stc_templates=vec,hashmap` (or
+`--stc-template vec`). Both paths select the STC profile. Adapters come from the
+current call sites, so a new operation works without a generator update. See the
+[STC quick start](doc/USAGE.md#stc-quick-start).
+
+## How generation works
+
+A template header carries a decorator:
 
 ```c
 // -- template List(T)
@@ -184,69 +165,27 @@ A template header has a decorator:
 /* ... */
 ```
 
-For a usage of `List(float)`, c-autotmpl appends:
+For a use of `List(float)`, c-autotmpl appends a marked, guarded re-include
+block that defines `T`, includes the template header, and undefines `T`. The
+marker drives idempotency and pruning; the presence macro prevents duplicate
+definitions across generated headers. User-defined types need a traditional
+include guard such as `FOO_H`; builtin and fixed-width scalars are emitted bare.
 
-```c
-/* c-autotmpl: List(float) */
-#ifndef C_AUTOTMPL_List_float
-#define C_AUTOTMPL_List_float
-#define T float
-#include "../tmpl/list.h"
-#undef T
-#endif
-```
-
-The marker drives idempotency and pruning. The presence macro lets the same
-nested instantiation appear in more than one generated header without duplicate
-definitions. User-defined types need a traditional guard such as `FOO_H`;
-`#pragma once` cannot be tested from generated code. Builtin and fixed-width
-scalar types are emitted bare.
-
-Advanced behavior lives in the usage guide:
-
-- [Nested types](doc/USAGE.md#nested-types) are emitted in dependency order.
-- [Split implementations](doc/USAGE.md#split-implementations) get one grouped source per template.
-- [Function templates](doc/USAGE.md#function-templates) spell every argument at the call site.
-- [Lexical HKTs](doc/USAGE.md#lexical-hkts) pass a template name as an argument.
-
-## STC with thin adapters
-
-c-autotmpl has first-class support for [STC](https://github.com/stclib/STC).
-A wrapper needs one decorator and one paste macro. The generated header adds
-configuration and thin adapter macros, so calls stay native STC calls with
-parametric types:
-
-```c
-vec(int) nums = {0};
-vec_push(int)(&nums, 7);
-```
-
-There are two ways to opt in.
-
-1. **Auto-detection, recommended.** Set `stc_auto=1` in `autotmpl.conf` or pass
-   `--stc-auto`. A wrapper with an STC include or two STC configuration macros
-   is detected from its template header. No name list is needed.
-2. **Explicit template lists.** Set `stc_templates=vec,hashmap` in the config or
-   pass `--stc-template vec` repeatedly. This opts in unprefixed wrapper names.
-
-Both paths select the static STC profile automatically. A profile can also be
-selected directly with `--stc` or `profile=stc`; without a list or auto-detection
-it uses the `stc_*` prefix rule. `--profile none` wins over all STC opt-ins.
-
-Adapters come from current call sites, so a new operation such as
-`vec_new_op(int)(...)` works without a generator update. The compile-checked
-wrapper, source, generated adapter, and build command are in the
-[STC quick start](doc/USAGE.md#stc-quick-start).
+Advanced generation lives in the usage guide:
+[nested types](doc/USAGE.md#nested-types),
+[split implementations](doc/USAGE.md#split-implementations),
+[function templates](doc/USAGE.md#function-templates), and
+[lexical HKTs](doc/USAGE.md#lexical-hkts).
 
 ## Documentation
 
 | Document | Description |
 | --- | --- |
 | [**Usage guide**](doc/USAGE.md) | CLI, configuration, template authoring, guards, and generated files. |
-| [**Dispatch macros**](doc/USAGE.md#generated-dispatch-macros) | Association rule, argument forwarding, guard behavior, and configuration. |
+| [**Generic calls**](doc/USAGE.md#generic-calls) | Compile-time operation selection, naming, forwarding, and configuration. |
 | [**STC quick start**](doc/USAGE.md#stc-quick-start) | Thin adapters, auto-detection, explicit template lists, and traits. |
+| [**Polymorphism**](doc/POLYMORPHISM.md) | Generated functions, function templates, static dispatch, and direct trait calls. |
 | [**Build guide**](doc/BUILD.md) | CLI build, clangd plugin build, loading, tests, and build errors. |
-| [**Polymorphism**](doc/POLYMORPHISM.md) | Generated functions, function templates, dispatch, and direct trait calls. |
 | [**Troubleshooting**](doc/TROUBLESHOOTING.md) | Common failures and fixes. |
 
 ## Build and test
@@ -258,7 +197,7 @@ make test
 make bench
 ```
 
-The plugin build needs a matching LLVM source and build tree. The CLI does not.
+The plugin build needs a matching LLVM source and build tree; the CLI does not.
 `make install` puts the CLI at `~/.local/bin/autotmpl` and the plugin at
 `~/.local/lib/c-autotmpl/libc-autotmpl.so`. Restart clangd after replacing the
 module.

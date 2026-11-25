@@ -47,8 +47,8 @@ and it does not remove unused blocks.
 
 ## Configuration
 
-Profiles and dispatch are opt-in. Put project settings in `autotmpl.conf` at the
-workspace root:
+Profiles and generic calls are opt-in. Put project settings in `autotmpl.conf`
+at the workspace root:
 
 ```text
 # autotmpl.conf
@@ -68,12 +68,12 @@ over defaults. Restart clangd after changing configuration.
 | Profile | `profile` | `C_AUTOTMPL_PROFILE` | Select an opt-in profile, such as `stc`. |
 | STC templates | `stc_templates` | `C_AUTOTMPL_STC_TEMPLATES` | Comma-separated names, such as `vec,hashmap`. |
 | STC auto | `stc_auto` | `C_AUTOTMPL_STC_AUTO` | Detect STC wrappers from template-header contents. |
-| Dispatch | `dispatch` | `C_AUTOTMPL_DISPATCH` | Generate method-like dispatch macros. |
-| Dispatch backend | `dispatch_backend` | `C_AUTOTMPL_DISPATCH_BACKEND` | Select `generic` (`_Generic`, default) or `builtin` (GCC/Clang builtins). |
-| Dispatch style | `dispatch_style` | `C_AUTOTMPL_DISPATCH_STYLE` | Place the affix before the name (`prefix`, default) or after it (`postfix`). |
-| Dispatch affix | `dispatch_affix` | `C_AUTOTMPL_DISPATCH_AFFIX` | Set the macro affix, default `$`. |
-| Dispatch suffix | `dispatch_suffix` | `C_AUTOTMPL_DISPATCH_SUFFIX` | Legacy alias for `dispatch_affix` that also selects postfix style. |
-| Dispatch templates | `dispatch_templates` | `C_AUTOTMPL_DISPATCH_TEMPLATES` | Comma-separated templates that get dispatch, such as `vec,list`. |
+| Generic calls | `dispatch` | `C_AUTOTMPL_DISPATCH` | Enable compile-time generic calls such as `$vec_push`. |
+| Call backend | `dispatch_backend` | `C_AUTOTMPL_DISPATCH_BACKEND` | Select `generic` (`_Generic`, default) or `builtin` (GCC/Clang builtins). |
+| Call style | `dispatch_style` | `C_AUTOTMPL_DISPATCH_STYLE` | Place the affix before the name (`prefix`, default) or after it (`postfix`). |
+| Call affix | `dispatch_affix` | `C_AUTOTMPL_DISPATCH_AFFIX` | Set the generic-call affix, default `$`. |
+| Legacy suffix | `dispatch_suffix` | `C_AUTOTMPL_DISPATCH_SUFFIX` | Legacy alias for `dispatch_affix` that also selects postfix style. |
+| Call templates | `dispatch_templates` | `C_AUTOTMPL_DISPATCH_TEMPLATES` | Comma-separated templates that get generic calls, such as `vec,list`. |
 | Plugin root | n/a | `C_AUTOTMPL_ROOT` | Force the clangd plugin workspace root. |
 | Plugin timing | n/a | `C_AUTOTMPL_TIMING` | Log plugin phase timings. |
 
@@ -281,11 +281,13 @@ Include only `gen/user.h`, as with any nested chain. This is lexical application
 not kind checking: a wrong argument count fails at compile time, and partial
 application needs an explicit wrapper template.
 
-## Generated dispatch macros
+## Generic calls
 
-Set `dispatch=1` in `autotmpl.conf` to emit method-like macros such as
-`$Vec_push`. An operation is eligible when a type-template header declares a
-function whose parameter list mentions that template's call form such as
+Set `dispatch=1` in `autotmpl.conf` to write method-like calls such as
+`$Vec_push(&xs, 7)`. The generated selector chooses the concrete operation at
+compile time from the argument types. An operation is eligible when a
+type-template header declares a function whose parameter list mentions that
+template's call form such as
 `Vec(T)`, `Pair(T, U)`, or `Box(int)`; a template parameter such as `T` or `U`;
 or a generated decorator parameter such as `Key`, `i_type`, or `i_key`.
 Pointer-ness and argument position do not matter. Function names are not
@@ -336,18 +338,17 @@ int main(void) {
 }
 ```
 
-The same dispatch macro works for every tracked instantiation of the generic
-type. Cases come only from tracked instantiations. Each case is guarded by its
-presence macro, so the header never names a type whose instantiation header was
-not included. The generated macro checks up to eight call arguments and forwards
-them unchanged.
+The same generic call works for every tracked instantiation of the type. Cases
+come only from tracked instantiations and are guarded by their presence macros,
+so the header never names a type whose instantiation header was not included.
+The public macro checks up to eight call arguments and forwards them unchanged.
 
 ```sh
 autotmpl --root . src
 cc -I. -std=c11 -Wall -Wextra -Werror src/main.c -o demo
 ```
 
-With the clangd plugin, go to definition on a dispatch macro opens the operation
+With the clangd plugin, go to definition on a generic call opens the operation
 declaration in the template header instead of the generated `#define`. No
 annotation is needed in source files. When snippet completions are enabled, the
 plugin escapes the configured affix in completion text, so clients insert a `$`
@@ -359,7 +360,7 @@ The default backend is `_Generic` and needs C11. Set
 C99. The default prefix `$` is accepted by GCC and Clang. Set
 `dispatch_style=postfix` and `dispatch_affix=_method` for `Vec_push_method`, or
 set only the legacy `dispatch_suffix=_method` to keep the old spelling. Without
-`dispatch_templates`, every eligible type template gets dispatch macros. The
+`dispatch_templates`, every eligible type template gets generic calls. The
 plugin rereads `autotmpl.conf` only on clangd restart.
 
 ## STC quick start
@@ -484,11 +485,11 @@ those values map to `i_type` and `i_traits`. `--profile stc-shared` maps
 `TMPL_HEADER` to `i_header` in public blocks and `i_implement` in grouped
 implementation sources.
 
-### Dispatch with STC
+### Generic calls with STC
 
-Dispatch is independent of the STC profile. Set `dispatch=1` with
+Generic calls are independent of the STC profile. Set `dispatch=1` with
 `stc_auto=1` or `stc_templates=vec`. The same thin wrapper supports explicit
-adapter calls and method-style dispatch:
+adapter calls and method-style calls:
 
 ```c
 /* src/main.c */
@@ -517,10 +518,10 @@ autotmpl --root . src
 ```
 
 One explicit call per operation is still enough to keep the adapter macro in
-`gen/`. Dispatch cases are guarded by presence macros such as
+`gen/`. Call cases are guarded by presence macros such as
 `C_AUTOTMPL_vec_int`, so a header never names a specialization that was not
 included. The same rule covers two-argument wrappers, so `hashmap_insert$`
-dispatches from a tracked `hashmap(int, int)` case.
+selects from a tracked `hashmap(int, int)` case.
 
 ## Generated files
 
@@ -549,7 +550,7 @@ The plugin reads the same `autotmpl.conf` file as the CLI. Restart clangd after
 changing configuration. A compile database is not needed for generation, but
 clangd still needs correct include paths and defines to parse the project.
 
-For dispatch calls, the plugin also routes `textDocument/definition` to the
+For generic calls, the plugin also routes `textDocument/definition` to the
 template function declaration rather than the generated macro. It wraps
 `textDocument/completion` responses to escape the configured affix in snippet
 text, which keeps a `$` prefix intact in editors that parse completion snippets.
