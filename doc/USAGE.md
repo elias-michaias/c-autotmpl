@@ -104,8 +104,9 @@ Two backends are available:
 | `full` | batched `cc -E -P` | ~20× raw scan | compiler-exact for the selected flags |
 
 `full` is the default so existing `preprocess=1` configurations keep their
-behavior. It passes all input sources to one preprocessor invocation, split
-only into batches of 128 files for very large projects:
+behavior. It passes all input sources to batched preprocessor invocations,
+capped at 128 files and by command-line length so Windows paths cannot overflow
+`cmd.exe` limits:
 
 ```text
 cc -E -P -I <workspace-root> <preprocess_flags> <source>...

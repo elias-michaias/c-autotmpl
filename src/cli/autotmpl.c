@@ -1109,6 +1109,8 @@ typedef struct {
 } PreprocessConfig;
 
 #define PREPROCESS_BATCH_SIZE 128
+/* cmd.exe caps a command line at 8191 characters; leave a little slack. */
+#define PREPROCESS_CMD_LIMIT 7800
 #define MACRO_EXPAND_DEPTH 32
 
 static TemplateDef *registry_find(const Registry *r, const char *name) {
@@ -2613,22 +2615,37 @@ static char *preprocess_sources(const Vec *paths, const char *root,
   size_t batches = 0;
   size_t start = 0;
 
-  while (start < paths->len) {
-    size_t end = start + PREPROCESS_BATCH_SIZE;
-    if (end > paths->len)
-      end = paths->len;
+  char *root_dir = shell_quote(root);
+  Str prefix;
+  str_init(&prefix);
+  str_append(&prefix, cfg->cc);
+  str_append(&prefix, " -E -P -I ");
+  str_append(&prefix, root_dir);
+  free(root_dir);
+  if (cfg->flags[0]) {
+    str_append_char(&prefix, ' ');
+    str_append(&prefix, cfg->flags);
+  }
+  size_t base_len = prefix.len ? prefix.len : 0;
 
-    char *root_dir = shell_quote(root);
+  while (start < paths->len) {
+    size_t end = start;
+    size_t cmd_len = base_len;
+    while (end < paths->len && end - start < PREPROCESS_BATCH_SIZE) {
+      char *source = shell_quote((const char *)paths->items[end]);
+      size_t add = strlen(source) + 1;
+      free(source);
+      if (end > start && cmd_len + add > PREPROCESS_CMD_LIMIT)
+        break;
+      cmd_len += add;
+      ++end;
+    }
+    if (end == start)
+      end = start + 1;
+
     Str cmd;
     str_init(&cmd);
-    str_append(&cmd, cfg->cc);
-    str_append(&cmd, " -E -P -I ");
-    str_append(&cmd, root_dir);
-    free(root_dir);
-    if (cfg->flags[0]) {
-      str_append_char(&cmd, ' ');
-      str_append(&cmd, cfg->flags);
-    }
+    str_append(&cmd, prefix.data ? prefix.data : "");
     for (size_t i = start; i < end; ++i) {
       char *source = shell_quote((const char *)paths->items[i]);
       str_append_char(&cmd, ' ');
@@ -2641,6 +2658,7 @@ static char *preprocess_sources(const Vec *paths, const char *root,
     if (!pipe) {
       fprintf(stderr, "warning: cannot start preprocessor\n");
       str_free(&out);
+      str_free(&prefix);
       return NULL;
     }
 
@@ -2653,6 +2671,7 @@ static char *preprocess_sources(const Vec *paths, const char *root,
         fprintf(stderr, "warning: preprocessor failed for batch %zu; "
                         "using raw text\n", batches + 1);
       str_free(&out);
+      str_free(&prefix);
       return NULL;
     }
     if (out.len && out.data[out.len - 1] != '\n')
@@ -2663,6 +2682,7 @@ static char *preprocess_sources(const Vec *paths, const char *root,
 
   if (verbose)
     printf("preprocess batches=%zu files=%zu\n", batches, paths->len);
+  str_free(&prefix);
   return str_take(&out);
 }
 

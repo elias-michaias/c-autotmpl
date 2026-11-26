@@ -2,6 +2,7 @@
 """Integration check for the standalone autotmpl executable."""
 
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -962,14 +963,16 @@ int use_b(void) {
         chunk_output = chunk_proc.stdout + chunk_proc.stderr
         require(chunk_proc.returncode == 0,
                 "chunked preprocess run exited with error", chunk_output)
-        require("preprocess batches=2 files=132" in chunk_output,
-                "expected two preprocessor batches for 132 files",
+        match = re.search(r"preprocess batches=(\d+) files=132", chunk_output)
+        require(match is not None and int(match.group(1)) >= 2,
+                "expected multiple preprocessor batches for 132 files",
                 chunk_output)
+        expected_batches = int(match.group(1))
         with open(log) as f:
             chunk_invocations = f.read().count("invocation\n")
-        require(chunk_invocations == 2,
-                "expected two preprocessor processes, got %d"
-                % chunk_invocations, chunk_output)
+        require(chunk_invocations == expected_batches,
+                "expected %d preprocessor processes, got %d"
+                % (expected_batches, chunk_invocations), chunk_output)
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

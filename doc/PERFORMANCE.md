@@ -74,9 +74,9 @@ invocation, while `local` expands wrapper macros inside the CLI.
   latency promises.
 - Omitting `preprocess=1` never invokes an external compiler. With the `local`
   backend, enabling it still does not start a subprocess.
-- With `preprocess_backend=full`, all sources are passed to one compiler process
-  in batches of 128 files. Macros remain isolated per input because each file is
-  still a separate preprocessing translation unit.
+- With `preprocess_backend=full`, sources are grouped into compiler invocations
+  capped at 128 files and by command-line length. Macros remain isolated per
+  input because each file is still a separate preprocessing translation unit.
 - The `local` backend collects macros per input translation unit, following
   local includes but not evaluating conditionals. It is much faster but less
   faithful than `full`.

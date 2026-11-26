@@ -206,9 +206,9 @@ dispatch_templates=vec,pair
 
 Use `dispatch_style` and `dispatch_affix` for custom call spellings.
 Preprocessing is opt-in. The `local` backend expands common wrapper macros
-inside the CLI with no external process; the `full` backend passes all sources
-to one batched compiler invocation and treats missing generated headers as
-empty files while bootstrapping. See
+inside the CLI with no external process; the `full` backend passes sources to
+batched compiler invocations and treats missing generated headers as empty
+files while bootstrapping. See
 [configuration in the usage guide](doc/USAGE.md#configuration) for CLI flags,
 macro-generated usages, and template-authoring details.
 
