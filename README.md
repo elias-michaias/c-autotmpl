@@ -20,7 +20,7 @@
 ---
 
 <p align="center">
-  <img src="assets/demo.gif" alt="c-autotmpl generating headers live in Neovim">
+  <img src="assets/demo.gif" alt="c-autotmpl generating headers live and dispatching generic calls in Neovim">
 </p>
 
 c-autotmpl writes the generated headers behind C template-style code such as
