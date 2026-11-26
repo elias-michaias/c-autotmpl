@@ -248,7 +248,9 @@ plugin. To see plugin logs from that check:
 C_AUTOTMPL_TEST_VERBOSE=1 make lsp-check
 ```
 
-`make bench` builds a synthetic project and measures CLI and plugin overhead.
+`make bench` builds a synthetic project and measures CLI, configuration, and
+plugin overhead. Use `make bench-quick` for a shorter smoke run. See
+[PERFORMANCE.md](PERFORMANCE.md) for methodology and sample results.
 
 ### When clangd changes
 

@@ -54,7 +54,7 @@ CLI := build/autotmpl
 SELFTEST := build/c-autotmpl-selftest
 
 .PHONY: all clean install selftest lsp-check standalone-check test test-check \
-        bench portability-check
+        bench bench-quick portability-check
 
 all: $(PLUGIN) $(CLI)
 
@@ -120,6 +120,9 @@ test: selftest lsp-check standalone-check portability-check
 
 bench: $(CLI) $(PLUGIN)
 	python3 tools/bench.py $(abspath $(CLI)) $(abspath $(PLUGIN)) $(BENCH_ARGS)
+
+bench-quick: $(CLI) $(PLUGIN)
+	python3 tools/bench.py $(abspath $(CLI)) $(abspath $(PLUGIN)) --quick $(BENCH_ARGS)
 
 # Kept as an alias for older docs/scripts.
 test-check: lsp-check

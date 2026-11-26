@@ -20,6 +20,15 @@
 #if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
 #define _POSIX_C_SOURCE 200809L
 #endif
+#if defined(_WIN32)
+#define autotmpl_popen _popen
+#define autotmpl_pclose _pclose
+#define autotmpl_unlink _unlink
+#else
+#define autotmpl_popen popen
+#define autotmpl_pclose pclose
+#define autotmpl_unlink unlink
+#endif
 
 #include <ctype.h>
 #include <errno.h>
@@ -1080,10 +1089,28 @@ typedef struct {
   int has_names;
 } DispatchConfig;
 
+typedef struct {
+  int enabled;
+  char *cc;
+  char *flags;
+} PreprocessConfig;
+
 static TemplateDef *registry_find(const Registry *r, const char *name) {
   for (size_t i = 0; i < r->items.len; ++i) {
     TemplateDef *d = (TemplateDef *)r->items.items[i];
     if (strcmp(d->name, name) == 0)
+      return d;
+  }
+  return NULL;
+}
+
+/* Operations are collected from template-header signatures, so a call such as
+ * box_alloc(int)() is enough to instantiate the owning type template even when
+ * a local macro hid the direct Box(int) spelling. */
+static TemplateDef *registry_find_op(const Registry *r, const char *name) {
+  for (size_t i = 0; i < r->items.len; ++i) {
+    TemplateDef *d = (TemplateDef *)r->items.items[i];
+    if (d->kind == TEMPLATE_TYPE && set_has(&d->dispatch_ops, name))
       return d;
   }
   return NULL;
@@ -1823,6 +1850,114 @@ static DispatchConfig resolve_dispatch(void) {
   return cfg;
 }
 
+static PreprocessConfig resolve_preprocess(void) {
+  PreprocessConfig cfg;
+  cfg.enabled = parse_bool_text(config_value("preprocess")) == 1;
+  const char *cc = config_value("preprocess_cc");
+  const char *flags = config_value("preprocess_flags");
+  cfg.cc = xstrdup(cc && cc[0] ? cc : "cc");
+  cfg.flags = xstrdup(flags ? flags : "");
+  return cfg;
+}
+
+static char *shell_quote(const char *text) {
+  Str out;
+  str_init(&out);
+#if defined(_WIN32)
+  str_append_char(&out, '"');
+  for (const char *p = text; *p; ++p) {
+    if (*p == '"')
+      str_append(&out, "\\\"");
+    else
+      str_append_char(&out, *p);
+  }
+  str_append_char(&out, '"');
+#else
+  str_append_char(&out, '\'');
+  for (const char *p = text; *p; ++p) {
+    if (*p == '\'')
+      str_append(&out, "'\\''");
+    else
+      str_append_char(&out, *p);
+  }
+  str_append_char(&out, '\'');
+#endif
+  return str_take(&out);
+}
+
+/* Full-fidelity mode is opt-in: it expands the original source with the
+ * configured preprocessor before the normal lexical usage scan. Includes are
+ * resolved normally, but generated headers are allowed to be empty during the
+ * bootstrap pass; temporary empty stubs are removed before generation. */
+static char *preprocess_source(const char *path, const char *root,
+                               const PreprocessConfig *cfg, int verbose) {
+  char *source = shell_quote(path);
+  char *root_dir = shell_quote(root);
+  Str cmd;
+  str_init(&cmd);
+  str_append(&cmd, cfg->cc);
+  str_append(&cmd, " -E -P -I ");
+  str_append(&cmd, root_dir);
+  if (cfg->flags[0]) {
+    str_append_char(&cmd, ' ');
+    str_append(&cmd, cfg->flags);
+  }
+  str_append_char(&cmd, ' ');
+  str_append(&cmd, source);
+
+  FILE *pipe = autotmpl_popen(cmd.data, "r");
+  free(source);
+  free(root_dir);
+  str_free(&cmd);
+  if (!pipe) {
+    fprintf(stderr, "warning: cannot start preprocessor for %s\n", path);
+    return NULL;
+  }
+
+  Str out;
+  str_init(&out);
+  char buf[4096];
+  while (fgets(buf, sizeof(buf), pipe))
+    str_append(&out, buf);
+  int rc = autotmpl_pclose(pipe);
+  if (rc != 0 || !out.len) {
+    if (verbose)
+      fprintf(stderr, "warning: preprocessor failed for %s; using raw text\n",
+              path);
+    str_free(&out);
+    return NULL;
+  }
+  return str_take(&out);
+}
+
+static void prepare_preprocessor_stubs(Registry *reg, Vec *created,
+                                       int verbose) {
+  for (size_t i = 0; i < reg->items.len; ++i) {
+    TemplateDef *def = (TemplateDef *)reg->items.items[i];
+    if (path_is_file(def->generated))
+      continue;
+    char *dir = path_dirname(def->generated);
+    make_dir(dir);
+    free(dir);
+    if (write_file(def->generated, "", 0) == 0) {
+      vec_push(created, xstrdup(def->generated));
+      if (verbose)
+        printf("preprocess stub %s\n", def->generated);
+    }
+  }
+}
+
+static void remove_preprocessor_stubs(Vec *created) {
+  for (size_t i = 0; i < created->len; ++i) {
+    char *path = (char *)created->items[i];
+    autotmpl_unlink(path);
+    free(path);
+  }
+  free(created->items);
+  created->items = NULL;
+  created->len = created->cap = 0;
+}
+
 /* Explicit CLI options win over autotmpl.conf, then environment variables. */
 static PresetKind resolve_preset(const char *configured, const Set *cli_names,
                                  int has_cli_names, int cli_auto,
@@ -1926,9 +2061,14 @@ static TemplateDef *registry_match_mangled(const Registry *r, const char *text,
 }
 
 static int registry_may_contain(const Registry *r, const char *text) {
-  for (size_t i = 0; i < r->items.len; ++i)
-    if (strstr(text, ((TemplateDef *)r->items.items[i])->name))
+  for (size_t i = 0; i < r->items.len; ++i) {
+    TemplateDef *def = (TemplateDef *)r->items.items[i];
+    if (strstr(text, def->name))
       return 1;
+    for (size_t j = 0; j < def->dispatch_ops.len; ++j)
+      if (strstr(text, (char *)def->dispatch_ops.items[j]))
+        return 1;
+  }
   return 0;
 }
 
@@ -2885,6 +3025,35 @@ static void scan_usages_impl(const char *code, Registry *reg, Vec *out,
         }
       }
     } else {
+      TemplateDef *op_tmpl = registry_find_op(reg, match_ident);
+      if (op_tmpl) {
+        size_t k = end;
+        while (k < n && is_space(clean[k]))
+          ++k;
+        if (k < n && clean[k] == '(') {
+          size_t begin = k + 1;
+          int depth = 1;
+          size_t close = begin;
+          for (; close < n && depth > 0; ++close) {
+            if (clean[close] == '(')
+              ++depth;
+            else if (clean[close] == ')')
+              --depth;
+          }
+          if (depth == 0 && close > begin + 1) {
+            char *raw = xstrdup_n(clean + begin, close - begin - 1);
+            char *type = trim_copy(raw);
+            if (type[0])
+              scan_template_usage(op_tmpl, type, reg, out, scan_headers);
+            free(type);
+            free(raw);
+            free(match_ident);
+            free(ident);
+            i = close;
+            continue;
+          }
+        }
+      }
       /* A generated STC adapter reads as vec_push(int)(...). The leading
        * identifier is a call, not the mangled type vec_push. For STC-derived
        * templates, remember the operation and instantiate the underlying type.
@@ -4577,6 +4746,14 @@ int main(int argc, char **argv) {
   if (opt.verbose && stc_auto)
     printf("stc auto=1\n");
 
+  PreprocessConfig pre_cfg = resolve_preprocess();
+  if (opt.verbose && pre_cfg.enabled) {
+    printf("preprocess=1\n");
+    printf("preprocess cc=%s\n", pre_cfg.cc);
+    if (pre_cfg.flags[0])
+      printf("preprocess flags=%s\n", pre_cfg.flags);
+  }
+
   DispatchConfig dispatch_cfg = resolve_dispatch();
   g_dispatch_style = dispatch_cfg.style;
   g_dispatch_affix = dispatch_cfg.affix;
@@ -4620,6 +4797,12 @@ int main(int argc, char **argv) {
   wanted_names.items = NULL;
   wanted_names.len = wanted_names.cap = 0;
 
+  Vec preprocess_stubs;
+  preprocess_stubs.items = NULL;
+  preprocess_stubs.len = preprocess_stubs.cap = 0;
+  if (pre_cfg.enabled)
+    prepare_preprocessor_stubs(&reg, &preprocess_stubs, opt.verbose);
+
   for (size_t i = 0; i < files.len; ++i) {
     char *path = (char *)files.items[i];
     if (set_has(&generated_outputs, path))
@@ -4627,16 +4810,26 @@ int main(int argc, char **argv) {
     char *content = read_file(path, NULL);
     if (!content)
       continue;
+    char *scan_text = content;
+    if (pre_cfg.enabled) {
+      char *expanded = preprocess_source(path, root, &pre_cfg, opt.verbose);
+      if (expanded) {
+        free(content);
+        content = expanded;
+        scan_text = expanded;
+      }
+    }
     FileUsages *fu = (FileUsages *)xmalloc(sizeof(FileUsages));
     fu->path = path;
     fu->usages.items = NULL;
     fu->usages.len = fu->usages.cap = 0;
-    scan_usages(content, &reg, &fu->usages);
+    scan_usages(scan_text, &reg, &fu->usages);
     free(content);
     for (size_t j = 0; j < fu->usages.len; ++j)
       add_wanted_usage((Usage *)fu->usages.items[j], &reg, &wanted_names);
     vec_push(&file_usages, fu);
   }
+  remove_preprocessor_stubs(&preprocess_stubs);
 
   TypeIndex idx;
   idx.guards.items = NULL;
@@ -4741,5 +4934,7 @@ int main(int argc, char **argv) {
   if (opt.verbose)
     printf("templates=%zu added=%u skipped=%u\n", reg.items.len, emit.added,
            emit.skipped);
+  free(pre_cfg.cc);
+  free(pre_cfg.flags);
   return 0;
 }

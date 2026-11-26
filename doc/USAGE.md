@@ -73,6 +73,9 @@ over defaults. Restart clangd after changing configuration.
 | Call style | `dispatch_style` | `C_AUTOTMPL_DISPATCH_STYLE` | Place the affix before the name (`prefix`, default) or after it (`postfix`). |
 | Call affix | `dispatch_affix` | `C_AUTOTMPL_DISPATCH_AFFIX` | Set the generic-call affix, default `$`. |
 | Call templates | `dispatch_templates` | `C_AUTOTMPL_DISPATCH_TEMPLATES` | Comma-separated templates that get generic calls, such as `vec,list`. |
+| Preprocess | `preprocess` | `C_AUTOTMPL_PREPROCESS` | CLI only: scan preprocessed source so macro-generated usages are visible. Off by default. |
+| Preprocessor | `preprocess_cc` | `C_AUTOTMPL_PREPROCESS_CC` | Command used for preprocessing; default `cc`. |
+| Preprocessor flags | `preprocess_flags` | `C_AUTOTMPL_PREPROCESS_FLAGS` | Extra flags such as `-Iinclude -DFEATURE=1`. |
 | Plugin root | n/a | `C_AUTOTMPL_ROOT` | Force the clangd plugin workspace root. |
 | Plugin timing | n/a | `C_AUTOTMPL_TIMING` | Log plugin phase timings. |
 
@@ -80,6 +83,36 @@ over defaults. Restart clangd after changing configuration.
 starting with `#`, optional spaces around `=`, and quoted values. STC
 auto-detection and explicit template lists are explained in the
 [STC quick start](#stc-quick-start).
+
+### Macro-generated usages
+
+The CLI scans raw source text by default. Enable preprocessing when a usage is
+spelled only through local macros:
+
+```text
+# autotmpl.conf
+preprocess=1
+preprocess_cc=cc
+preprocess_flags=-Iinclude -DFEATURE=1
+```
+
+For each input source the CLI runs:
+
+```text
+cc -E -P -I <workspace-root> <preprocess_flags> <source>
+```
+
+It then feeds the expanded text to the normal usage scanner. Missing
+`gen/*.h` files are temporarily created empty so preprocessing can succeed
+before any instantiation exists; those stubs are removed before generated
+blocks are written. This mode costs one preprocessor invocation per source file
+and reflects the chosen `-D` and `-I` flags, so leave it off when usages are
+already spelled directly. Operation calls such as `box_alloc(int)()` are mapped
+back to their owning type template from the header signature.
+
+The clangd plugin keeps its fast unsaved-buffer scan and does not invoke an
+external preprocessor. It can recover many macro-generated type usages through
+clang diagnostics after parsing.
 
 ## What the pattern does
 

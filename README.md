@@ -170,6 +170,7 @@ Advanced generation lives in the usage guide:
 | [**STC quick start**](doc/USAGE.md#stc-quick-start) | Thin adapters, auto-detection, explicit template lists, and traits. |
 | [**Polymorphism**](doc/POLYMORPHISM.md) | Generated functions, function templates, static dispatch, and direct trait calls. |
 | [**Build guide**](doc/BUILD.md) | CLI build, clangd plugin build, loading, tests, and build errors. |
+| [**Performance**](doc/PERFORMANCE.md) | Benchmark methodology, configuration costs, and sample results. |
 | [**Troubleshooting**](doc/TROUBLESHOOTING.md) | Common failures and fixes. |
 
 ## Configuration
@@ -197,11 +198,17 @@ dispatch_templates=vec,pair
 | Call style | `dispatch_style` | `C_AUTOTMPL_DISPATCH_STYLE` | `prefix` (default) or `postfix` affix placement. |
 | Call affix | `dispatch_affix` | `C_AUTOTMPL_DISPATCH_AFFIX` | Affix text; default `$`. |
 | Call templates | `dispatch_templates` | `C_AUTOTMPL_DISPATCH_TEMPLATES` | Comma-separated templates that get generic calls. |
+| Preprocess | `preprocess` | `C_AUTOTMPL_PREPROCESS` | CLI only: scan `cc -E -P` output so macro-generated usages are visible. Off by default. |
+| Preprocessor | `preprocess_cc` | `C_AUTOTMPL_PREPROCESS_CC` | Preprocessor command; default `cc`. |
+| Preprocessor flags | `preprocess_flags` | `C_AUTOTMPL_PREPROCESS_FLAGS` | Extra flags such as `-Iinclude -DFEATURE=1`. |
 | Plugin root | n/a | `C_AUTOTMPL_ROOT` | Force the clangd workspace root. |
 
-Use `dispatch_style` and `dispatch_affix` for custom call spellings. See
-[configuration in the usage guide](doc/USAGE.md#configuration) for CLI flags and
-template-authoring details.
+Use `dispatch_style` and `dispatch_affix` for custom call spellings.
+Preprocessing is opt-in because it costs one compiler invocation per source
+file. The CLI temporarily treats missing generated headers as empty files so a
+first run can preprocess successfully, then removes those stubs before writing
+real blocks. See [configuration in the usage guide](doc/USAGE.md#configuration)
+for CLI flags, macro-generated usages, and template-authoring details.
 
 ## Build and test
 
@@ -217,25 +224,18 @@ The plugin build needs a matching LLVM source and build tree; the CLI does not.
 `~/.local/lib/c-autotmpl/libc-autotmpl.so`. Restart clangd after replacing the
 module.
 
-## Benchmarks
+## Performance
 
-With the C99 CLI, median of three runs:
-
-| Measurement | 510 headers | 2010 headers |
-| --- | ---: | ---: |
-| `clang -fsyntax-only` | 815 ms | 813 ms |
-| `autotmpl --dry-run` | 1.7 ms | 1.6 ms |
-| `autotmpl` cold generation | 1.8 ms | 1.8 ms |
-| plugin `prepareUpdate`, first open | 0.36 ms | 0.36 ms |
-| plugin `prepareUpdate`, edits | 0.22 ms | 0.26 ms |
-
-Run `make bench` to reproduce these numbers.
+It's really fast. On the benchmark workload the C99 CLI adds roughly 20 ms to
+a one-second syntax check, and plugin edits stay around 2 ms. See
+[PERFORMANCE.md](doc/PERFORMANCE.md) for methodology, configuration comparisons,
+and `make bench` results.
 
 ## Limitations
 
 - Generated headers always live in a sibling `gen/` directory.
 - `#pragma once` headers cannot provide a testable guard.
-- The CLI does not see usages created only by macro expansion.
+- The CLI uses raw text by default; enable `preprocess=1` to see macro-generated usages.
 - Function templates need explicit type arguments; there is no deduction.
 - Nested blocks depend on include order in the source file.
 - The clangd module must be rebuilt against a matching clangd version.

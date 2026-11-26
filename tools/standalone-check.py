@@ -23,6 +23,9 @@ CONFIG_KEYS = (
     "C_AUTOTMPL_DISPATCH_AFFIX",
     "C_AUTOTMPL_DISPATCH_SUFFIX",
     "C_AUTOTMPL_DISPATCH_TEMPLATES",
+    "C_AUTOTMPL_PREPROCESS",
+    "C_AUTOTMPL_PREPROCESS_CC",
+    "C_AUTOTMPL_PREPROCESS_FLAGS",
 )
 
 
@@ -757,6 +760,90 @@ int main(void) {
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
+
+def check_preprocess(cli):
+    compiler = os.environ.get("CC") or next(
+        (name for name in ("cc", "gcc", "clang") if shutil.which(name)),
+        None,
+    )
+    if not compiler:
+        return
+    root = tempfile.mkdtemp(prefix="c-autotmpl-preprocess-")
+    try:
+        os.makedirs(os.path.join(root, "tmpl"))
+        os.makedirs(os.path.join(root, "gen"))
+        write(os.path.join(root, "tmpl", "box.h"), """\
+// -- template type Box(T)
+#define BOX_CAT_I(A, B) A##B
+#define BOX_CAT(A, B) BOX_CAT_I(A, B)
+#define Box(T) BOX_CAT(Box_, T)
+#define box_alloc(T) BOX_CAT(box_alloc_, T)
+#ifndef T
+typedef int T;
+#endif
+typedef struct { T value; } Box(T);
+static inline Box(T) *box_alloc(T)(void) {
+  static Box(T) value;
+  return &value;
+}
+#undef T
+""")
+        write(os.path.join(root, "main.c"), """\
+#include "gen/box.h"
+
+#define MAKE_BOX(T) Box(T)
+#define NEW_BOX(T) box_alloc(T)()
+
+int main(void) {
+  MAKE_BOX(int) a = {1};
+  void *b = NEW_BOX(float);
+  return a.value + (b != 0);
+}
+""")
+        write(os.path.join(root, "autotmpl.conf"),
+              "preprocess=1\npreprocess_cc=%s\n" % compiler)
+        args = [cli, "--root", root, "--verbose",
+                os.path.join(root, "main.c")]
+        proc = subprocess.run(args, cwd=root, capture_output=True, text=True,
+                              env=env_with())
+        output = proc.stdout + proc.stderr
+        require(proc.returncode == 0, "preprocess run exited with error",
+                output)
+        require("preprocess=1" in output,
+                "preprocess opt-in was not reported", output)
+        require("generated Box(int)" in output and
+                "generated Box(float)" in output,
+                "macro-only usages were not generated", output)
+
+        with open(os.path.join(root, "gen", "box.h")) as f:
+            content = f.read()
+        for needle in ("/* c-autotmpl: Box(int) */",
+                       "/* c-autotmpl: Box(float) */"):
+            require(needle in content, "missing preprocessed block: " + needle,
+                    content)
+
+        rerun = subprocess.run(args, cwd=root, capture_output=True, text=True,
+                               env=env_with())
+        require(rerun.returncode == 0 and
+                "added=0" in rerun.stdout + rerun.stderr,
+                "preprocess mode was not idempotent",
+                rerun.stdout + rerun.stderr)
+
+        os.remove(os.path.join(root, "autotmpl.conf"))
+        os.remove(os.path.join(root, "gen", "box.h"))
+        plain = subprocess.run(args, cwd=root, capture_output=True, text=True,
+                               env=env_with())
+        require(plain.returncode == 0 and
+                "added=0" in plain.stdout + plain.stderr,
+                "preprocess mode ran without opt-in",
+                plain.stdout + plain.stderr)
+        require(not os.path.exists(os.path.join(root, "gen", "box.h")),
+                "raw scan unexpectedly created a generated header",
+                plain.stdout + plain.stderr)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main():
     cli = os.path.abspath(
         sys.argv[1] if len(sys.argv) > 1 else "build/autotmpl"
@@ -772,6 +859,7 @@ def main():
     check_unprefixed_stc(cli)
     check_stc_auto(cli)
     check_dispatch(cli)
+    check_preprocess(cli)
 
     root = tempfile.mkdtemp(prefix="c-autotmpl-standalone-")
     try:
