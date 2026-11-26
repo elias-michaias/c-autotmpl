@@ -198,17 +198,19 @@ dispatch_templates=vec,pair
 | Call style | `dispatch_style` | `C_AUTOTMPL_DISPATCH_STYLE` | `prefix` (default) or `postfix` affix placement. |
 | Call affix | `dispatch_affix` | `C_AUTOTMPL_DISPATCH_AFFIX` | Affix text; default `$`. |
 | Call templates | `dispatch_templates` | `C_AUTOTMPL_DISPATCH_TEMPLATES` | Comma-separated templates that get generic calls. |
-| Preprocess | `preprocess` | `C_AUTOTMPL_PREPROCESS` | CLI only: scan `cc -E -P` output so macro-generated usages are visible. Off by default. |
-| Preprocessor | `preprocess_cc` | `C_AUTOTMPL_PREPROCESS_CC` | Preprocessor command; default `cc`. |
+| Preprocess | `preprocess` | `C_AUTOTMPL_PREPROCESS` | CLI only: scan expanded source so macro-generated usages are visible. Off by default. |
+| Preprocess backend | `preprocess_backend` | `C_AUTOTMPL_PREPROCESS_BACKEND` | `local` internal expander (fast) or `full` batched `cc -E -P` (default, exact). |
+| Preprocessor | `preprocess_cc` | `C_AUTOTMPL_PREPROCESS_CC` | Preprocessor command for the `full` backend; default `cc`. |
 | Preprocessor flags | `preprocess_flags` | `C_AUTOTMPL_PREPROCESS_FLAGS` | Extra flags such as `-Iinclude -DFEATURE=1`. |
 | Plugin root | n/a | `C_AUTOTMPL_ROOT` | Force the clangd workspace root. |
 
 Use `dispatch_style` and `dispatch_affix` for custom call spellings.
-Preprocessing is opt-in because it costs one compiler invocation per source
-file. The CLI temporarily treats missing generated headers as empty files so a
-first run can preprocess successfully, then removes those stubs before writing
-real blocks. See [configuration in the usage guide](doc/USAGE.md#configuration)
-for CLI flags, macro-generated usages, and template-authoring details.
+Preprocessing is opt-in. The `local` backend expands common wrapper macros
+inside the CLI with no external process; the `full` backend passes all sources
+to one batched compiler invocation and treats missing generated headers as
+empty files while bootstrapping. See
+[configuration in the usage guide](doc/USAGE.md#configuration) for CLI flags,
+macro-generated usages, and template-authoring details.
 
 ## Build and test
 
@@ -227,9 +229,10 @@ module.
 ## Performance
 
 It's really fast. On the benchmark workload the C99 CLI adds roughly 20 ms to
-a one-second syntax check, and plugin edits stay around 2 ms. See
-[PERFORMANCE.md](doc/PERFORMANCE.md) for methodology, configuration comparisons,
-and `make bench` results.
+a one-second syntax check, plugin edits stay around 2 ms, and even macro-only
+usages can be expanded internally in about 39 ms with `preprocess=1` and
+`preprocess_backend=local`. See [PERFORMANCE.md](doc/PERFORMANCE.md) for
+methodology, configuration comparisons, and `make bench` results.
 
 ## Limitations
 

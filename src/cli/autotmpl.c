@@ -301,6 +301,13 @@ int is_ident_start(char c) {
 
 int is_ident_char(char c) { return is_ident_start(c) || (c >= '0' && c <= '9'); }
 
+static int ascii_ieq(const char *a, const char *b) {
+  for (; *a && *b; ++a, ++b)
+    if (tolower((unsigned char)*a) != tolower((unsigned char)*b))
+      return 0;
+  return *a == *b;
+}
+
 char *trim_copy(const char *s) { return trim_copy_n(s, strlen(s)); }
 
 char *trim_copy_n(const char *s, size_t n) {
@@ -1089,11 +1096,20 @@ typedef struct {
   int has_names;
 } DispatchConfig;
 
+typedef enum {
+  PREPROCESS_BACKEND_FULL,
+  PREPROCESS_BACKEND_LOCAL
+} PreprocessBackend;
+
 typedef struct {
   int enabled;
+  PreprocessBackend backend;
   char *cc;
   char *flags;
 } PreprocessConfig;
+
+#define PREPROCESS_BATCH_SIZE 128
+#define MACRO_EXPAND_DEPTH 32
 
 static TemplateDef *registry_find(const Registry *r, const char *name) {
   for (size_t i = 0; i < r->items.len; ++i) {
@@ -1850,9 +1866,19 @@ static DispatchConfig resolve_dispatch(void) {
   return cfg;
 }
 
+static PreprocessBackend parse_preprocess_backend(const char *text) {
+  if (!text || !text[0])
+    return PREPROCESS_BACKEND_FULL;
+  if (ascii_ieq(text, "local") || ascii_ieq(text, "internal") ||
+      ascii_ieq(text, "fast"))
+    return PREPROCESS_BACKEND_LOCAL;
+  return PREPROCESS_BACKEND_FULL;
+}
+
 static PreprocessConfig resolve_preprocess(void) {
   PreprocessConfig cfg;
   cfg.enabled = parse_bool_text(config_value("preprocess")) == 1;
+  cfg.backend = parse_preprocess_backend(config_value("preprocess_backend"));
   const char *cc = config_value("preprocess_cc");
   const char *flags = config_value("preprocess_flags");
   cfg.cc = xstrdup(cc && cc[0] ? cc : "cc");
@@ -1885,48 +1911,758 @@ static char *shell_quote(const char *text) {
   return str_take(&out);
 }
 
-/* Full-fidelity mode is opt-in: it expands the original source with the
- * configured preprocessor before the normal lexical usage scan. Includes are
- * resolved normally, but generated headers are allowed to be empty during the
- * bootstrap pass; temporary empty stubs are removed before generation. */
-static char *preprocess_source(const char *path, const char *root,
-                               const PreprocessConfig *cfg, int verbose) {
-  char *source = shell_quote(path);
-  char *root_dir = shell_quote(root);
-  Str cmd;
-  str_init(&cmd);
-  str_append(&cmd, cfg->cc);
-  str_append(&cmd, " -E -P -I ");
-  str_append(&cmd, root_dir);
-  if (cfg->flags[0]) {
-    str_append_char(&cmd, ' ');
-    str_append(&cmd, cfg->flags);
-  }
-  str_append_char(&cmd, ' ');
-  str_append(&cmd, source);
+/* ---------------- opt-in local macro expander ---------------- */
 
-  FILE *pipe = autotmpl_popen(cmd.data, "r");
-  free(source);
-  free(root_dir);
-  str_free(&cmd);
-  if (!pipe) {
-    fprintf(stderr, "warning: cannot start preprocessor for %s\n", path);
+typedef struct {
+  char *name;
+  int function_like;
+  int variadic;
+  char **params;
+  size_t nparams;
+  char *body;
+} MacroDef;
+
+typedef struct {
+  MacroDef **items;
+  size_t len;
+  size_t cap;
+} MacroTable;
+
+typedef struct {
+  MacroTable *table;
+  Set visited;
+  const Registry *reg;
+  const Set *generated;
+  const char *root;
+} MacroCollectCtx;
+
+static void macro_def_free(MacroDef *def) {
+  if (!def)
+    return;
+  free(def->name);
+  free(def->body);
+  for (size_t i = 0; i < def->nparams; ++i)
+    free(def->params[i]);
+  free(def->params);
+  free(def);
+}
+
+static void macro_table_free(MacroTable *table) {
+  for (size_t i = 0; i < table->len; ++i)
+    macro_def_free(table->items[i]);
+  free(table->items);
+  table->items = NULL;
+  table->len = table->cap = 0;
+}
+
+static MacroDef *macro_find(const MacroTable *table, const char *name) {
+  for (size_t i = 0; i < table->len; ++i)
+    if (strcmp(table->items[i]->name, name) == 0)
+      return table->items[i];
+  return NULL;
+}
+
+static void macro_remove(MacroTable *table, const char *name) {
+  for (size_t i = 0; i < table->len; ++i) {
+    if (strcmp(table->items[i]->name, name) != 0)
+      continue;
+    macro_def_free(table->items[i]);
+    for (size_t j = i + 1; j < table->len; ++j)
+      table->items[j - 1] = table->items[j];
+    --table->len;
+    return;
+  }
+}
+
+static void macro_put(MacroTable *table, MacroDef *def) {
+  macro_remove(table, def->name);
+  if (table->len == table->cap) {
+    table->cap = table->cap ? table->cap * 2 : 16;
+    table->items = (MacroDef **)xrealloc(
+        table->items, table->cap * sizeof(MacroDef *));
+  }
+  table->items[table->len++] = def;
+}
+
+static int macro_is_protected(const char *name, const Registry *reg) {
+  return registry_find(reg, name) != NULL || registry_find_op(reg, name) != NULL;
+}
+
+static int contains_call_name(const char *text, const char *name) {
+  size_t n = strlen(name);
+  if (!n)
+    return 0;
+  const char *p = text;
+  while ((p = strstr(p, name)) != NULL) {
+    if ((p == text || !is_ident_char(p[-1])) &&
+        !is_ident_char(p[n])) {
+      const char *q = p + n;
+      while (is_space(*q))
+        ++q;
+      if (*q == '(')
+        return 1;
+    }
+    p += n;
+  }
+  return 0;
+}
+
+static int body_mentions_template(const char *body, const Registry *reg) {
+  for (size_t i = 0; i < reg->items.len; ++i) {
+    TemplateDef *def = (TemplateDef *)reg->items.items[i];
+    if (contains_call_name(body, def->name))
+      return 1;
+    for (size_t j = 0; j < def->dispatch_ops.len; ++j)
+      if (contains_call_name(body, (char *)def->dispatch_ops.items[j]))
+        return 1;
+  }
+  return 0;
+}
+
+static size_t param_index(const MacroDef *def, const char *name) {
+  for (size_t i = 0; i < def->nparams; ++i)
+    if (strcmp(def->params[i], name) == 0)
+      return i;
+  return (size_t)-1;
+}
+
+static void macro_set_params(MacroDef *def, const char *text, size_t begin,
+                             size_t end) {
+  Vec params;
+  params.items = NULL;
+  params.len = params.cap = 0;
+  size_t start = begin;
+  int variadic = 0;
+  for (size_t i = begin; i <= end; ++i) {
+    if (i == end || text[i] == ',') {
+      char *item = trim_copy_n(text + start, i - start);
+      if (strcmp(item, "...") == 0) {
+        variadic = 1;
+        vec_push(&params, xstrdup("__VA_ARGS__"));
+      } else if (item[0]) {
+        vec_push(&params, item);
+      } else {
+        free(item);
+      }
+      start = i + 1;
+    }
+  }
+  def->variadic = variadic;
+  def->nparams = params.len;
+  def->params = (char **)params.items;
+}
+
+static MacroDef *macro_parse_definition(const char *line, const Registry *reg) {
+  const char *p = line;
+  while (is_space(*p))
+    ++p;
+  if (!is_ident_start(*p))
+    return NULL;
+  size_t name_start = (size_t)(p - line);
+  while (is_ident_char(*(p + 1)))
+    ++p;
+  size_t name_end = (size_t)(p - line) + 1;
+  char *name = xstrdup_n(line + name_start, name_end - name_start);
+  if (macro_is_protected(name, reg) || ascii_ieq(name, "defined") ||
+      strcmp(name, "__VA_ARGS__") == 0) {
+    free(name);
     return NULL;
   }
 
+  MacroDef *def = (MacroDef *)xmalloc(sizeof(MacroDef));
+  def->name = name;
+  def->function_like = 0;
+  def->variadic = 0;
+  def->params = NULL;
+  def->nparams = 0;
+  def->body = NULL;
+
+  if (*(p + 1) == '(') {
+    size_t open = (size_t)(p - line) + 1;
+    size_t close = open + 1;
+    int depth = 1;
+    while (line[close] && depth > 0) {
+      if (line[close] == '(')
+        ++depth;
+      else if (line[close] == ')')
+        --depth;
+      if (depth > 0)
+        ++close;
+    }
+    if (depth != 0) {
+      macro_def_free(def);
+      return NULL;
+    }
+    def->function_like = 1;
+    macro_set_params(def, line, open + 1, close);
+    def->body = trim_copy(line + close + 1);
+  } else {
+    def->body = trim_copy(p + 1);
+    if (!body_mentions_template(def->body, reg)) {
+      macro_def_free(def);
+      return NULL;
+    }
+  }
+  if (!def->body[0]) {
+    macro_def_free(def);
+    return NULL;
+  }
+  return def;
+}
+
+static void macro_parse_flags(const char *flags, MacroTable *table,
+                              const Registry *reg) {
+  if (!flags)
+    return;
+  for (const char *p = flags; *p; ++p) {
+    if (*p != 'D' || (p != flags && !is_space(p[-1])))
+      continue;
+    ++p;
+    while (is_space(*p))
+      ++p;
+    size_t start = (size_t)(p - flags);
+    while (flags[start] && !is_space(flags[start]))
+      ++start;
+    char *def_text = xstrdup_n(flags + (p - flags), start - (p - flags));
+    char *eq = strchr(def_text, '=');
+    if (eq) {
+      *eq = '\0';
+      char *body = eq + 1;
+      /* Command-line function macros need shell-aware tokenization; local
+       * mode keeps those defined in project files. */
+      if (!strchr(def_text, '(')) {
+        MacroDef *def = (MacroDef *)xmalloc(sizeof(MacroDef));
+        def->name = xstrdup(def_text);
+        def->function_like = 0;
+        def->variadic = 0;
+        def->params = NULL;
+        def->nparams = 0;
+        def->body = xstrdup(body);
+        if (macro_is_protected(def->name, reg) ||
+            !body_mentions_template(def->body, reg))
+          macro_def_free(def);
+        else
+          macro_put(table, def);
+      }
+    }
+    p = flags + start;
+    if (!*p)
+      break;
+  }
+}
+
+static void collect_macros_text(const char *text, const char *dir,
+                                MacroCollectCtx *ctx);
+
+static char *resolve_local_include(const char *name, int angled,
+                                   const char *dir, const char *root) {
+  char *path = angled ? NULL : path_join(dir, name);
+  if (path && !path_is_file(path)) {
+    free(path);
+    path = NULL;
+  }
+  if (!path) {
+    path = path_join(root, name);
+    if (!path_is_file(path)) {
+      free(path);
+      return NULL;
+    }
+  }
+  return path;
+}
+
+static void collect_macros_file(const char *path, MacroCollectCtx *ctx) {
+  if (set_has(&ctx->visited, path) ||
+      (ctx->generated && set_has(ctx->generated, path)))
+    return;
+  set_add(&ctx->visited, path);
+  char *text = read_file(path, NULL);
+  if (!text)
+    return;
+  char *dir = path_dirname(path);
+  collect_macros_text(text, dir, ctx);
+  free(dir);
+  free(text);
+}
+
+static void collect_macros_text(const char *text, const char *dir,
+                                MacroCollectCtx *ctx) {
+  size_t len = strlen(text);
+  size_t pos = 0;
+  while (pos < len) {
+    size_t line_start = pos;
+    size_t eol = pos;
+    while (eol < len && text[eol] != '\n')
+      ++eol;
+    Str logical;
+    str_init(&logical);
+    for (;;) {
+      size_t end = eol;
+      if (end > line_start && text[end - 1] == '\r')
+        --end;
+      size_t trimmed = end;
+      while (trimmed > line_start && is_space(text[trimmed - 1]))
+        --trimmed;
+      int continued = trimmed > line_start && text[trimmed - 1] == '\\';
+      if (continued)
+        --trimmed;
+      str_append_n(&logical, text + line_start, trimmed - line_start);
+      str_append_char(&logical, '\n');
+      pos = eol < len ? eol + 1 : len;
+      if (!continued || pos >= len)
+        break;
+      line_start = pos;
+      eol = pos;
+      while (eol < len && text[eol] != '\n')
+        ++eol;
+    }
+
+    char *line = str_take(&logical);
+    char *trimmed_line = trim_copy(line);
+    if (trimmed_line[0] == '#') {
+      const char *p = trimmed_line + 1;
+      while (is_space(*p))
+        ++p;
+      size_t word_start = (size_t)(p - trimmed_line);
+      while (is_ident_char(*p))
+        ++p;
+      size_t word_end = (size_t)(p - trimmed_line);
+      char *word = xstrdup_n(trimmed_line + word_start, word_end - word_start);
+      char *rest = trim_copy(p);
+      if (strcmp(word, "define") == 0) {
+        MacroDef *def = macro_parse_definition(rest, ctx->reg);
+        if (def)
+          macro_put(ctx->table, def);
+      } else if (strcmp(word, "undef") == 0) {
+        char *name = trim_copy(rest);
+        size_t n = 0;
+        while (is_ident_char(name[n]))
+          ++n;
+        if (n) {
+          name[n] = '\0';
+          macro_remove(ctx->table, name);
+        }
+        free(name);
+      } else if (strcmp(word, "include") == 0) {
+        int angled = rest[0] == '<';
+        char quote = angled ? '>' : '"';
+        if (rest[0] == '"' || angled) {
+          const char *end = strchr(rest + 1, quote);
+          if (end) {
+            char *name = xstrdup_n(rest + 1, (size_t)(end - rest - 1));
+            char *path = resolve_local_include(name, angled, dir, ctx->root);
+            free(name);
+            if (path) {
+              collect_macros_file(path, ctx);
+              free(path);
+            }
+          }
+        }
+      }
+      free(word);
+      free(rest);
+    }
+    free(trimmed_line);
+    free(line);
+  }
+}
+
+static size_t macro_skip_literal(const char *text, size_t i) {
+  char quote = text[i];
+  ++i;
+  while (text[i]) {
+    if (text[i] == '\\' && text[i + 1]) {
+      i += 2;
+      continue;
+    }
+    if (text[i] == quote)
+      return i + 1;
+    ++i;
+  }
+  return i;
+}
+
+static size_t macro_skip_comment(const char *text, size_t i) {
+  if (text[i + 1] == '/') {
+    while (text[i] && text[i] != '\n')
+      ++i;
+    return i;
+  }
+  i += 2;
+  while (text[i]) {
+    if (text[i] == '*' && text[i + 1] == '/')
+      return i + 2;
+    ++i;
+  }
+  return i;
+}
+
+static int macro_is_stack(MacroDef **stack, size_t stack_len,
+                          const MacroDef *def) {
+  for (size_t i = 0; i < stack_len; ++i)
+    if (stack[i] == def)
+      return 1;
+  return 0;
+}
+
+static char *macro_remove_paste(const char *text) {
   Str out;
   str_init(&out);
-  char buf[4096];
-  while (fgets(buf, sizeof(buf), pipe))
-    str_append(&out, buf);
-  int rc = autotmpl_pclose(pipe);
-  if (rc != 0 || !out.len) {
-    if (verbose)
-      fprintf(stderr, "warning: preprocessor failed for %s; using raw text\n",
-              path);
-    str_free(&out);
-    return NULL;
+  size_t i = 0;
+  while (text[i]) {
+    if (text[i] == '"' || text[i] == '\'') {
+      size_t j = macro_skip_literal(text, i);
+      str_append_n(&out, text + i, j - i);
+      i = j;
+      continue;
+    }
+    if (text[i] == '#' && text[i + 1] == '#') {
+      while (out.len && is_space(out.data[out.len - 1]))
+        --out.len;
+      if (out.data)
+        out.data[out.len] = '\0';
+      i += 2;
+      while (is_space(text[i]))
+        ++i;
+      continue;
+    }
+    str_append_char(&out, text[i]);
+    ++i;
   }
+  return str_take(&out);
+}
+
+static char *expand_text_depth(const char *text, MacroTable *table,
+                               const Registry *reg, MacroDef **stack,
+                               size_t stack_len);
+
+static int macro_parse_args(const char *text, size_t open, const MacroDef *def,
+                            size_t *close_out, Vec *args) {
+  size_t i = open + 1;
+  size_t start = i;
+  int depth = 1;
+  while (text[i] && depth > 0) {
+    if (text[i] == '"' || text[i] == '\'') {
+      i = macro_skip_literal(text, i);
+      continue;
+    }
+    if (text[i] == '/' && (text[i + 1] == '*' || text[i + 1] == '/')) {
+      i = macro_skip_comment(text, i);
+      continue;
+    }
+    if (text[i] == '(') {
+      ++depth;
+      ++i;
+      continue;
+    }
+    if (text[i] == ')') {
+      --depth;
+      if (depth == 0)
+        break;
+      ++i;
+      continue;
+    }
+    if (text[i] == ',' && depth == 1) {
+      vec_push(args, trim_copy_n(text + start, i - start));
+      start = i + 1;
+      ++i;
+      continue;
+    }
+    ++i;
+  }
+  if (depth != 0)
+    return 0;
+  if (start < i || args->len > 0 || def->nparams == 1)
+    vec_push(args, trim_copy_n(text + start, i - start));
+  *close_out = i + 1;
+  return 1;
+}
+
+static char *macro_substitute(const MacroDef *def, const Vec *args,
+                              MacroTable *table, const Registry *reg,
+                              MacroDef **stack, size_t stack_len) {
+  Str out;
+  str_init(&out);
+  const char *body = def->body;
+  size_t i = 0;
+  while (body[i]) {
+    if (body[i] == '"' || body[i] == '\'') {
+      size_t j = macro_skip_literal(body, i);
+      str_append_n(&out, body + i, j - i);
+      i = j;
+      continue;
+    }
+    if (is_ident_start(body[i])) {
+      size_t j = i + 1;
+      while (is_ident_char(body[j]))
+        ++j;
+      char *name = xstrdup_n(body + i, j - i);
+      size_t idx = param_index(def, name);
+      if (idx != (size_t)-1 && def->variadic && idx + 1 == def->nparams &&
+          args && args->len > idx) {
+        Str joined;
+        str_init(&joined);
+        for (size_t k = idx; k < args->len; ++k) {
+          if (k > idx)
+            str_append_char(&joined, ',');
+          str_append(&joined, (char *)args->items[k]);
+        }
+        str_append(&out, joined.data ? joined.data : "");
+        str_free(&joined);
+      } else if (idx != (size_t)-1 && args && idx < args->len) {
+        str_append(&out, (char *)args->items[idx]);
+      } else {
+        str_append_n(&out, body + i, j - i);
+      }
+      free(name);
+      i = j;
+      continue;
+    }
+    str_append_char(&out, body[i]);
+    ++i;
+  }
+
+  char *raw = str_take(&out);
+  char *pasted = macro_remove_paste(raw);
+  free(raw);
+  if (stack_len >= MACRO_EXPAND_DEPTH)
+    return pasted;
+  char *expanded = expand_text_depth(pasted, table, reg, stack, stack_len);
+  free(pasted);
+  return expanded;
+}
+
+static char *expand_text_depth(const char *text, MacroTable *table,
+                               const Registry *reg, MacroDef **stack,
+                               size_t stack_len) {
+  Str out;
+  str_init(&out);
+  size_t i = 0;
+  while (text[i]) {
+    if ((i == 0 || text[i - 1] == '\n')) {
+      size_t j = i;
+      while (text[j] == ' ' || text[j] == '\t' || text[j] == '\r')
+        ++j;
+      if (text[j] == '#') {
+        size_t eol = j;
+        while (text[eol] && text[eol] != '\n')
+          ++eol;
+        str_append_n(&out, text + i, eol - i);
+        i = eol;
+        continue;
+      }
+    }
+    if (text[i] == '"' || text[i] == '\'') {
+      size_t j = macro_skip_literal(text, i);
+      str_append_n(&out, text + i, j - i);
+      i = j;
+      continue;
+    }
+    if (text[i] == '/' && (text[i + 1] == '*' || text[i + 1] == '/')) {
+      size_t j = macro_skip_comment(text, i);
+      str_append_n(&out, text + i, j - i);
+      i = j;
+      continue;
+    }
+    if (is_ident_start(text[i])) {
+      size_t j = i + 1;
+      while (is_ident_char(text[j]))
+        ++j;
+      char *name = xstrdup_n(text + i, j - i);
+      MacroDef *def = macro_find(table, name);
+      if (!def || macro_is_protected(name, reg) ||
+          macro_is_stack(stack, stack_len, def) ||
+          stack_len >= MACRO_EXPAND_DEPTH) {
+        str_append_n(&out, text + i, j - i);
+        free(name);
+        i = j;
+        continue;
+      }
+
+      size_t after = j;
+      while (is_space(text[after]) && text[after] != '\n')
+        ++after;
+      size_t close = after;
+      int invoked = def->function_like && text[after] == '(';
+      if (!def->function_like || invoked) {
+        MacroDef **next = (MacroDef **)xmalloc((stack_len + 1) *
+                                                sizeof(MacroDef *));
+        for (size_t k = 0; k < stack_len; ++k)
+          next[k] = stack[k];
+        next[stack_len] = def;
+
+        Vec args;
+        args.items = NULL;
+        args.len = args.cap = 0;
+        if (invoked &&
+            macro_parse_args(text, after, def, &close, &args)) {
+          Vec expanded_args;
+          expanded_args.items = NULL;
+          expanded_args.len = expanded_args.cap = 0;
+          for (size_t k = 0; k < args.len; ++k) {
+            char *arg = (char *)args.items[k];
+            char *expanded = expand_text_depth(arg, table, reg, next,
+                                               stack_len + 1);
+            vec_push(&expanded_args, expanded);
+            free(arg);
+          }
+          free(args.items);
+          if (def->variadic && expanded_args.len >= def->nparams &&
+              def->nparams > 0) {
+            Str joined;
+            str_init(&joined);
+            for (size_t k = def->nparams - 1; k < expanded_args.len; ++k) {
+              if (k > def->nparams - 1)
+                str_append_char(&joined, ',');
+              str_append(&joined, (char *)expanded_args.items[k]);
+            }
+            free(expanded_args.items[def->nparams - 1]);
+            expanded_args.items[def->nparams - 1] = str_take(&joined);
+            expanded_args.len = def->nparams;
+          }
+          char *repl = macro_substitute(def, &expanded_args, table, reg,
+                                        next, stack_len + 1);
+          str_append(&out, repl);
+          free(repl);
+          for (size_t k = 0; k < expanded_args.len; ++k)
+            free(expanded_args.items[k]);
+          free(expanded_args.items);
+          i = close;
+        } else {
+          for (size_t k = 0; k < args.len; ++k)
+            free(args.items[k]);
+          free(args.items);
+          char *repl = macro_substitute(def, NULL, table, reg, next,
+                                        stack_len + 1);
+          str_append(&out, repl);
+          free(repl);
+          i = j;
+        }
+        free(next);
+      } else {
+        str_append_n(&out, text + i, j - i);
+        i = j;
+      }
+      free(name);
+      continue;
+    }
+    str_append_char(&out, text[i]);
+    ++i;
+  }
+  return str_take(&out);
+}
+
+static char *expand_sources_locally(const Vec *paths, const char *root,
+                                    const Registry *reg, const Set *generated,
+                                    const char *flags, int verbose) {
+  Str out;
+  str_init(&out);
+  size_t macro_count = 0;
+
+  /* Macros are collected per input translation unit, not globally. This keeps
+   * a macro defined in one source file from leaking into the next, matching
+   * the full preprocessor backend. */
+  for (size_t i = 0; i < paths->len; ++i) {
+    MacroTable table;
+    table.items = NULL;
+    table.len = table.cap = 0;
+    MacroCollectCtx ctx;
+    ctx.table = &table;
+    ctx.visited.items = NULL;
+    ctx.visited.len = ctx.visited.cap = 0;
+    ctx.reg = reg;
+    ctx.generated = generated;
+    ctx.root = root;
+
+    collect_macros_file((const char *)paths->items[i], &ctx);
+    macro_parse_flags(flags, &table, reg);
+    macro_count += table.len;
+
+    char *text = read_file((const char *)paths->items[i], NULL);
+    if (text) {
+      char *expanded = expand_text_depth(text, &table, reg, NULL, 0);
+      str_append(&out, expanded);
+      if (out.len && out.data[out.len - 1] != '\n')
+        str_append_char(&out, '\n');
+      free(expanded);
+      free(text);
+    }
+
+    free(ctx.visited.items);
+    macro_table_free(&table);
+  }
+
+  if (verbose)
+    printf("preprocess local macros=%zu files=%zu\n", macro_count, paths->len);
+  return str_take(&out);
+}
+
+/* Full-fidelity mode is opt-in: it expands the original sources with the
+ * configured preprocessor before the normal lexical usage scan. Includes are
+ * resolved normally, but generated headers are allowed to be empty during the
+ * bootstrap pass; temporary empty stubs are removed before generation.
+ *
+ * All inputs are passed to one preprocessor process in normal projects. GCC
+ * and Clang still treat each input as a separate translation unit, so macros
+ * defined in one file do not leak into the next. Large input lists are split
+ * into batches to stay below command-line length limits. */
+static char *preprocess_sources(const Vec *paths, const char *root,
+                                const PreprocessConfig *cfg, int verbose) {
+  Str out;
+  str_init(&out);
+  size_t batches = 0;
+  size_t start = 0;
+
+  while (start < paths->len) {
+    size_t end = start + PREPROCESS_BATCH_SIZE;
+    if (end > paths->len)
+      end = paths->len;
+
+    char *root_dir = shell_quote(root);
+    Str cmd;
+    str_init(&cmd);
+    str_append(&cmd, cfg->cc);
+    str_append(&cmd, " -E -P -I ");
+    str_append(&cmd, root_dir);
+    free(root_dir);
+    if (cfg->flags[0]) {
+      str_append_char(&cmd, ' ');
+      str_append(&cmd, cfg->flags);
+    }
+    for (size_t i = start; i < end; ++i) {
+      char *source = shell_quote((const char *)paths->items[i]);
+      str_append_char(&cmd, ' ');
+      str_append(&cmd, source);
+      free(source);
+    }
+
+    FILE *pipe = autotmpl_popen(cmd.data, "r");
+    str_free(&cmd);
+    if (!pipe) {
+      fprintf(stderr, "warning: cannot start preprocessor\n");
+      str_free(&out);
+      return NULL;
+    }
+
+    char buf[4096];
+    while (fgets(buf, sizeof(buf), pipe))
+      str_append(&out, buf);
+    int rc = autotmpl_pclose(pipe);
+    if (rc != 0) {
+      if (verbose)
+        fprintf(stderr, "warning: preprocessor failed for batch %zu; "
+                        "using raw text\n", batches + 1);
+      str_free(&out);
+      return NULL;
+    }
+    if (out.len && out.data[out.len - 1] != '\n')
+      str_append_char(&out, '\n');
+    ++batches;
+    start = end;
+  }
+
+  if (verbose)
+    printf("preprocess batches=%zu files=%zu\n", batches, paths->len);
   return str_take(&out);
 }
 
@@ -4749,9 +5485,15 @@ int main(int argc, char **argv) {
   PreprocessConfig pre_cfg = resolve_preprocess();
   if (opt.verbose && pre_cfg.enabled) {
     printf("preprocess=1\n");
-    printf("preprocess cc=%s\n", pre_cfg.cc);
-    if (pre_cfg.flags[0])
+    printf("preprocess backend=%s\n",
+           pre_cfg.backend == PREPROCESS_BACKEND_LOCAL ? "local" : "full");
+    if (pre_cfg.backend == PREPROCESS_BACKEND_FULL) {
+      printf("preprocess cc=%s\n", pre_cfg.cc);
+      if (pre_cfg.flags[0])
+        printf("preprocess flags=%s\n", pre_cfg.flags);
+    } else if (pre_cfg.flags[0]) {
       printf("preprocess flags=%s\n", pre_cfg.flags);
+    }
   }
 
   DispatchConfig dispatch_cfg = resolve_dispatch();
@@ -4790,6 +5532,15 @@ int main(int argc, char **argv) {
       set_add(&generated_outputs, def->impl);
   }
 
+  Vec inputs;
+  inputs.items = NULL;
+  inputs.len = inputs.cap = 0;
+  for (size_t i = 0; i < files.len; ++i) {
+    char *path = (char *)files.items[i];
+    if (!set_has(&generated_outputs, path))
+      vec_push(&inputs, path);
+  }
+
   Vec file_usages;
   file_usages.items = NULL;
   file_usages.len = file_usages.cap = 0;
@@ -4800,36 +5551,50 @@ int main(int argc, char **argv) {
   Vec preprocess_stubs;
   preprocess_stubs.items = NULL;
   preprocess_stubs.len = preprocess_stubs.cap = 0;
-  if (pre_cfg.enabled)
+  if (pre_cfg.enabled && pre_cfg.backend == PREPROCESS_BACKEND_FULL)
     prepare_preprocessor_stubs(&reg, &preprocess_stubs, opt.verbose);
 
-  for (size_t i = 0; i < files.len; ++i) {
-    char *path = (char *)files.items[i];
-    if (set_has(&generated_outputs, path))
-      continue;
-    char *content = read_file(path, NULL);
-    if (!content)
-      continue;
-    char *scan_text = content;
-    if (pre_cfg.enabled) {
-      char *expanded = preprocess_source(path, root, &pre_cfg, opt.verbose);
-      if (expanded) {
-        free(content);
-        content = expanded;
-        scan_text = expanded;
-      }
+  int used_preprocessed = 0;
+  if (pre_cfg.enabled) {
+    char *expanded = NULL;
+    if (pre_cfg.backend == PREPROCESS_BACKEND_LOCAL)
+      expanded = expand_sources_locally(&inputs, root, &reg, &generated_outputs,
+                                        pre_cfg.flags, opt.verbose);
+    else
+      expanded = preprocess_sources(&inputs, root, &pre_cfg, opt.verbose);
+    if (expanded) {
+      FileUsages *fu = (FileUsages *)xmalloc(sizeof(FileUsages));
+      fu->path = inputs.len ? (char *)inputs.items[0] : NULL;
+      fu->usages.items = NULL;
+      fu->usages.len = fu->usages.cap = 0;
+      scan_usages(expanded, &reg, &fu->usages);
+      free(expanded);
+      for (size_t j = 0; j < fu->usages.len; ++j)
+        add_wanted_usage((Usage *)fu->usages.items[j], &reg, &wanted_names);
+      vec_push(&file_usages, fu);
+      used_preprocessed = 1;
     }
-    FileUsages *fu = (FileUsages *)xmalloc(sizeof(FileUsages));
-    fu->path = path;
-    fu->usages.items = NULL;
-    fu->usages.len = fu->usages.cap = 0;
-    scan_usages(scan_text, &reg, &fu->usages);
-    free(content);
-    for (size_t j = 0; j < fu->usages.len; ++j)
-      add_wanted_usage((Usage *)fu->usages.items[j], &reg, &wanted_names);
-    vec_push(&file_usages, fu);
+  }
+
+  if (!used_preprocessed) {
+    for (size_t i = 0; i < inputs.len; ++i) {
+      char *path = (char *)inputs.items[i];
+      char *content = read_file(path, NULL);
+      if (!content)
+        continue;
+      FileUsages *fu = (FileUsages *)xmalloc(sizeof(FileUsages));
+      fu->path = path;
+      fu->usages.items = NULL;
+      fu->usages.len = fu->usages.cap = 0;
+      scan_usages(content, &reg, &fu->usages);
+      free(content);
+      for (size_t j = 0; j < fu->usages.len; ++j)
+        add_wanted_usage((Usage *)fu->usages.items[j], &reg, &wanted_names);
+      vec_push(&file_usages, fu);
+    }
   }
   remove_preprocessor_stubs(&preprocess_stubs);
+  free(inputs.items);
 
   TypeIndex idx;
   idx.guards.items = NULL;

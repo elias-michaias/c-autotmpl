@@ -5,7 +5,8 @@ The benchmark separates the ways c-autotmpl can affect a build:
 
   * steady-state compilation of already-generated C code;
   * standalone `autotmpl --dry-run` scans under several configurations;
-  * cold generation from an empty `gen/` tree, with and without preprocessing;
+  * cold generation from an empty `gen/` tree, with the full and local
+    preprocessing backends;
   * clangd parse latency with and without the feature module, and with
     different plugin configurations.
 
@@ -73,12 +74,16 @@ CLI_SCENARIOS = (
     ("stc=auto", "profile=stc\nstc_auto=1\n"),
     ("preprocess", "preprocess=1\n"),
     ("preprocess+dispatch", "preprocess=1\ndispatch=1\n"),
+    ("preprocess=local", "preprocess=1\npreprocess_backend=local\n"),
+    ("preprocess=local+dispatch",
+     "preprocess=1\npreprocess_backend=local\ndispatch=1\n"),
 )
 
 COLD_SCENARIOS = (
     ("raw", ""),
     ("dispatch", "dispatch=1\n"),
     ("preprocess bootstrap", "preprocess=1\n"),
+    ("preprocess local", "preprocess=1\npreprocess_backend=local\n"),
     ("stc=auto", "profile=stc\nstc_auto=1\n"),
 )
 

@@ -54,8 +54,9 @@ The generated project contains:
 The `Vec` template has a signature-defined operation, `Vec_push(T)`, so the
 benchmark exercises dispatch generation as well as plain type instantiation.
 The STC template exercises `profile`/`stc_auto` configuration. The macro-only
-file exercises opt-in preprocessing without changing the default raw-text
-workload.
+file exercises both preprocessing backends without changing the default raw-text
+workload: the `full` backend expands all 82 sources in one batched compiler
+invocation, while `local` expands wrapper macros inside the CLI.
 
 ## Methodology
 
@@ -71,8 +72,14 @@ workload.
 - The clangd columns measure time to first diagnostics, not a full link or a
   complete AST build. Use them as relative comparisons, not absolute editor
   latency promises.
-- Omitting `preprocess=1` never invokes an external compiler. That is the main
-  performance cliff in the results below.
+- Omitting `preprocess=1` never invokes an external compiler. With the `local`
+  backend, enabling it still does not start a subprocess.
+- With `preprocess_backend=full`, all sources are passed to one compiler process
+  in batches of 128 files. Macros remain isolated per input because each file is
+  still a separate preprocessing translation unit.
+- The `local` backend collects macros per input translation unit, following
+  local includes but not evaluating conditionals. It is much faster but less
+  faithful than `full`.
 
 ## Configuration matrix
 
@@ -84,8 +91,10 @@ workload.
 | dispatch=postfix | `dispatch=1`, `dispatch_style=postfix`, `dispatch_affix=_method` | Affix parsing and naming; no spelling penalty. |
 | stc=explicit | `profile=stc`, `stc_templates=stc_vec` | Explicit STC wrapper selection. |
 | stc=auto | `profile=stc`, `stc_auto=1` | STC detection from template-header contents. |
-| preprocess | `preprocess=1` | Full `cc -E -P` expansion for macro-only usages. |
-| preprocess+dispatch | `preprocess=1`, `dispatch=1` | Both expensive expansion and dispatch generation. |
+| preprocess | `preprocess=1` | Default `full` backend: batched `cc -E -P` expansion. |
+| preprocess+dispatch | `preprocess=1`, `dispatch=1` | Batched expansion plus dispatch generation. |
+| preprocess=local | `preprocess=1`, `preprocess_backend=local` | Internal wrapper-macro expansion with no subprocess. |
+| preprocess=local+dispatch | `preprocess=1`, `preprocess_backend=local`, `dispatch=1` | Local expansion plus dispatch generation. |
 
 ## Representative results
 
@@ -96,9 +105,9 @@ numbers will differ; the ratios are the useful part.
 
 | Measurement | Median | p10 | p90 |
 | --- | ---: | ---: | ---: |
-| `clang -fsyntax-only` | 996 ms | 986 ms | 1001 ms |
-| `clang + autotmpl --dry-run` | 1020 ms | 1000 ms | 1033 ms |
-| Added pre-build time | +23 ms (+2.4%) | | |
+| `clang -fsyntax-only` | 998 ms | 984 ms | 1009 ms |
+| `clang + autotmpl --dry-run` | 1020 ms | 1004 ms | 1024 ms |
+| Added pre-build time | +22 ms (+2.2%) | | |
 
 The CLI scan is tiny next to compilation. Even with a stale generated header,
 a no-op dry run costs about 2% of the compile in this workload.
@@ -107,32 +116,40 @@ a no-op dry run costs about 2% of the compile in this workload.
 
 | Configuration | Median | p10 | p90 | vs raw |
 | --- | ---: | ---: | ---: | ---: |
-| raw | 20.37 ms | 19.76 | 20.75 | — |
-| dispatch=generic | 20.55 ms | 20.19 | 21.11 | +0.9% |
-| dispatch=builtin | 20.78 ms | 20.45 | 21.22 | +2.0% |
-| dispatch=postfix | 20.25 ms | 19.66 | 20.48 | -0.6% |
-| stc=explicit | 17.48 ms | 17.04 | 17.94 | -14.2% |
-| stc=auto | 17.42 ms | 17.08 | 17.76 | -14.5% |
-| preprocess | 598.34 ms | 583.99 | 623.43 | +2837% |
-| preprocess+dispatch | 602.77 ms | 591.86 | 617.33 | +2859% |
+| raw | 20.25 ms | 19.99 | 20.55 | — |
+| dispatch=generic | 20.72 ms | 20.36 | 21.08 | +2.3% |
+| dispatch=builtin | 20.91 ms | 20.64 | 21.07 | +3.3% |
+| dispatch=postfix | 20.20 ms | 19.96 | 20.38 | -0.2% |
+| stc=explicit | 17.35 ms | 17.06 | 17.61 | -14.3% |
+| stc=auto | 17.41 ms | 17.12 | 17.67 | -14.0% |
+| preprocess | 429.11 ms | 418.43 | 432.95 | +2019% |
+| preprocess+dispatch | 423.50 ms | 415.32 | 433.15 | +1991% |
+| preprocess=local | 39.23 ms | 38.83 | 39.50 | +94% |
+| preprocess=local+dispatch | 39.50 ms | 39.01 | 39.85 | +95% |
 
 Dispatch backend and affix style are effectively free here. STC cases are
 faster in this particular workload because the preset skips guard lookups for
 STC-owned types; that is workload-specific rather than a general guarantee.
-Preprocessing dominates because it runs one compiler process per source file.
+The `full` backend is still expensive because every include must be expanded,
+though batching removed repeated compiler startup: the same workload dropped
+from about 598 ms with a per-file loop to about 429 ms here. The `local` backend
+cuts that further to about 39 ms, roughly 11× faster than `full` and only about
+19 ms above a raw scan.
 
 ### Cold generation
 
 | Configuration | Median | p10 | p90 |
 | --- | --- | ---: | ---: |
-| raw | 20.59 ms | 20.32 | 20.87 |
-| dispatch | 20.75 ms | 20.47 | 21.04 |
-| preprocess bootstrap | 549.57 ms | 543.11 | 553.59 |
-| stc=auto | 17.62 ms | 17.27 | 17.76 |
+| raw | 20.68 ms | 20.33 | 21.14 |
+| dispatch | 20.81 ms | 20.55 | 21.28 |
+| preprocess bootstrap | 364.51 ms | 357.84 | 373.13 |
+| preprocess local | 25.29 ms | 25.01 | 25.38 |
+| stc=auto | 17.63 ms | 17.41 | 18.06 |
 
-Cold raw generation is still around 20 ms. The preprocess bootstrap case also
+Cold raw generation is still around 20 ms. The `full` bootstrap case also
 creates and removes empty `gen/*.h` stubs, which is negligible next to the
-preprocessor invocations.
+single batched preprocessor invocation. The `local` backend needs no stubs and
+adds only about 5 ms over cold raw generation here.
 
 ### Clangd plugin
 
@@ -140,14 +157,14 @@ Time to first diagnostics:
 
 | Measurement | Median | Samples |
 | --- | ---: | ---: |
-| cold parse, no plugin | 30.26 ms | 9 |
-| cold parse, plugin default | 40.23 ms | 9 |
-| cold parse, plugin dispatch | 40.26 ms | 9 |
+| cold parse, no plugin | 30.24 ms | 9 |
+| cold parse, plugin default | 40.28 ms | 9 |
+| cold parse, plugin dispatch | 40.34 ms | 9 |
 | cold parse, plugin stc+dispatch | 40.31 ms | 9 |
-| warm parse, no plugin | 60.36 ms | 80 |
-| warm parse, plugin default | 60.34 ms | 80 |
-| warm parse, plugin dispatch | 60.34 ms | 80 |
-| warm parse, plugin stc+dispatch | 60.46 ms | 80 |
+| warm parse, no plugin | 60.43 ms | 80 |
+| warm parse, plugin default | 60.39 ms | 80 |
+| warm parse, plugin dispatch | 60.46 ms | 80 |
+| warm parse, plugin stc+dispatch | 60.44 ms | 80 |
 
 Cold opens pay about 10 ms for workspace scanning and first generation. Warm
 edits are indistinguishable from no-plugin parsing in this run.
@@ -157,21 +174,24 @@ Plugin-internal phases for the default configuration:
 | Phase | Median | Samples |
 | --- | ---: | ---: |
 | registry scan | 0.12 ms | 10 |
-| `prepareUpdate`, first open | 9.81 ms | 10 |
-| `prepareUpdate`, edits | 1.85 ms | 80 |
+| `prepareUpdate`, first open | 9.77 ms | 10 |
+| `prepareUpdate`, edits | 1.84 ms | 80 |
 | — scan | 0.00 ms | 90 |
 | — usages | 1.16 ms | 90 |
-| — prune | 0.03 ms | 90 |
-| — generate | 0.66 ms | 90 |
+| — prune | 0.02 ms | 90 |
+| — generate | 0.65 ms | 90 |
 
-Enabling dispatch raised warm `prepareUpdate` from 1.85 ms to 2.07 ms.
+Enabling dispatch raised warm `prepareUpdate` from 1.84 ms to 2.08 ms.
 `stc+dispatch` was the same at 2.07 ms. Both are still far below editor input
 latency.
 
 ## Practical guidance
 
 - Leave `preprocess=1` off unless a usage exists only through macro expansion.
-  It is exact and opt-in, but costs one external compiler invocation per file.
+  Prefer `preprocess_backend=local` for ordinary wrapper macros; it starts no
+  subprocess and costs about twice a raw scan here. Use `full` only when the
+  usage depends on conditionals, system headers, predefined macros, or other
+  compiler-specific expansion.
 - `dispatch=1` and its style/backend variants are cheap. Choose them for
   readability and API shape, not for performance reasons.
 - STC profiles can be faster or slower depending on how many guarded user types

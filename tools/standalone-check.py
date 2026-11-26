@@ -2,6 +2,7 @@
 """Integration check for the standalone autotmpl executable."""
 
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -844,6 +845,220 @@ int main(void) {
         shutil.rmtree(root, ignore_errors=True)
 
 
+def check_preprocess_batch(cli):
+    compiler = os.environ.get("CC") or next(
+        (name for name in ("cc", "gcc", "clang") if shutil.which(name)),
+        None,
+    )
+    if not compiler:
+        return
+    compiler = shutil.which(compiler) or compiler
+    root = tempfile.mkdtemp(prefix="c-autotmpl-preprocess-batch-")
+    try:
+        os.makedirs(os.path.join(root, "tmpl"))
+        os.makedirs(os.path.join(root, "gen"))
+        write(os.path.join(root, "tmpl", "box.h"), """\
+// -- template type Box(T)
+#define BOX_CAT_I(A, B) A##B
+#define BOX_CAT(A, B) BOX_CAT_I(A, B)
+#define Box(T) BOX_CAT(Box_, T)
+#ifndef T
+typedef int T;
+#endif
+typedef struct { T value; } Box(T);
+#undef T
+""")
+        write(os.path.join(root, "a.c"), """\
+#include "gen/box.h"
+
+#define ONLY_A(T) Box(T)
+
+int use_a(void) {
+  ONLY_A(int) a = {1};
+  return a.value;
+}
+""")
+        write(os.path.join(root, "b.c"), """\
+#include "gen/box.h"
+
+#define MAKE_BOX(T) Box(T)
+
+int use_b(void) {
+  MAKE_BOX(float) b = {2};
+  ONLY_A(double) leaked = {3};
+  return b.value + leaked.value;
+}
+""")
+
+        log = os.path.join(root, "preprocess.log")
+        script = os.path.join(root, "counting-cc")
+        write(script, """\
+#!/bin/sh
+printf 'invocation\\n' >> %s
+exec %s "$@"
+""" % (shlex.quote(log), shlex.quote(compiler)))
+        os.chmod(script, 0o755)
+        write(os.path.join(root, "autotmpl.conf"),
+              "preprocess=1\npreprocess_cc=%s\n" % shlex.quote(script))
+
+        args = [cli, "--root", root, "--verbose",
+                os.path.join(root, "a.c"), os.path.join(root, "b.c")]
+        proc = subprocess.run(args, cwd=root, capture_output=True, text=True,
+                              env=env_with())
+        output = proc.stdout + proc.stderr
+        require(proc.returncode == 0, "batched preprocess run exited with error",
+                output)
+        require("preprocess batches=1 files=2" in output,
+                "expected one preprocessor batch", output)
+
+        with open(log) as f:
+            invocations = f.read().count("invocation\n")
+        require(invocations == 1,
+                "expected one preprocessor process, got %d" % invocations,
+                output)
+
+        require("generated Box(int)" in output and
+                "generated Box(float)" in output,
+                "batched preprocess missed a macro-only usage", output)
+        require("generated Box(double)" not in output,
+                "macro leaked across preprocessed inputs", output)
+
+        with open(os.path.join(root, "gen", "box.h")) as f:
+            content = f.read()
+        require("/* c-autotmpl: Box(int) */" in content and
+                "/* c-autotmpl: Box(float) */" in content,
+                "missing batched preprocess block", content)
+        require("/* c-autotmpl: Box(double) */" not in content,
+                "leaked macro produced a generated block", content)
+
+        chunk_sources = []
+        for i in range(130):
+            path = os.path.join(root, "chunk%d.c" % i)
+            write(path, "int chunk%d(void) { return %d; }\n" % (i, i))
+            chunk_sources.append(path)
+        write(log, "")
+        chunk_args = [cli, "--root", root, "--verbose",
+                      os.path.join(root, "a.c"), os.path.join(root, "b.c")] \
+            + chunk_sources
+        chunk_proc = subprocess.run(chunk_args, cwd=root,
+                                    capture_output=True, text=True,
+                                    env=env_with())
+        chunk_output = chunk_proc.stdout + chunk_proc.stderr
+        require(chunk_proc.returncode == 0,
+                "chunked preprocess run exited with error", chunk_output)
+        require("preprocess batches=2 files=132" in chunk_output,
+                "expected two preprocessor batches for 132 files",
+                chunk_output)
+        with open(log) as f:
+            chunk_invocations = f.read().count("invocation\n")
+        require(chunk_invocations == 2,
+                "expected two preprocessor processes, got %d"
+                % chunk_invocations, chunk_output)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def check_preprocess_local(cli):
+    root = tempfile.mkdtemp(prefix="c-autotmpl-preprocess-local-")
+    try:
+        os.makedirs(os.path.join(root, "tmpl"))
+        os.makedirs(os.path.join(root, "gen"))
+        os.makedirs(os.path.join(root, "inc"))
+        write(os.path.join(root, "tmpl", "box.h"), """\
+// -- template type Box(T)
+#define BOX_CAT_IMPL_(A, B) A##B
+#define BOX_CAT_(A, B) BOX_CAT_IMPL_(A, B)
+#define Box(T) BOX_CAT_(Box_, T)
+#define box_alloc(T) BOX_CAT_(box_alloc_, T)
+#ifndef T
+typedef int T;
+#endif
+typedef struct { T value; } Box(T);
+static inline Box(T) *box_alloc(T)(void) {
+  static Box(T) value;
+  return &value;
+}
+#undef T
+""")
+        write(os.path.join(root, "inc", "wrappers.h"), """\
+#ifndef WRAPPERS_H
+#define WRAPPERS_H
+#define MAKE_BOX(T) Box(T)
+#define NEW_BOX(T) box_alloc(T)()
+#endif
+""")
+        write(os.path.join(root, "a.c"), """\
+#include "gen/box.h"
+#include "inc/wrappers.h"
+
+#define ONLY_A(T) Box(T)
+#define OUTER(T) INNER(T)
+#define INNER(T) Box(T)
+#define DEFAULT_BOX Box(double)
+#define CAT_I(A, B) A##B
+#define CAT(A, B) CAT_I(A, B)
+#define PASTE_BOX(T) CAT(Box_, T)
+
+int use_a(void) {
+  MAKE_BOX(int) a = {1};
+  void *p = NEW_BOX(float);
+  OUTER(short) b = {2};
+  DEFAULT_BOX c = {3};
+  PASTE_BOX(char) d = {4};
+  return a.value + (p != 0) + b.value + c.value + d.value;
+}
+""")
+        write(os.path.join(root, "b.c"), """\
+#include "gen/box.h"
+
+int use_b(void) {
+  ONLY_A(long) leak = {9};
+  return leak.value;
+}
+""")
+        write(os.path.join(root, "autotmpl.conf"), """\
+preprocess=1
+preprocess_backend=local
+preprocess_cc=/definitely/not/a/compiler
+""")
+        args = [cli, "--root", root, "--verbose",
+                os.path.join(root, "a.c"), os.path.join(root, "b.c")]
+        proc = subprocess.run(args, cwd=root, capture_output=True, text=True,
+                              env=env_with())
+        output = proc.stdout + proc.stderr
+        require(proc.returncode == 0, "local preprocess run exited with error",
+                output)
+        require("preprocess backend=local" in output,
+                "local preprocess backend was not reported", output)
+        require("cannot start preprocessor" not in output,
+                "local backend invoked an external compiler", output)
+
+        expected = ("Box(int)", "Box(float)", "Box(short)", "Box(double)",
+                    "Box(char)")
+        for usage in expected:
+            require("generated " + usage in output,
+                    "local expander missed " + usage, output)
+        require("generated Box(long)" not in output,
+                "macro leaked across local translation units", output)
+
+        with open(os.path.join(root, "gen", "box.h")) as f:
+            content = f.read()
+        for usage in expected:
+            require("/* c-autotmpl: " + usage + " */" in content,
+                    "missing local expander block: " + usage, content)
+        require("/* c-autotmpl: Box(long) */" not in content,
+                "leaked macro produced a generated block", content)
+
+        rerun = subprocess.run(args, cwd=root, capture_output=True, text=True,
+                               env=env_with())
+        require(rerun.returncode == 0 and
+                "added=0" in rerun.stdout + rerun.stderr,
+                "local preprocess mode was not idempotent",
+                rerun.stdout + rerun.stderr)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main():
     cli = os.path.abspath(
         sys.argv[1] if len(sys.argv) > 1 else "build/autotmpl"
@@ -860,6 +1075,8 @@ def main():
     check_stc_auto(cli)
     check_dispatch(cli)
     check_preprocess(cli)
+    check_preprocess_batch(cli)
+    check_preprocess_local(cli)
 
     root = tempfile.mkdtemp(prefix="c-autotmpl-standalone-")
     try:
