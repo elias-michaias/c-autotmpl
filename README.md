@@ -1,6 +1,6 @@
 <p align="center">
   <h1 align="center">c-autotmpl</h1>
-  <p align="center">C template-style generic headers, generated from your editor or your build.</p>
+  <p align="center">C template-style generic headers, generated from your editor or your build. Parametric polymorphism and static dispatch that just works in C.</p>
 </p>
 
 <p align="center">
