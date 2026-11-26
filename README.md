@@ -40,7 +40,7 @@ as a clangd plugin that keeps headers current while you type. Both read the same
 - **Builds without toolchain baggage.** The CLI is one portable C99 source with
   no LLVM, libclang, C++ runtime, or compile database dependency.
 - **STC adapters.** Use [STC](https://github.com/stclib/STC) containers as
-  `vec(int)` with call sites such as `vec_push(int)(&nums, 7)`.
+  `vec(int)` with call sites such as `vec_push(int)(&nums, 7)` or `$vec_push(&nums, 7)`.
 
 ## At a glance
 
