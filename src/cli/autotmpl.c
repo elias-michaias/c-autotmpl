@@ -2618,13 +2618,15 @@ static char *preprocess_sources(const Vec *paths, const char *root,
     if (end > paths->len)
       end = paths->len;
 
+    char *cc = shell_quote(cfg->cc);
     char *root_dir = shell_quote(root);
     Str cmd;
     str_init(&cmd);
-    str_append(&cmd, cfg->cc);
+    str_append(&cmd, cc);
     str_append(&cmd, " -E -P -I ");
     str_append(&cmd, root_dir);
     free(root_dir);
+    free(cc);
     if (cfg->flags[0]) {
       str_append_char(&cmd, ' ');
       str_append(&cmd, cfg->flags);

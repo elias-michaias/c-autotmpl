@@ -14,6 +14,28 @@ def write(path, text):
         f.write(text)
 
 
+def make_counting_preprocessor(root, log, compiler):
+    """Create a prefix-counting preprocessor wrapper for the current shell."""
+    if os.name == "nt":
+        # autotmpl uses _popen on Windows, so the wrapper must have a cmd
+        # extension and use cmd quoting rather than a POSIX shebang script.
+        script = os.path.join(root, "counting-cc.cmd")
+        write(script, """@echo off
+>>"%s" echo invocation
+"%s" %%*
+exit /b %%ERRORLEVEL%%
+""" % (log, compiler))
+        return script
+
+    script = os.path.join(root, "counting-cc")
+    write(script, """#!/bin/sh
+printf 'invocation\\n' >> %s
+exec %s "$@"
+""" % (shlex.quote(log), shlex.quote(compiler)))
+    os.chmod(script, 0o755)
+    return script
+
+
 CONFIG_KEYS = (
     "C_AUTOTMPL_PROFILE",
     "C_AUTOTMPL_STC_TEMPLATES",
@@ -891,15 +913,9 @@ int use_b(void) {
 """)
 
         log = os.path.join(root, "preprocess.log")
-        script = os.path.join(root, "counting-cc")
-        write(script, """\
-#!/bin/sh
-printf 'invocation\\n' >> %s
-exec %s "$@"
-""" % (shlex.quote(log), shlex.quote(compiler)))
-        os.chmod(script, 0o755)
+        script = make_counting_preprocessor(root, log, compiler)
         write(os.path.join(root, "autotmpl.conf"),
-              "preprocess=1\npreprocess_cc=%s\n" % shlex.quote(script))
+              "preprocess=1\npreprocess_cc=%s\n" % script)
 
         args = [cli, "--root", root, "--verbose",
                 os.path.join(root, "a.c"), os.path.join(root, "b.c")]
