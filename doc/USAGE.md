@@ -293,6 +293,43 @@ header. The template header is lexed after substitution, so a function head such
 as `sum(Item)(List(Item) *xs)` adds `List(int)` as a dependency when the call is
 `sum(int)(xs)`.
 
+## Value generics
+
+A type template can take a value parameter as well as a type parameter. Paste a
+literal constant into the generated type name; c-autotmpl recognizes numeric
+arguments as values, so they need no include guard.
+
+```c
+/* tmpl/array.h */
+// -- template type Array(T, N)
+#define ARRAY_CAT4_I(a, b, c, d) a##b##c##d
+#define ARRAY_CAT4(a, b, c, d) ARRAY_CAT4_I(a, b, c, d)
+#define Array(T, N) ARRAY_CAT4(Array_, T, _, N)
+typedef struct { T data[N]; } Array(T, N);
+```
+
+```c
+/* main.c */
+#include "gen/array.h"
+
+int main(void) {
+  Array(int, 4) a = {{1, 2, 3, 4}};
+  Array(float, 2) b = {{1.0f, 2.0f}};
+  return a.data[3] == 4 && b.data[1] == 2.0f ? 0 : 1;
+}
+```
+
+```sh
+autotmpl --root . main.c
+cc -I. -std=c11 -Wall -Wextra -Werror main.c -o demo
+```
+
+The generated `gen/array.h` defines `Array_int_4` and `Array_float_2`. Each block
+defines `T` and `N` before re-including `tmpl/array.h`, so `N` stays a literal in
+`data[N]` while the paste macro uses the same token to form a distinct concrete
+name. Named constants still work and need their usual include guard; plain
+numbers do not.
+
 ## Lexical HKTs
 
 A bare registered type-template name is a constructor argument passed as a macro

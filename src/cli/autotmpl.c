@@ -850,7 +850,41 @@ static int keyword_name(const char *s) {
   return 0;
 }
 
+/* Integer and floating constants can be value-template arguments. They never
+ * name a guarded header, so they must not be treated as user-defined types. */
+static int is_numeric_literal(const char *spelling) {
+  const char *p = spelling;
+  while (is_space(*p))
+    ++p;
+  if (*p == '+' || *p == '-')
+    ++p;
+  if (!isdigit((unsigned char)*p))
+    return 0;
+  int hex = p[0] == '0' && (p[1] == 'x' || p[1] == 'X');
+  int binary = p[0] == '0' && (p[1] == 'b' || p[1] == 'B');
+  for (; *p; ++p) {
+    unsigned char c = (unsigned char)*p;
+    if (isdigit(c))
+      continue;
+    if (hex && ((c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') ||
+                c == 'x' || c == 'X'))
+      continue;
+    if (binary && (c == 'b' || c == 'B'))
+      continue;
+    if (!hex && !binary &&
+        (c == '.' || c == 'e' || c == 'E' || c == 'p' || c == 'P' ||
+         c == '+' || c == '-' || c == 'f' || c == 'F'))
+      continue;
+    if (c == 'u' || c == 'U' || c == 'l' || c == 'L' || is_space((char)c))
+      continue;
+    return 0;
+  }
+  return 1;
+}
+
 static int needs_guard(const char *spelling) {
+  if (is_numeric_literal(spelling))
+    return 0;
   char *name = last_identifier(spelling);
   int result = name[0] && !builtin_name(name);
   free(name);

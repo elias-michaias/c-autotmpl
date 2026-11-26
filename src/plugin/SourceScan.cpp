@@ -54,7 +54,42 @@ bool isBuiltinTypeName(StringRef Name) {
   return false;
 }
 
+bool isNumericLiteral(StringRef Spelling) {
+  StringRef S = Spelling.trim();
+  size_t I = 0;
+  if (I < S.size() && (S[I] == '+' || S[I] == '-'))
+    ++I;
+  if (I >= S.size() ||
+      !std::isdigit(static_cast<unsigned char>(S[I])))
+    return false;
+  bool Hex = S[I] == '0' && I + 1 < S.size() &&
+             (S[I + 1] == 'x' || S[I + 1] == 'X');
+  bool Binary = S[I] == '0' && I + 1 < S.size() &&
+                (S[I + 1] == 'b' || S[I + 1] == 'B');
+  for (; I < S.size(); ++I) {
+    char C = S[I];
+    unsigned char UC = static_cast<unsigned char>(C);
+    if (std::isdigit(UC))
+      continue;
+    if (Hex && ((C >= 'a' && C <= 'f') || (C >= 'A' && C <= 'F') ||
+                C == 'x' || C == 'X'))
+      continue;
+    if (Binary && (C == 'b' || C == 'B'))
+      continue;
+    if (!Hex && !Binary &&
+        (C == '.' || C == 'e' || C == 'E' || C == 'p' || C == 'P' ||
+         C == '+' || C == '-' || C == 'f' || C == 'F'))
+      continue;
+    if (C == 'u' || C == 'U' || C == 'l' || C == 'L' || isSpace(C))
+      continue;
+    return false;
+  }
+  return true;
+}
+
 bool needsIncludeGuard(StringRef TypeSpelling) {
+  if (isNumericLiteral(TypeSpelling))
+    return false;
   StringRef Name = lastIdentifier(TypeSpelling);
   return !Name.empty() && !isBuiltinTypeName(Name);
 }

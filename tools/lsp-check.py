@@ -646,6 +646,113 @@ dispatch_truncate=1
     return 0
 
 
+def check_value_generics(plugin):
+    root = tempfile.mkdtemp(prefix="c-autotmpl-lsp-value-generic-")
+    try:
+        os.makedirs(os.path.join(root, "tmpl"))
+        os.makedirs(os.path.join(root, "gen"))
+        write(os.path.join(root, "tmpl", "array.h"), """\
+// -- template type Array(T, N)
+#define ARRAY_CAT4_I(a, b, c, d) a##b##c##d
+#define ARRAY_CAT4(a, b, c, d) ARRAY_CAT4_I(a, b, c, d)
+#define Array(T, N) ARRAY_CAT4(Array_, T, _, N)
+typedef struct { T data[N]; } Array(T, N);
+""")
+        source = os.path.join(root, "main.c")
+        write(source, "int main(void) { return 0; }\n")
+        text = """\
+#include "gen/array.h"
+
+int main(void) {
+  Array(int, 4) a = {{1, 2, 3, 4}};
+  Array(float, 2) b = {{1.0f, 2.0f}};
+  return a.data[3] == 4 && b.data[1] == 2.0f ? 0 : 1;
+}
+"""
+        generated = os.path.join(root, "gen", "array.h")
+        log_path = os.path.join(root, "clangd.log")
+        uri = "file://" + source
+        with open(log_path, "wb") as log:
+            proc = subprocess.Popen(
+                ["clangd", "--log=verbose", "--load=" + plugin],
+                cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=log, env=plugin_env(),
+            )
+            try:
+                send(proc, {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "processId": None,
+                        "rootUri": "file://" + root,
+                        "capabilities": {},
+                    },
+                })
+                send(proc, {"jsonrpc": "2.0", "method": "initialized",
+                            "params": {}})
+                send(proc, {
+                    "jsonrpc": "2.0",
+                    "method": "textDocument/didOpen",
+                    "params": {"textDocument": {
+                        "uri": uri,
+                        "languageId": "c",
+                        "version": 1,
+                        "text": text,
+                    }},
+                })
+                content = wait_for_content(generated, lambda c: (
+                    "/* c-autotmpl: Array(int, 4) */" in c and
+                    "/* c-autotmpl: Array(float, 2) */" in c and
+                    "#define N 4" in c and
+                    "#define N 2" in c
+                ))
+                if content is None:
+                    print("plugin did not generate numeric value generics",
+                          file=sys.stderr)
+                    with open(log_path, errors="replace") as f:
+                        print(f.read()[-4000:], file=sys.stderr)
+                    return 1
+                if "#ifdef" in content:
+                    print("plugin emitted a type guard for a numeric value",
+                          file=sys.stderr)
+                    print(content, file=sys.stderr)
+                    return 1
+
+                send(proc, {
+                    "jsonrpc": "2.0",
+                    "method": "textDocument/didChange",
+                    "params": {
+                        "textDocument": {"uri": uri,
+                                         "version": 2},
+                        "contentChanges": [{"text":
+                                            "int main(void) { return 0; }\n"}],
+                    },
+                })
+                content = wait_for_content(generated, lambda c: (
+                    "/* c-autotmpl: Array(int, 4) */" not in c and
+                    "/* c-autotmpl: Array(float, 2) */" not in c
+                ))
+                if content is None:
+                    print("plugin did not prune numeric value generics",
+                          file=sys.stderr)
+                    with open(log_path, errors="replace") as f:
+                        print(f.read()[-4000:], file=sys.stderr)
+                    return 1
+            finally:
+                try:
+                    send(proc, {"jsonrpc": "2.0", "id": 2,
+                                "method": "shutdown", "params": None})
+                    send(proc, {"jsonrpc": "2.0", "method": "exit",
+                                "params": None})
+                    proc.wait(timeout=5)
+                except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
+                    proc.kill()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return 0
+
+
 def check_auto_config(plugin):
     root = tempfile.mkdtemp(prefix="c-autotmpl-lsp-auto-")
     try:
@@ -740,6 +847,8 @@ def main():
     if check_dispatch(plugin) != 0:
         return 1
     if check_dispatch_truncate(plugin) != 0:
+        return 1
+    if check_value_generics(plugin) != 0:
         return 1
 
     root = tempfile.mkdtemp(prefix="c-autotmpl-lsp-")

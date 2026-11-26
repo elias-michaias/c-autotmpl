@@ -1226,6 +1226,77 @@ preprocess_cc=/definitely/not/a/compiler
         shutil.rmtree(root, ignore_errors=True)
 
 
+def check_value_generics(cli):
+    root = tempfile.mkdtemp(prefix="c-autotmpl-value-generic-")
+    try:
+        os.makedirs(os.path.join(root, "tmpl"))
+        os.makedirs(os.path.join(root, "gen"))
+        write(os.path.join(root, "tmpl", "array.h"), """\
+// -- template type Array(T, N)
+#define ARRAY_CAT4_I(a, b, c, d) a##b##c##d
+#define ARRAY_CAT4(a, b, c, d) ARRAY_CAT4_I(a, b, c, d)
+#define Array(T, N) ARRAY_CAT4(Array_, T, _, N)
+typedef struct { T data[N]; } Array(T, N);
+""")
+        source = os.path.join(root, "main.c")
+        write(source, """\
+#include "gen/array.h"
+
+int main(void) {
+  Array(int, 4) a = {{1, 2, 3, 4}};
+  Array(float, 2) b = {{1.0f, 2.0f}};
+  return a.data[3] == 4 && b.data[1] == 2.0f ? 0 : 1;
+}
+""")
+
+        generated = os.path.join(root, "gen", "array.h")
+        args = [cli, "--root", root, "--verbose", source]
+        proc = subprocess.run(args, cwd=root, capture_output=True, text=True)
+        output = proc.stdout + proc.stderr
+        require(proc.returncode == 0, "value generic run exited with error",
+                output)
+
+        with open(generated) as f:
+            content = f.read()
+        for needle in ("/* c-autotmpl: Array(int, 4) */",
+                       "/* c-autotmpl: Array(float, 2) */",
+                       "#ifndef C_AUTOTMPL_Array_int_2C_204",
+                       "#ifndef C_AUTOTMPL_Array_float_2C_202",
+                       "#define T int",
+                       "#define N 4",
+                       "#define T float",
+                       "#define N 2",
+                       "#undef N\n#undef T"):
+            require(needle in content,
+                    "missing generated value generic text: " + needle, content)
+        require("#ifdef" not in content,
+                "numeric value generic emitted a type guard", content)
+
+        compiler = os.environ.get("CC") or next(
+            (name for name in ("cc", "gcc", "clang") if shutil.which(name)),
+            None,
+        )
+        if compiler:
+            built = subprocess.run(
+                [compiler, "-std=c11", "-Wall", "-Wextra", "-Werror",
+                 "main.c", "-o", "value-generic-demo"],
+                cwd=root, capture_output=True, text=True,
+            )
+            require(built.returncode == 0,
+                    "value generic output did not compile",
+                    built.stdout + built.stderr)
+            ran = subprocess.run([os.path.join(root, "value-generic-demo")],
+                                 cwd=root)
+            require(ran.returncode == 0, "value generic output did not run")
+
+        rerun = subprocess.run(args, cwd=root, capture_output=True, text=True)
+        output = rerun.stdout + rerun.stderr
+        require(rerun.returncode == 0 and "added=0" in output,
+                "value generic output was not idempotent", output)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main():
     cli = os.path.abspath(
         sys.argv[1] if len(sys.argv) > 1 else "build/autotmpl"
@@ -1242,6 +1313,7 @@ def main():
     check_stc_auto(cli)
     check_dispatch(cli)
     check_dispatch_truncate(cli)
+    check_value_generics(cli)
     check_preprocess(cli)
     check_preprocess_batch(cli)
     check_preprocess_local(cli)

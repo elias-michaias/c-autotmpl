@@ -35,6 +35,14 @@ int main() {
   sys::fs::create_directories(join(Root, "tmpl"));
   sys::fs::create_directories(join(Root, "other"));
 
+  assert(c_autotmpl::isNumericLiteral("4"));
+  assert(c_autotmpl::isNumericLiteral("0x10u"));
+  assert(c_autotmpl::isNumericLiteral("-2.5f"));
+  assert(!c_autotmpl::isNumericLiteral("Four"));
+  assert(!c_autotmpl::needsIncludeGuard("4"));
+  assert(!c_autotmpl::needsIncludeGuard("2.5f"));
+  assert(c_autotmpl::needsIncludeGuard("Foo"));
+
   {
     std::error_code EC;
     raw_fd_ostream OS(join(Root, "tmpl/list.h"), EC);

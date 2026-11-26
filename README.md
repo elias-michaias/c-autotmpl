@@ -209,7 +209,8 @@ include guard such as `FOO_H`; builtin and fixed-width scalars are emitted bare.
 Advanced generation lives in the usage guide:
 [nested types](doc/USAGE.md#nested-types),
 [split implementations](doc/USAGE.md#split-implementations),
-[function templates](doc/USAGE.md#function-templates), and
+[function templates](doc/USAGE.md#function-templates),
+[value generics](doc/USAGE.md#value-generics), and
 [lexical HKTs](doc/USAGE.md#lexical-hkts).
 
 ## Documentation

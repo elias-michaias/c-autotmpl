@@ -77,6 +77,7 @@ void setSourceScanDispatchTruncate(bool Value);
 
 llvm::StringRef lastIdentifier(llvm::StringRef Spelling);
 bool isBuiltinTypeName(llvm::StringRef Name);
+bool isNumericLiteral(llvm::StringRef Spelling);
 bool needsIncludeGuard(llvm::StringRef TypeSpelling);
 
 /// True when Spelling is a bare registered type-template name. Such arguments
