@@ -500,11 +500,11 @@ int main(void) {
   vec(float) floats = {0};
 
   vec_push(int)(&nums, 7); /* keeps the adapter in gen/ */
-  vec_push$(&nums, 9); /* selects vec_int_push */
-  vec_push$(&floats, 2.5f); /* same macro, selects vec_float_push */
+  $vec_push(&nums, 9); /* selects vec_int_push */
+  $vec_push(&floats, 2.5f); /* same macro, selects vec_float_push */
 
-  printf("%d %d %.1f\n", *vec_at(int)(&nums, 0), *vec_at$(&nums, 1),
-         *vec_at$(&floats, 0));
+  printf("%d %d %.1f\n", *vec_at(int)(&nums, 0), *$vec_at(&nums, 1),
+         *$vec_at(&floats, 0));
   vec_drop(int)(&nums);
   vec_drop(float)(&floats);
   return 0;
