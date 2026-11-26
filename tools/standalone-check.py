@@ -22,7 +22,7 @@ def make_counting_preprocessor(root, log, compiler):
         script = os.path.join(root, "counting-cc.cmd")
         write(script, """@echo off
 >>"%s" echo invocation
-"%s" %%*
+call "%s" %%*
 exit /b %%ERRORLEVEL%%
 """ % (log, compiler))
         return script
