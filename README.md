@@ -119,6 +119,51 @@ operation as `box_set_impl(T)` in the template header; the dispatcher strips
 `<op>_impl(T, U)` and target `<op>_<T>_<U>`. `dispatch_affix` is ignored in this
 mode.
 
+#### Bare call example
+
+```text
+# autotmpl.conf
+dispatch=1
+dispatch_truncate=1
+```
+
+```c
+/* tmpl/pair.h */
+// -- template type pair(T, U)
+#define PAIR_CAT4_I(A, B, C, D) A##B##C##D
+#define PAIR_CAT4(A, B, C, D) PAIR_CAT4_I(A, B, C, D)
+#define PAIR_CAT5_I(A, B, C, D, E) A##B##C##D##E
+#define PAIR_CAT5(A, B, C, D, E) PAIR_CAT5_I(A, B, C, D, E)
+#define pair(T, U) PAIR_CAT4(pair_, T, _, U)
+#define pair_set_impl(T, U) PAIR_CAT5(pair_set, _, T, _, U)
+typedef struct { T first; U second; } pair(T, U);
+static inline void pair_set_impl(T, U)(pair(T, U) *p, T a, U b) {
+  p->first = a;
+  p->second = b;
+}
+```
+
+```c
+/* main.c */
+#include "gen/pair.h"
+
+int main(void) {
+  pair(int, float) p = {0};
+  pair(float, int) q = {0};
+
+  pair_set(&p, 3, 4.5f); /* selects pair_set_int_float */
+  pair_set(&q, 1.5f, 8); /* selects pair_set_float_int */
+
+  return p.first == 3 && p.second == 4.5f &&
+                 q.first == 1.5f && q.second == 8 ? 0 : 1;
+}
+```
+
+```sh
+autotmpl --root . main.c
+cc -I. -std=c11 -Wall -Wextra -Werror main.c -o demo
+```
+
 Each case is guarded by the presence macro of an instantiation that actually
 exists in the generated header, and the public macro forwards arguments
 unchanged. Selection uses C11 `_Generic` by default, with a GCC/Clang builtin

@@ -355,31 +355,61 @@ produces `<Template>_push`, so the example below yields `$Vec_push` targeting
 `Vec_int_push`. Names that already contain a concrete type, such as
 `Vec_int_push`, are used verbatim as the function spelling.
 
+### Bare generic calls
+
 With `dispatch_truncate=1`, the effective affix is none: the public macro is the
 operation spelling itself. Declare the implementation as `<op>_impl(T, U)` in
 the type-template header. The dispatcher strips `_impl`, and the generated macro
 targets `<op>_<args>` directly. The `_impl` macro takes the template parameters
-just like the function templates described earlier:
+just like the function templates described earlier.
 
-```c
-/* tmpl/box.h */
-// -- template type Box(T)
-#define BOX_CAT_I(a, b) a##b
-#define BOX_CAT(a, b) BOX_CAT_I(a, b)
-#define Box(T) BOX_CAT(Box_, T)
-#define box_set_impl(T) BOX_CAT(box_set_, T)
-typedef struct { T value; } Box(T);
-static inline void box_set_impl(T)(Box(T) *b, T value) { b->value = value; }
-
-/* src/main.c */
-Box(int) b = {0};
-box_set(&b, 7); /* selects box_set_int */
+```text
+# autotmpl.conf
+dispatch=1
+dispatch_truncate=1
 ```
 
-Two-parameter operations use `<op>_impl(T, U)` and paste `T` and `U` into the
-concrete name, so `pair_set(&p, 3, 4.5f)` selects `pair_set_int_float`. Older
-`BOX_FN(op, T)` paste declarations and concrete-only declarations such as
-`slab_set_int` remain accepted as fallbacks. `dispatch_affix` and
+```c
+/* tmpl/pair.h */
+// -- template type pair(T, U)
+#define PAIR_CAT4_I(A, B, C, D) A##B##C##D
+#define PAIR_CAT4(A, B, C, D) PAIR_CAT4_I(A, B, C, D)
+#define PAIR_CAT5_I(A, B, C, D, E) A##B##C##D##E
+#define PAIR_CAT5(A, B, C, D, E) PAIR_CAT5_I(A, B, C, D, E)
+#define pair(T, U) PAIR_CAT4(pair_, T, _, U)
+#define pair_set_impl(T, U) PAIR_CAT5(pair_set, _, T, _, U)
+typedef struct { T first; U second; } pair(T, U);
+static inline void pair_set_impl(T, U)(pair(T, U) *p, T a, U b) {
+  p->first = a;
+  p->second = b;
+}
+```
+
+```c
+/* main.c */
+#include "gen/pair.h"
+
+int main(void) {
+  pair(int, float) p = {0};
+  pair(float, int) q = {0};
+
+  pair_set(&p, 3, 4.5f); /* selects pair_set_int_float */
+  pair_set(&q, 1.5f, 8); /* selects pair_set_float_int */
+
+  return p.first == 3 && p.second == 4.5f &&
+                 q.first == 1.5f && q.second == 8 ? 0 : 1;
+}
+```
+
+```sh
+autotmpl --root . main.c
+cc -I. -std=c11 -Wall -Wextra -Werror main.c -o demo
+```
+
+The generated `gen/pair.h` defines `pair_set`, with cases for
+`pair(int, float)` and `pair(float, int)`, so both calls above use one bare
+spelling. Older `BOX_FN(op, T)` paste declarations and concrete-only declarations
+such as `slab_set_int` remain accepted as fallbacks. `dispatch_affix` and
 `dispatch_style` have no effect while truncation is on.
 
 The rule covers direct declarations and paste-macro declarations, including
