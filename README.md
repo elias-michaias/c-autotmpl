@@ -113,6 +113,12 @@ function name is not compared with the template name, and declarations after
 plus the configured affix, so `box_alloc(T)` becomes `$box_alloc` and selects
 `box_alloc_<Type>`.
 
+Set `dispatch_truncate=1` for bare calls such as `box_set(&box, 7)`. Declare the
+operation as `box_set_impl(T)` in the template header; the dispatcher strips
+`_impl` and targets `box_set_<Type>` directly. Two-argument operations use
+`<op>_impl(T, U)` and target `<op>_<T>_<U>`. `dispatch_affix` is ignored in this
+mode.
+
 Each case is guarded by the presence macro of an instantiation that actually
 exists in the generated header, and the public macro forwards arguments
 unchanged. Selection uses C11 `_Generic` by default, with a GCC/Clang builtin
@@ -186,6 +192,7 @@ profile=stc
 stc_auto=1
 dispatch=1
 dispatch_templates=vec,pair
+# dispatch_truncate=1
 ```
 
 | Area | Config key | Environment variable | Effect |
@@ -197,6 +204,7 @@ dispatch_templates=vec,pair
 | Call backend | `dispatch_backend` | `C_AUTOTMPL_DISPATCH_BACKEND` | `generic` (`_Generic`, default) or `builtin`. |
 | Call style | `dispatch_style` | `C_AUTOTMPL_DISPATCH_STYLE` | `prefix` (default) or `postfix` affix placement. |
 | Call affix | `dispatch_affix` | `C_AUTOTMPL_DISPATCH_AFFIX` | Affix text; default `$`. |
+| Bare generic calls | `dispatch_truncate` | `C_AUTOTMPL_DISPATCH_TRUNCATE` | Use bare operation macros and directly mangled targets; ignore the affix. |
 | Call templates | `dispatch_templates` | `C_AUTOTMPL_DISPATCH_TEMPLATES` | Comma-separated templates that get generic calls. |
 | Preprocess | `preprocess` | `C_AUTOTMPL_PREPROCESS` | CLI only: scan expanded source so macro-generated usages are visible. Off by default. |
 | Preprocess backend | `preprocess_backend` | `C_AUTOTMPL_PREPROCESS_BACKEND` | `local` internal expander (fast) or `full` batched `cc -E -P` (default, exact). |
@@ -204,9 +212,11 @@ dispatch_templates=vec,pair
 | Preprocessor flags | `preprocess_flags` | `C_AUTOTMPL_PREPROCESS_FLAGS` | Extra flags such as `-Iinclude -DFEATURE=1`. |
 | Plugin root | n/a | `C_AUTOTMPL_ROOT` | Force the clangd workspace root. |
 
-Use `dispatch_style` and `dispatch_affix` for custom call spellings.
-Preprocessing is opt-in. The `local` backend expands common wrapper macros
-inside the CLI with no external process; the `full` backend passes sources to
+Use `dispatch_style` and `dispatch_affix` for custom call spellings. With
+`dispatch_truncate=1`, the affix is ignored and `<op>_impl(T, U)` declarations
+produce bare `<op>` calls. Preprocessing is opt-in. The `local` backend expands
+common wrapper macros inside the CLI with no external process; the `full` backend
+passes sources to
 batched compiler invocations and treats missing generated headers as empty
 files while bootstrapping. See
 [configuration in the usage guide](doc/USAGE.md#configuration) for CLI flags,

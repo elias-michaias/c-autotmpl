@@ -34,8 +34,13 @@ struct DispatchConfig {
   DispatchBackend Backend = DispatchBackend::Generic;
   DispatchStyle Style = DispatchStyle::Prefix;
   std::string Affix = "$";
+  bool Truncate = false; // bare op macros with base_<T> call targets
   llvm::SmallVector<std::string, 2> Templates;
 };
+
+/// Set before scanning template headers so dispatch operations are discovered
+/// with the correct naming convention.
+void setDispatchTruncate(bool Value);
 
 /// Loads short key=value settings from autotmpl.conf at or above Root.
 void loadConfig(llvm::StringRef Root);
@@ -135,6 +140,14 @@ public:
   const TemplateDef *findByName(llvm::StringRef Name) const {
     auto It = ByName.find(Name);
     return It == ByName.end() ? nullptr : It->second;
+  }
+
+  /// Returns the type template that exposes `Op` as a dispatch operation.
+  const TemplateDef *findDispatchOp(llvm::StringRef Op) const {
+    for (const auto &Def : Owned)
+      if (Def->DispatchOps.contains(Op))
+        return Def.get();
+    return nullptr;
   }
 
   /// Matches e.g. "List_int" to template "List" with type spelling "int".

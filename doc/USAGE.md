@@ -72,6 +72,7 @@ over defaults. Restart clangd after changing configuration.
 | Call backend | `dispatch_backend` | `C_AUTOTMPL_DISPATCH_BACKEND` | Select `generic` (`_Generic`, default) or `builtin` (GCC/Clang builtins). |
 | Call style | `dispatch_style` | `C_AUTOTMPL_DISPATCH_STYLE` | Place the affix before the name (`prefix`, default) or after it (`postfix`). |
 | Call affix | `dispatch_affix` | `C_AUTOTMPL_DISPATCH_AFFIX` | Set the generic-call affix, default `$`. |
+| Bare generic calls | `dispatch_truncate` | `C_AUTOTMPL_DISPATCH_TRUNCATE` | Use bare operation macros and direct `<op>_<args>` targets; ignore the affix. |
 | Call templates | `dispatch_templates` | `C_AUTOTMPL_DISPATCH_TEMPLATES` | Comma-separated templates that get generic calls, such as `vec,list`. |
 | Preprocess | `preprocess` | `C_AUTOTMPL_PREPROCESS` | CLI only: scan expanded source so macro-generated usages are visible. Off by default. |
 | Preprocess backend | `preprocess_backend` | `C_AUTOTMPL_PREPROCESS_BACKEND` | `local` (internal expander) or `full` (batched `cc -E -P`, default). |
@@ -354,6 +355,33 @@ produces `<Template>_push`, so the example below yields `$Vec_push` targeting
 `Vec_int_push`. Names that already contain a concrete type, such as
 `Vec_int_push`, are used verbatim as the function spelling.
 
+With `dispatch_truncate=1`, the effective affix is none: the public macro is the
+operation spelling itself. Declare the implementation as `<op>_impl(T, U)` in
+the type-template header. The dispatcher strips `_impl`, and the generated macro
+targets `<op>_<args>` directly. The `_impl` macro takes the template parameters
+just like the function templates described earlier:
+
+```c
+/* tmpl/box.h */
+// -- template type Box(T)
+#define BOX_CAT_I(a, b) a##b
+#define BOX_CAT(a, b) BOX_CAT_I(a, b)
+#define Box(T) BOX_CAT(Box_, T)
+#define box_set_impl(T) BOX_CAT(box_set_, T)
+typedef struct { T value; } Box(T);
+static inline void box_set_impl(T)(Box(T) *b, T value) { b->value = value; }
+
+/* src/main.c */
+Box(int) b = {0};
+box_set(&b, 7); /* selects box_set_int */
+```
+
+Two-parameter operations use `<op>_impl(T, U)` and paste `T` and `U` into the
+concrete name, so `pair_set(&p, 3, 4.5f)` selects `pair_set_int_float`. Older
+`BOX_FN(op, T)` paste declarations and concrete-only declarations such as
+`slab_set_int` remain accepted as fallbacks. `dispatch_affix` and
+`dispatch_style` have no effect while truncation is on.
+
 The rule covers direct declarations and paste-macro declarations, including
 two-argument templates such as `pair(Key, Value)`:
 
@@ -405,7 +433,7 @@ declaration in the template header instead of the generated `#define`. No
 annotation is needed in source files. When snippet completions are enabled, the
 plugin escapes the configured affix in completion text, so clients insert a `$`
 prefix literally instead of parsing it as snippet-variable syntax and dropping
-it.
+it. In truncate mode the completion is the bare operation name instead.
 
 The default backend is `_Generic` and needs C11. Set
 `dispatch_backend=builtin` for the GCC/Clang builtin form, which also works in

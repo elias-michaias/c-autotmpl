@@ -47,6 +47,7 @@ CONFIG_KEYS = (
     "C_AUTOTMPL_DISPATCH_AFFIX",
     "C_AUTOTMPL_DISPATCH_SUFFIX",
     "C_AUTOTMPL_DISPATCH_TEMPLATES",
+    "C_AUTOTMPL_DISPATCH_TRUNCATE",
     "C_AUTOTMPL_PREPROCESS",
     "C_AUTOTMPL_PREPROCESS_CC",
     "C_AUTOTMPL_PREPROCESS_FLAGS",
@@ -785,6 +786,153 @@ int main(void) {
         shutil.rmtree(root, ignore_errors=True)
 
 
+def check_dispatch_truncate(cli):
+    root = tempfile.mkdtemp(prefix="c-autotmpl-truncate-")
+    try:
+        os.makedirs(os.path.join(root, "tmpl"))
+        os.makedirs(os.path.join(root, "gen"))
+        write(os.path.join(root, "tmpl", "box.h"), """\
+// -- template type Box(T)
+#define BOX_CAT_I(A, B) A##B
+#define BOX_CAT(A, B) BOX_CAT_I(A, B)
+#define Box(T) BOX_CAT(Box_, T)
+#define box_set_impl(T) BOX_CAT(box_set_, T)
+#define box_get_impl(T) BOX_CAT(box_get_, T)
+typedef struct { T value; } Box(T);
+static inline void box_set_impl(T)(Box(T) *b, T v) { b->value = v; }
+static inline T box_get_impl(T)(Box(T) *b) { return b->value; }
+""")
+        write(os.path.join(root, "tmpl", "pair.h"), """\
+// -- template type pair(T, U)
+#define PAIR_CAT4_I(A, B, C, D) A##B##C##D
+#define PAIR_CAT4(A, B, C, D) PAIR_CAT4_I(A, B, C, D)
+#define PAIR_CAT5_I(A, B, C, D, E) A##B##C##D##E
+#define PAIR_CAT5(A, B, C, D, E) PAIR_CAT5_I(A, B, C, D, E)
+#define pair(T, U) PAIR_CAT4(pair_, T, _, U)
+#define pair_set_impl(T, U) PAIR_CAT5(pair_set, _, T, _, U)
+typedef struct { T first; U second; } pair(T, U);
+static inline void pair_set_impl(T, U)(pair(T, U) *p, T a, U b) {
+  p->first = a;
+  p->second = b;
+}
+""")
+        write(os.path.join(root, "tmpl", "slab.h"), """\
+// -- template type Slab(T)
+#define SLAB_CAT_I(A, B) A##B
+#define SLAB_CAT(A, B) SLAB_CAT_I(A, B)
+#define Slab(T) SLAB_CAT(Slab_, T)
+typedef struct { T value; } Slab(T);
+static inline void slab_set_int(Slab(int) *s, int v) { s->value = v; }
+""")
+        source = os.path.join(root, "main.c")
+        write(source, """\
+#include "gen/box.h"
+#include "gen/pair.h"
+#include "gen/slab.h"
+
+int main(void) {
+  Box(int) a = {1};
+  Box(float) b = {2};
+  pair(int, float) p = {0};
+  pair(float, int) q = {0};
+  Slab(int) s = {0};
+  box_set(&a, 7);
+  box_set(&b, 9);
+  pair_set(&p, 3, 4.5f);
+  pair_set(&q, 1.5f, 8);
+  slab_set(&s, 5);
+  return (box_get(&a) == 7 && box_get(&b) == 9 && p.first == 3 &&
+          p.second == 4.5f && q.first == 1.5f && q.second == 8 &&
+          s.value == 5) ? 0 : 1;
+}
+""")
+        write(os.path.join(root, "autotmpl.conf"), """\
+dispatch=1
+dispatch_truncate=1
+""")
+        generated_box = os.path.join(root, "gen", "box.h")
+        generated_pair = os.path.join(root, "gen", "pair.h")
+        generated_slab = os.path.join(root, "gen", "slab.h")
+        # A configured affix is ignored in truncate mode: public macros are
+        # exactly the op spellings from the template header.
+        env = env_with(C_AUTOTMPL_DISPATCH_AFFIX="m",
+                       C_AUTOTMPL_DISPATCH_STYLE="prefix")
+        args = [cli, "--root", root, "--verbose", source]
+        proc = subprocess.run(args, cwd=root, capture_output=True, text=True,
+                              env=env)
+        output = proc.stdout + proc.stderr
+        require(proc.returncode == 0, "truncate dispatch run exited with error",
+                output)
+        require("dispatch truncate=1" in output and "dispatch affix=none" in
+                output, "truncate dispatch was not reported", output)
+
+        with open(generated_box) as f:
+            box_content = f.read()
+        for needle in ("/* c-autotmpl dispatch begin Box */",
+                       "Box_int: box_set_int", "Box_float: box_set_float",
+                       "#define box_set(...)", "#define box_get(...)"):
+            require(needle in box_content,
+                    "truncated Box dispatch is missing: " + needle,
+                    box_content)
+        require("#define mbox_set(...)" not in box_content and
+                "#define $box_set(...)" not in box_content,
+                "truncate mode kept a configured affix", box_content)
+        require("C_AUTOTMPL_DISPATCH_SEL_Box_box_set_" in box_content and
+                "C_AUTOTMPL_DISPATCH_SEL_Box_box_set_impl_" not in box_content,
+                "_impl suffix leaked into the public operation name",
+                box_content)
+        require("dispatch begin box_set" not in box_content,
+                "dispatch call was scanned as a mangled type", box_content)
+
+        with open(generated_slab) as f:
+            slab_content = f.read()
+        for needle in ("/* c-autotmpl dispatch begin Slab */",
+                       "Slab_int: slab_set_int", "#define slab_set(...)"):
+            require(needle in slab_content,
+                    "concrete-only truncate dispatch is missing: " + needle,
+                    slab_content)
+
+        with open(generated_pair) as f:
+            pair_content = f.read()
+        for needle in ("/* c-autotmpl dispatch begin pair */",
+                       "pair_int_float: pair_set_int_float",
+                       "pair_float_int: pair_set_float_int",
+                       "#define pair_set(...)"):
+            require(needle in pair_content,
+                    "truncated two-argument dispatch is missing: " + needle,
+                    pair_content)
+        require("C_AUTOTMPL_DISPATCH_SEL_pair_pair_set_" in pair_content and
+                "C_AUTOTMPL_DISPATCH_SEL_pair_pair_set_impl_" not in
+                pair_content,
+                "_impl suffix leaked into a two-argument operation name",
+                pair_content)
+
+        compiler = os.environ.get("CC") or next(
+            (name for name in ("cc", "gcc", "clang") if shutil.which(name)),
+            None,
+        )
+        if compiler:
+            built = subprocess.run(
+                [compiler, "-std=c11", "-Wall", "-Wextra", "-Werror",
+                 "main.c", "-o", "truncate-demo"],
+                cwd=root, capture_output=True, text=True,
+            )
+            require(built.returncode == 0,
+                    "truncated dispatch output did not compile",
+                    built.stdout + built.stderr)
+            ran = subprocess.run([os.path.join(root, "truncate-demo")],
+                                 cwd=root)
+            require(ran.returncode == 0, "truncated dispatch output did not run")
+
+        rerun = subprocess.run(args, cwd=root, capture_output=True, text=True,
+                               env=env)
+        output = rerun.stdout + rerun.stderr
+        require(rerun.returncode == 0 and "added=0" in output,
+                "truncated dispatch output was not idempotent", output)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def check_preprocess(cli):
     compiler = os.environ.get("CC") or next(
         (name for name in ("cc", "gcc", "clang") if shutil.which(name)),
@@ -1093,6 +1241,7 @@ def main():
     check_unprefixed_stc(cli)
     check_stc_auto(cli)
     check_dispatch(cli)
+    check_dispatch_truncate(cli)
     check_preprocess(cli)
     check_preprocess_batch(cli)
     check_preprocess_local(cli)

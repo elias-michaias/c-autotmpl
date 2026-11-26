@@ -219,6 +219,11 @@ full header and generated-block rules.
 When the caller should not care which concrete function it calls, the next step
 is a generic call. The following section uses extendible `_Generic`. The one
 after that uses c-trait to generate the impl and the dispatcher together.
+c-autotmpl generates the same kind of selector from template headers: with
+`dispatch=1` calls carry a configurable affix, and with `dispatch_truncate=1`
+they are bare operation names. The canonical declaration is `<op>_impl(T, U)`,
+which generates `<op>` targeting `<op>_<args>`; older paste declarations and
+concrete-only functions remain accepted fallbacks.
 
 ## Extendible generic calls
 

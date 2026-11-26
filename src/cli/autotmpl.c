@@ -1092,6 +1092,7 @@ typedef struct {
   DispatchBackend backend;
   DispatchStyle style;
   char *affix;
+  int truncate; /* emit bare op macros and discover concrete_<T> targets */
   Set names;
   int has_names;
 } DispatchConfig;
@@ -1301,6 +1302,20 @@ static int is_word(const char *s, size_t i, const char *word) {
   return !is_ident_char(s[i + n]);
 }
 
+static int g_dispatch_truncate = 0;
+
+/* In truncate mode `<op>_impl(T, U)` is the canonical generic-method spelling.
+ * The suffix marks the declaration macro; the public operation is the part
+ * before it, and the concrete target is `<op>_<args>`. */
+static char *impl_op_name(const char *ident) {
+  static const char suffix[] = "_impl";
+  size_t n = strlen(ident);
+  size_t sn = strlen(suffix);
+  if (n <= sn || strcmp(ident + n - sn, suffix))
+    return NULL;
+  return xstrdup_n(ident, n - sn);
+}
+
 static void set_dispatch_target(TemplateDef *tmpl, const char *op,
                                 const char *base, const char *suffix,
                                 int append_args) {
@@ -1473,6 +1488,167 @@ static int params_declare_argument(const char *s, size_t begin, size_t end) {
   return ok;
 }
 
+/* `BOX_FN(box_set, T)(Box(T) *, T)` or
+ * `PAIR_FN(pair_set, T, U)(Pair(T, U) *, T, U)` declares a concrete function
+ * whose name is pasted from the first macro argument and `_` plus the template
+ * arguments. In truncate mode that first argument is the public op and becomes
+ * the `<op>_<args>` target base. Nested paste macros such as
+ * `BOX_CAT(_, T)` in the remaining arguments are fine. */
+static char *direct_mangled_op_name(const char *s, size_t begin, size_t end,
+                                    const TemplateDef *tmpl) {
+  size_t first_end = end;
+  int depth = 0;
+  for (size_t i = begin; i < end; ++i) {
+    char c = s[i];
+    if (c == '(' || c == '[')
+      ++depth;
+    else if (c == ')' || c == ']')
+      --depth;
+    else if (c == ',' && depth == 0) {
+      first_end = i;
+      break;
+    }
+  }
+  if (first_end == end)
+    return NULL;
+  char *first = trim_copy_n(s + begin, first_end - begin);
+  if (!first[0] || !is_ident_start(first[0])) {
+    free(first);
+    return NULL;
+  }
+  for (size_t i = 0; first[i]; ++i) {
+    if (!is_ident_char(first[i])) {
+      free(first);
+      return NULL;
+    }
+  }
+
+  int has_param = 0;
+  for (size_t i = first_end + 1; i < end && !has_param;) {
+    if (!is_ident_start(s[i])) {
+      ++i;
+      continue;
+    }
+    size_t start = i++;
+    while (i < end && is_ident_char(s[i]))
+      ++i;
+    size_t len = i - start;
+    if (len == 6 && !strncmp(s + start, "i_type", 6)) {
+      has_param = 1;
+      break;
+    }
+    for (size_t k = 0; k < tmpl->nparams; ++k) {
+      const char *param = parameter_name(tmpl, k);
+      if (strlen(param) == len && !strncmp(s + start, param, len)) {
+        has_param = 1;
+        break;
+      }
+    }
+  }
+  if (!has_param) {
+    free(first);
+    return NULL;
+  }
+  return first;
+}
+
+/* Try a mangled parameter token (`Box_int`) first, then a template call in the
+ * parameter list (`pair(int, float)`). Both spellings identify the `_<args>`
+ * suffix to remove from a concrete operation name such as `pair_set_int_float`.
+ */
+static char *op_for_suffix(const char *ident, const char *suffix,
+                           size_t suffix_len) {
+  size_t ident_len = strlen(ident);
+  if (!suffix_len || ident_len <= suffix_len ||
+      strncmp(ident + ident_len - suffix_len, suffix, suffix_len))
+    return NULL;
+  return xstrdup_n(ident, ident_len - suffix_len);
+}
+
+static char *truncated_op_name(const char *ident, const char *s, size_t begin,
+                               size_t end, const TemplateDef *tmpl) {
+  Str prefix;
+  str_init(&prefix);
+  str_append(&prefix, tmpl->name);
+  str_append_char(&prefix, '_');
+  for (size_t i = begin; i < end;) {
+    if (!is_ident_start(s[i])) {
+      ++i;
+      continue;
+    }
+    size_t start = i++;
+    while (i < end && is_ident_char(s[i]))
+      ++i;
+    size_t len = i - start;
+    if (len <= prefix.len || strncmp(s + start, prefix.data, prefix.len))
+      continue;
+    Str suffix;
+    str_init(&suffix);
+    str_append_char(&suffix, '_');
+    str_append_n(&suffix, s + start + prefix.len, len - prefix.len);
+    char *op = op_for_suffix(ident, suffix.data, suffix.len);
+    str_free(&suffix);
+    if (op) {
+      str_free(&prefix);
+      return op;
+    }
+  }
+  str_free(&prefix);
+
+  size_t name_len = strlen(tmpl->name);
+  for (size_t i = begin; i + name_len <= end; ++i) {
+    if (strncmp(s + i, tmpl->name, name_len) || !is_word(s, i, tmpl->name))
+      continue;
+    size_t j = i + name_len;
+    while (j < end && is_space(s[j]))
+      ++j;
+    if (j >= end || s[j] != '(')
+      continue;
+    size_t close = matching_paren(s, j, end);
+    if (close >= end)
+      continue;
+
+    Str suffix;
+    str_init(&suffix);
+    size_t part = j + 1;
+    int depth = 1;
+    for (size_t k = part; k <= end; ++k) {
+      char c = k < end ? s[k] : '\0';
+      int boundary = k == end || k == close;
+      if (!boundary) {
+        if (c == '(' || c == '[')
+          ++depth;
+        else if (c == ')' || c == ']')
+          --depth;
+        else if (c == ',' && depth == 1)
+          boundary = 1;
+      }
+      if (!boundary)
+        continue;
+      char *arg = trim_copy_n(s + part, k - part);
+      size_t arg_len = strlen(arg);
+      size_t last = arg_len;
+      while (last && !is_ident_char(arg[last - 1]))
+        --last;
+      size_t first = last;
+      while (first && is_ident_char(arg[first - 1]))
+        --first;
+      if (last > first)
+        str_append_char(&suffix, '_'), str_append_n(&suffix, arg + first,
+                                                    last - first);
+      free(arg);
+      part = k + 1;
+      if (k == close)
+        break;
+    }
+    char *op = op_for_suffix(ident, suffix.data, suffix.len);
+    str_free(&suffix);
+    if (op)
+      return op;
+  }
+  return NULL;
+}
+
 /* Finds functions generated by a type-template header. Eligibility depends
  * only on the parameter list; function names are never compared with the
  * template name. A paste-macro declaration such as VEC_FN(i_type, _push)(...)
@@ -1565,7 +1741,30 @@ static void collect_dispatch_ops_from_header(const char *content,
             if (functional && declaration_has_prefix(clean, decl_begin, i) &&
                 declaration_tail_is_function(clean, call_close, n) &&
                 (args_use || macro_uses)) {
-              if (paste_op) {
+              if (g_dispatch_truncate) {
+                char *op = impl_op_name(ident);
+                if (!op || !op[0]) {
+                  free(op);
+                  op = direct_mangled_op_name(clean, after + 1, close, tmpl);
+                }
+                if (op && op[0]) {
+                  set_add(ops, op);
+                  set_dispatch_target(tmpl, op, op, NULL, 1);
+                } else if (paste_op) {
+                  Str name;
+                  str_init(&name);
+                  str_append(&name, tmpl->name);
+                  str_append_char(&name, '_');
+                  str_append(&name, last + 1);
+                  set_add(ops, name.data);
+                  set_dispatch_target(tmpl, name.data, NULL, last + 1, 0);
+                  str_free(&name);
+                } else {
+                  set_add(ops, ident);
+                  set_dispatch_target(tmpl, ident, ident, NULL, 1);
+                }
+                free(op);
+              } else if (paste_op) {
                 Str name;
                 str_init(&name);
                 str_append(&name, tmpl->name);
@@ -1586,8 +1785,20 @@ static void collect_dispatch_ops_from_header(const char *content,
                    declaration_tail_is_function(clean, close, n) &&
                    params_use_template(clean, after + 1, close, tmpl) &&
                    params_declare_argument(clean, after + 1, close)) {
-          set_add(ops, ident);
-          set_dispatch_target(tmpl, ident, ident, NULL, 0);
+          if (g_dispatch_truncate) {
+            char *op = truncated_op_name(ident, clean, after + 1, close, tmpl);
+            if (op && op[0]) {
+              set_add(ops, op);
+              set_dispatch_target(tmpl, op, op, NULL, 1);
+            } else {
+              set_add(ops, ident);
+              set_dispatch_target(tmpl, ident, ident, NULL, 0);
+            }
+            free(op);
+          } else {
+            set_add(ops, ident);
+            set_dispatch_target(tmpl, ident, ident, NULL, 0);
+          }
         }
       }
     }
@@ -1857,6 +2068,7 @@ static DispatchConfig resolve_dispatch(void) {
   cfg.style = style && style[0] ? parse_dispatch_style(style)
                                 : DISPATCH_PREFIX;
   cfg.affix = xstrdup(valid_dispatch_affix(affix) ? affix : "$");
+  cfg.truncate = parse_bool_text(config_value("dispatch_truncate")) == 1;
   cfg.names.items = NULL;
   cfg.names.len = cfg.names.cap = 0;
   cfg.has_names = 0;
@@ -3233,6 +3445,80 @@ static void split_type_args(const char *s, Vec *out) {
   }
 }
 
+static char *join_strings(Vec *items, const char *sep);
+
+static int is_builtin_type_word(const char *word) {
+  static const char *const builtins[] = {
+      "void",  "bool",    "char",   "short",   "int",     "long",
+      "float", "double",  "signed", "unsigned", "_Bool",   "size_t",
+      "ssize_t", "int8_t", "uint8_t", "int16_t", "uint16_t",
+      "int32_t", "uint32_t", "int64_t", "uint64_t", "intptr_t",
+      "uintptr_t", NULL};
+  for (size_t i = 0; builtins[i]; ++i)
+    if (strcmp(word, builtins[i]) == 0)
+      return 1;
+  return 0;
+}
+
+/* Dispatch calls mix type arguments with ordinary values. Only keep arguments
+ * that spell a concrete type: a builtin name or an explicit template call. */
+static int is_dispatch_type_arg(const char *arg, Registry *reg) {
+  const char *p = arg;
+  while (is_space(*p))
+    ++p;
+  for (;;) {
+    if (!is_ident_start(*p))
+      return 0;
+    const char *start = p++;
+    while (is_ident_char(*p))
+      ++p;
+    char *word = xstrdup_n(start, (size_t)(p - start));
+    int qualifier = strcmp(word, "const") == 0 ||
+                    strcmp(word, "volatile") == 0 ||
+                    strcmp(word, "restrict") == 0 ||
+                    strcmp(word, "struct") == 0 ||
+                    strcmp(word, "union") == 0 ||
+                    strcmp(word, "enum") == 0;
+    int builtin = is_builtin_type_word(word);
+    TemplateDef *def = qualifier ? NULL : registry_find(reg, word);
+    int templated = def && def->kind == TEMPLATE_TYPE;
+    free(word);
+    if (qualifier) {
+      while (is_space(*p))
+        ++p;
+      continue;
+    }
+    if (builtin)
+      return 1;
+    if (!templated)
+      return 0;
+    while (is_space(*p))
+      ++p;
+    return *p == '(';
+  }
+}
+
+static char *dispatch_type_args_from_call(const char *raw, Registry *reg) {
+  Vec args;
+  Vec kept;
+  args.items = NULL;
+  args.len = args.cap = 0;
+  kept.items = NULL;
+  kept.len = kept.cap = 0;
+  split_type_args(raw, &args);
+  for (size_t i = 0; i < args.len; ++i)
+    if (is_dispatch_type_arg((const char *)args.items[i], reg))
+      vec_push(&kept, xstrdup((const char *)args.items[i]));
+  char *out = join_strings(&kept, ", ");
+  for (size_t i = 0; i < args.len; ++i)
+    free(args.items[i]);
+  for (size_t i = 0; i < kept.len; ++i)
+    free(kept.items[i]);
+  free(args.items);
+  free(kept.items);
+  return out;
+}
+
 static char *join_strings(Vec *items, const char *sep) {
   Str out;
   str_init(&out);
@@ -3798,7 +4084,7 @@ static void scan_usages_impl(const char *code, Registry *reg, Vec *out,
           }
           if (depth == 0 && close > begin + 1) {
             char *raw = xstrdup_n(clean + begin, close - begin - 1);
-            char *type = trim_copy(raw);
+            char *type = dispatch_type_args_from_call(raw, reg);
             if (type[0])
               scan_template_usage(op_tmpl, type, reg, out, scan_headers);
             free(type);
@@ -4554,10 +4840,12 @@ static char *make_dispatch_section(const TemplateDef *tmpl, Vec *cases,
     str_append(&out, "\n");
 
     str_append(&out, "#define ");
-    if (cfg->style == DISPATCH_PREFIX)
-      str_append(&out, cfg->affix);
+    if (!cfg->truncate) {
+      if (cfg->style == DISPATCH_PREFIX)
+        str_append(&out, cfg->affix);
+    }
     str_append(&out, op);
-    if (cfg->style == DISPATCH_POSTFIX)
+    if (!cfg->truncate && cfg->style == DISPATCH_POSTFIX)
       str_append(&out, cfg->affix);
     str_append(&out, "(...) C_AUTOTMPL_DISPATCH_PICK_");
     str_append(&out, tmpl->name);
@@ -5518,14 +5806,18 @@ int main(int argc, char **argv) {
 
   DispatchConfig dispatch_cfg = resolve_dispatch();
   g_dispatch_style = dispatch_cfg.style;
-  g_dispatch_affix = dispatch_cfg.affix;
+  g_dispatch_affix = dispatch_cfg.truncate ? "" : dispatch_cfg.affix;
+  g_dispatch_truncate = dispatch_cfg.truncate;
   if (opt.verbose && dispatch_cfg.enabled) {
     printf("dispatch=1\n");
     printf("dispatch backend=%s\n",
            dispatch_cfg.backend == DISPATCH_BUILTIN ? "builtin" : "generic");
     printf("dispatch style=%s\n",
            dispatch_cfg.style == DISPATCH_PREFIX ? "prefix" : "postfix");
-    printf("dispatch affix=%s\n", dispatch_cfg.affix);
+    printf("dispatch affix=%s\n",
+           dispatch_cfg.truncate ? "none" : dispatch_cfg.affix);
+    if (dispatch_cfg.truncate)
+      printf("dispatch truncate=1\n");
     if (dispatch_cfg.has_names)
       printf("dispatch templates=%zu\n", dispatch_cfg.names.len);
   }

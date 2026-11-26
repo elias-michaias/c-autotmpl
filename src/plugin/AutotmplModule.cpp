@@ -444,13 +444,16 @@ struct SharedState {
     loadConfig(Root);
     StcConfig Config = resolvePreset();
     ProfileName = Config.Name;
+    Dispatch = resolveDispatch();
+    setDispatchTruncate(Dispatch.Truncate);
     Registry.scanPreferTemplateDirs(Root);
     SmallVector<StringRef, 4> Names;
     for (const std::string &Name : Config.Templates)
       Names.push_back(Name);
     Registry.applyPreset(Config.Preset, Names, Config.Auto);
-    Dispatch = resolveDispatch();
-    setDispatchAffix(Dispatch.Affix, Dispatch.Style == DispatchStyle::Prefix);
+    setDispatchAffix(Dispatch.Truncate ? "" : Dispatch.Affix,
+                     Dispatch.Style == DispatchStyle::Prefix);
+    setSourceScanDispatchTruncate(Dispatch.Truncate);
     Registry.applyDispatch(Dispatch);
     if (Dispatch.Enabled) {
       std::string Msg = "dispatch=1 backend=";
@@ -458,7 +461,9 @@ struct SharedState {
                                                           : "generic";
       Msg += " style=";
       Msg += Dispatch.Style == DispatchStyle::Prefix ? "prefix" : "postfix";
-      Msg += " affix=" + Dispatch.Affix;
+      Msg += " affix=" + std::string(Dispatch.Truncate ? "none" : Dispatch.Affix);
+      if (Dispatch.Truncate)
+        Msg += " truncate=1";
       log(Msg);
     }
     if (!ProfileName.empty())
@@ -1342,23 +1347,25 @@ static DispatchNavTarget dispatchTargetAt(StringRef Text, size_t Offset,
   StringRef Ident = Text.slice(Start, End);
   StringRef Affix(State.Dispatch.Affix);
   bool AffixIsIdent = dispatchAffixIsIdent(State.Dispatch);
-  bool IsDispatch = false;
-  if (State.Dispatch.Style == DispatchStyle::Prefix) {
-    if (AffixIsIdent)
-      IsDispatch = Affix.size() < Ident.size() && Ident.starts_with(Affix);
-    else
-      IsDispatch = Start >= Affix.size() &&
-                   Text.substr(Start - Affix.size(), Affix.size()) == Affix;
-  } else {
-    if (AffixIsIdent)
-      IsDispatch = Affix.size() < Ident.size() && Ident.ends_with(Affix);
-    else
-      IsDispatch = Text.substr(End).starts_with(Affix);
+  bool IsDispatch = State.Dispatch.Truncate;
+  if (!State.Dispatch.Truncate) {
+    if (State.Dispatch.Style == DispatchStyle::Prefix) {
+      if (AffixIsIdent)
+        IsDispatch = Affix.size() < Ident.size() && Ident.starts_with(Affix);
+      else
+        IsDispatch = Start >= Affix.size() &&
+                     Text.substr(Start - Affix.size(), Affix.size()) == Affix;
+    } else {
+      if (AffixIsIdent)
+        IsDispatch = Affix.size() < Ident.size() && Ident.ends_with(Affix);
+      else
+        IsDispatch = Text.substr(End).starts_with(Affix);
+    }
   }
   if (!IsDispatch)
     return Result;
 
-  if (AffixIsIdent)
+  if (AffixIsIdent && !State.Dispatch.Truncate)
     Ident = State.Dispatch.Style == DispatchStyle::Prefix
                 ? Ident.drop_front(Affix.size())
                 : Ident.drop_back(Affix.size());

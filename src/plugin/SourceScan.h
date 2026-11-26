@@ -73,6 +73,7 @@ void scanUsages(llvm::StringRef Code, const TemplateRegistry &Registry,
 /// Affix and placement used by generated dispatch macros. Dispatch calls are
 /// ignored by the usage scanner so they do not look like mangled types.
 void setDispatchAffix(llvm::StringRef Affix, bool Prefix);
+void setSourceScanDispatchTruncate(bool Value);
 
 llvm::StringRef lastIdentifier(llvm::StringRef Spelling);
 bool isBuiltinTypeName(llvm::StringRef Name);

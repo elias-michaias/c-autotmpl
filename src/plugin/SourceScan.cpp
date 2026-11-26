@@ -502,11 +502,14 @@ static void scanFunctionUsage(const TemplateDef &Template, StringRef RawType,
 
 static std::string DispatchAffix = "$";
 static bool DispatchPrefix = true;
+static bool DispatchTruncate = false;
 
 void setDispatchAffix(StringRef Affix, bool Prefix) {
   DispatchAffix = Affix.str();
   DispatchPrefix = Prefix;
 }
+
+void setSourceScanDispatchTruncate(bool Value) { DispatchTruncate = Value; }
 
 static bool dispatchAffixIsIdent() {
   return !DispatchAffix.empty() && isIdentStart(DispatchAffix.front());
@@ -540,6 +543,63 @@ static StringRef stripDispatchAffix(StringRef Ident) {
     return Ident;
   return DispatchPrefix ? Ident.drop_front(DispatchAffix.size())
                         : Ident.drop_back(DispatchAffix.size());
+}
+
+static bool isDispatchTypeArg(StringRef Arg, const TemplateRegistry &Registry) {
+  StringRef S = Arg.trim();
+  for (;;) {
+    S = S.ltrim();
+    if (S.empty() || !isIdentStart(S.front()))
+      return false;
+    unsigned End = 1;
+    while (End < S.size() && isIdentChar(S[End]))
+      ++End;
+    StringRef Word = S.slice(0, End);
+    bool Qualifier = Word == "const" || Word == "volatile" ||
+                     Word == "restrict" || Word == "struct" ||
+                     Word == "union" || Word == "enum";
+    if (Qualifier) {
+      S = S.drop_front(End);
+      continue;
+    }
+    if (isBuiltinTypeName(Word))
+      return true;
+    const TemplateDef *Def = Registry.findByName(Word);
+    if (!Def || Def->Kind != TemplateKind::Type)
+      return false;
+    unsigned K = End;
+    while (K < S.size() && isSpace(S[K]))
+      ++K;
+    return K < S.size() && S[K] == '(';
+  }
+}
+
+static std::string dispatchTypeArgsFromCall(StringRef Raw,
+                                            const TemplateRegistry &Registry) {
+  std::string Out;
+  unsigned Start = 0;
+  int Depth = 0;
+  auto Append = [&](StringRef Arg) {
+    if (!isDispatchTypeArg(Arg, Registry))
+      return;
+    if (!Out.empty())
+      Out += ", ";
+    Out += Arg.trim().str();
+  };
+  for (unsigned I = 0; I < Raw.size(); ++I) {
+    char C = Raw[I];
+    if (C == '(' || C == '<' || C == '[') {
+      ++Depth;
+    } else if (C == ')' || C == '>' || C == ']') {
+      if (Depth > 0)
+        --Depth;
+    } else if (C == ',' && Depth == 0) {
+      Append(Raw.slice(Start, I));
+      Start = I + 1;
+    }
+  }
+  Append(Raw.slice(Start, Raw.size()));
+  return Out;
 }
 
 static void scanUsagesImpl(StringRef Code, const TemplateRegistry &Registry,
@@ -604,6 +664,35 @@ static void scanUsagesImpl(StringRef Code, const TemplateRegistry &Registry,
               scanFunctionUsage(*Def, Type, Registry, Out, ScanHeaders);
             else
               scanTemplateUsage(*Def, Type, Registry, Out, ScanHeaders);
+            I = Close;
+            continue;
+          }
+        }
+      }
+    } else if (DispatchTruncate) {
+      // A bare dispatch call such as box_set(Box(int) *, T) can spell its
+      // template argument at the call site. Scan it like the CLI does, but
+      // leave pointers and other non-type arguments alone. Affixed dispatch
+      // calls were already skipped above, so this is truncate-only.
+      if (const TemplateDef *OpDef = Registry.findDispatchOp(Ident)) {
+        unsigned K = End;
+        while (K < S.size() && isSpace(S[K]))
+          ++K;
+        if (K < S.size() && S[K] == '(') {
+          unsigned Start = K + 1;
+          int Depth = 1;
+          unsigned Close = Start;
+          for (; Close < S.size() && Depth > 0; ++Close) {
+            if (S[Close] == '(')
+              ++Depth;
+            else if (S[Close] == ')')
+              --Depth;
+          }
+          if (Depth == 0 && Close > Start + 1) {
+            std::string Type =
+                dispatchTypeArgsFromCall(S.slice(Start, Close - 1), Registry);
+            if (!Type.empty())
+              scanTemplateUsage(*OpDef, Type, Registry, Out, ScanHeaders);
             I = Close;
             continue;
           }

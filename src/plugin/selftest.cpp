@@ -89,6 +89,29 @@ int main() {
   }
   {
     std::error_code EC;
+    raw_fd_ostream OS(join(Root, "tmpl/truncate.h"), EC);
+    OS << "// -- template type Direct(T, U)\n"
+          "#define DIRECT_CAT4_I(A, B, C, D) A##B##C##D\n"
+          "#define DIRECT_CAT4(A, B, C, D) DIRECT_CAT4_I(A, B, C, D)\n"
+          "#define DIRECT_CAT5_I(A, B, C, D, E) A##B##C##D##E\n"
+          "#define DIRECT_CAT5(A, B, C, D, E) DIRECT_CAT5_I(A, B, C, D, E)\n"
+          "#define Direct(T, U) DIRECT_CAT4(Direct_, T, _, U)\n"
+          "#define direct_set_impl(T, U) DIRECT_CAT5(direct_set, _, T, _, U)\n"
+          "typedef struct { T first; U second; } Direct(T, U);\n"
+          "static inline void direct_set_impl(T, U)(Direct(T, U) *d, "
+          "T a, U b) { d->first = a; d->second = b; }\n";
+  }
+  {
+    std::error_code EC;
+    raw_fd_ostream OS(join(Root, "tmpl/slab.h"), EC);
+    OS << "// -- template type Slab(T)\n"
+          "#define Slab(T) Slab_##T\n"
+          "typedef struct { T value; } Slab(T);\n"
+          "static inline void slab_set_int(Slab(int) *s, int v) "
+          "{ s->value = v; }\n";
+  }
+  {
+    std::error_code EC;
     raw_fd_ostream OS(join(Root, "tmpl/select.h"), EC);
     OS << "// -- template function select(First, Second)\n"
           "#define select(First, Second) select_##First##Second\n";
@@ -892,6 +915,46 @@ int main() {
            StringRef::npos);
     assert(Pruned.find("/* c-autotmpl: select(int, Foo) */") !=
            StringRef::npos);
+  }
+
+  {
+    // dispatch_truncate=1: bare operation macros whose concrete targets are
+    // pasted directly from the template arguments.
+    c_autotmpl::setDispatchTruncate(true);
+    c_autotmpl::TemplateRegistry TruncateRegistry;
+    TruncateRegistry.scan(Root);
+    const c_autotmpl::TemplateDef *DirectDef =
+        TruncateRegistry.findByName("Direct");
+    const c_autotmpl::TemplateDef *SlabDef =
+        TruncateRegistry.findByName("Slab");
+    assert(DirectDef && SlabDef);
+    assert(DirectDef->DispatchOps.contains("direct_set"));
+    assert(!DirectDef->DispatchOps.contains("direct_set_impl"));
+    assert(SlabDef->DispatchOps.contains("slab_set"));
+    assert(SlabDef->DispatchTargets.find("slab_set") !=
+           SlabDef->DispatchTargets.end());
+    auto DirectTarget = DirectDef->DispatchTargets.find("direct_set");
+    assert(DirectTarget != DirectDef->DispatchTargets.end());
+    assert(DirectTarget->second.Base == "direct_set" &&
+           DirectTarget->second.AppendArgs);
+
+    c_autotmpl::DispatchConfig TruncCfg;
+    TruncCfg.Enabled = true;
+    TruncCfg.Truncate = true;
+    TruncateRegistry.applyDispatch(TruncCfg);
+    SmallVector<c_autotmpl::DispatchCase, 1> Cases{
+        {"int, float", "Direct_int_float", {"int", "float"}}};
+    SmallVector<StringRef, 1> Ops{"direct_set"};
+    std::string Section = c_autotmpl::makeDispatchSection(
+        *DirectDef, Cases, Ops, TruncCfg);
+    for (StringRef Needle : {
+             "/* c-autotmpl dispatch begin Direct */",
+             "Direct_int_float: direct_set_int_float",
+             "Direct_int_float*: direct_set_int_float",
+             "#define direct_set(...)"})
+      assert(Section.find(Needle.str()) != std::string::npos);
+    assert(Section.find("#define $direct_set(...)") == std::string::npos);
+    c_autotmpl::setDispatchTruncate(false);
   }
 
   std::cout << "selftest OK\n";

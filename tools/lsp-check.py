@@ -73,6 +73,7 @@ CONFIG_KEYS = (
     "C_AUTOTMPL_DISPATCH_STYLE",
     "C_AUTOTMPL_DISPATCH_AFFIX",
     "C_AUTOTMPL_DISPATCH_TEMPLATES",
+    "C_AUTOTMPL_DISPATCH_TRUNCATE",
 )
 
 
@@ -417,6 +418,234 @@ dispatch=1
     return 0
 
 
+def check_dispatch_truncate(plugin):
+    root = tempfile.mkdtemp(prefix="c-autotmpl-lsp-truncate-")
+    try:
+        os.makedirs(os.path.join(root, "tmpl"))
+        os.makedirs(os.path.join(root, "gen"))
+        write(os.path.join(root, "tmpl", "box.h"), """\
+// -- template type Box(T)
+#define BOX_CAT_I(A, B) A##B
+#define BOX_CAT(A, B) BOX_CAT_I(A, B)
+#define Box(T) BOX_CAT(Box_, T)
+#define box_set_impl(T) BOX_CAT(box_set_, T)
+#define box_get_impl(T) BOX_CAT(box_get_, T)
+typedef struct { T value; } Box(T);
+static inline void box_set_impl(T)(Box(T) *b, T v) { b->value = v; }
+static inline T box_get_impl(T)(Box(T) *b) { return b->value; }
+""")
+        write(os.path.join(root, "tmpl", "pair.h"), """\
+// -- template type pair(T, U)
+#define PAIR_CAT4_I(A, B, C, D) A##B##C##D
+#define PAIR_CAT4(A, B, C, D) PAIR_CAT4_I(A, B, C, D)
+#define PAIR_CAT5_I(A, B, C, D, E) A##B##C##D##E
+#define PAIR_CAT5(A, B, C, D, E) PAIR_CAT5_I(A, B, C, D, E)
+#define pair(T, U) PAIR_CAT4(pair_, T, _, U)
+#define pair_set_impl(T, U) PAIR_CAT5(pair_set, _, T, _, U)
+typedef struct { T first; U second; } pair(T, U);
+static inline void pair_set_impl(T, U)(pair(T, U) *p, T a, U b) {
+  p->first = a;
+  p->second = b;
+}
+""")
+        source = os.path.join(root, "main.c")
+        write(source, "int main(void) { return 0; }\n")
+        text = """\
+#include "gen/box.h"
+#include "gen/pair.h"
+
+int main(void) {
+  Box(int) a = {1};
+  Box(float) b = {2};
+  pair(int, float) p = {0};
+  box_set(&a, 7);
+  box_set(&b, 9);
+  pair_set(&p, 3, 4.5f);
+  pa
+  return 0;
+}
+"""
+        generated = os.path.join(root, "gen", "box.h")
+        generated_pair = os.path.join(root, "gen", "pair.h")
+        log_path = os.path.join(root, "clangd.log")
+        uri = "file://" + source
+        write(os.path.join(root, "autotmpl.conf"), """\
+dispatch=1
+dispatch_truncate=1
+""")
+        env = plugin_env(C_AUTOTMPL_DISPATCH="0",
+                         C_AUTOTMPL_DISPATCH_AFFIX="m")
+        with open(log_path, "wb") as log:
+            proc = subprocess.Popen(
+                ["clangd", "--log=verbose", "--load=" + plugin],
+                cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=log, env=env,
+            )
+            try:
+                send(proc, {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "processId": None,
+                        "rootUri": "file://" + root,
+                        "capabilities": {
+                            "textDocument": {
+                                "completion": {
+                                    "completionItem": {
+                                        "snippetSupport": True,
+                                    },
+                                },
+                            },
+                        },
+                    },
+                })
+                send(proc, {"jsonrpc": "2.0", "method": "initialized",
+                            "params": {}})
+                send(proc, {
+                    "jsonrpc": "2.0",
+                    "method": "textDocument/didOpen",
+                    "params": {"textDocument": {
+                        "uri": uri,
+                        "languageId": "c",
+                        "version": 1,
+                        "text": text,
+                    }},
+                })
+                content = wait_for_content(generated, lambda c: (
+                    "/* c-autotmpl dispatch begin Box */" in c and
+                    "#define box_set(...)" in c and
+                    "#define box_get(...)" in c and
+                    "Box_int: box_set_int" in c and
+                    "Box_float: box_set_float" in c
+                ))
+                if content is None:
+                    print("plugin truncated dispatch was not generated",
+                          file=sys.stderr)
+                    with open(log_path, errors="replace") as f:
+                        print(f.read()[-4000:], file=sys.stderr)
+                    return 1
+                if ("dispatch begin box_set" in content or
+                        "C_AUTOTMPL_DISPATCH_SEL_Box_box_set_impl_" in content):
+                    print("plugin exposed an _impl name as a dispatch op",
+                          file=sys.stderr)
+                    return 1
+                if ("#define $box_set(...)" in content or
+                        "#define mbox_set(...)" in content):
+                    print("plugin kept a dispatch affix in truncate mode",
+                          file=sys.stderr)
+                    return 1
+
+                pair_content = wait_for_content(generated_pair, lambda c: (
+                    "/* c-autotmpl dispatch begin pair */" in c and
+                    "#define pair_set(...)" in c and
+                    "pair_int_float: pair_set_int_float" in c
+                ))
+                if pair_content is None:
+                    print("plugin two-argument truncated dispatch missing",
+                          file=sys.stderr)
+                    with open(log_path, errors="replace") as f:
+                        print(f.read()[-4000:], file=sys.stderr)
+                    return 1
+                if "C_AUTOTMPL_DISPATCH_SEL_pair_pair_set_impl_" in pair_content:
+                    print("plugin exposed a two-argument _impl op",
+                          file=sys.stderr)
+                    return 1
+
+                with open(os.path.join(root, "tmpl", "box.h")) as f:
+                    box_header = f.read()
+                send(proc, {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "textDocument/definition",
+                    "params": {
+                        "textDocument": {"uri": uri},
+                        "position": {"line": 7, "character": 3},
+                    },
+                })
+                response = receive_response(proc, 3)
+                locations = response.get("result") if response else None
+                if (not locations or len(locations) != 1 or
+                        not locations[0]["uri"].endswith("tmpl/box.h")):
+                    print("plugin did not map bare dispatch call to op",
+                          file=sys.stderr)
+                    print(response, file=sys.stderr)
+                    return 1
+                start = locations[0]["range"]["start"]
+                start_offset = sum(len(line) + 1 for line in
+                                   box_header.splitlines()[:start["line"]])
+                start_offset += start["character"]
+                if not box_header[start_offset:].startswith("box_set_impl"):
+                    print("bare dispatch pointed at the wrong declaration",
+                          file=sys.stderr)
+                    print(response, file=sys.stderr)
+                    return 1
+
+                send(proc, {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "textDocument/completion",
+                    "params": {
+                        "textDocument": {"uri": uri},
+                        "position": {"line": 10, "character": 2},
+                    },
+                })
+                response = receive_response(proc, 4)
+                result = response.get("result") if response else None
+                items = result.get("items", []) if isinstance(result, dict) \
+                    else (result or [])
+                dispatch_items = [item for item in items
+                                  if item.get("filterText") == "pair_set"]
+                if len(dispatch_items) != 1:
+                    print("plugin did not offer bare dispatch completion",
+                          file=sys.stderr)
+                    print(response, file=sys.stderr)
+                    return 1
+                item = dispatch_items[0]
+                snippet = item.get("insertText", "")
+                edit_text = item.get("textEdit", {}).get("newText", "")
+                if (item.get("insertTextFormat") != 2 or
+                        not snippet.startswith("pair_set(") or
+                        "\\$" in snippet or edit_text != snippet):
+                    print("bare dispatch completion had a bad snippet",
+                          file=sys.stderr)
+                    print(item, file=sys.stderr)
+                    return 1
+
+                send(proc, {
+                    "jsonrpc": "2.0",
+                    "method": "textDocument/didChange",
+                    "params": {
+                        "textDocument": {"uri": uri,
+                                         "version": 2},
+                        "contentChanges": [{"text":
+                                            "int main(void) { return 0; }\n"}],
+                    },
+                })
+                content = wait_for_content(generated, lambda c: (
+                    "dispatch begin" not in c and
+                    "/* c-autotmpl: Box(int) */" not in c
+                ))
+                if content is None:
+                    print("plugin truncated dispatch was not pruned",
+                          file=sys.stderr)
+                    with open(log_path, errors="replace") as f:
+                        print(f.read()[-4000:], file=sys.stderr)
+                    return 1
+            finally:
+                try:
+                    send(proc, {"jsonrpc": "2.0", "id": 2,
+                                "method": "shutdown", "params": None})
+                    send(proc, {"jsonrpc": "2.0", "method": "exit",
+                                "params": None})
+                    proc.wait(timeout=5)
+                except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
+                    proc.kill()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return 0
+
+
 def check_auto_config(plugin):
     root = tempfile.mkdtemp(prefix="c-autotmpl-lsp-auto-")
     try:
@@ -509,6 +738,8 @@ def main():
     if check_auto_config(plugin) != 0:
         return 1
     if check_dispatch(plugin) != 0:
+        return 1
+    if check_dispatch_truncate(plugin) != 0:
         return 1
 
     root = tempfile.mkdtemp(prefix="c-autotmpl-lsp-")

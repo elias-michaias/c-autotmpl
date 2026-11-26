@@ -89,6 +89,7 @@ invocation, while `local` expands wrapper macros inside the CLI.
 | dispatch=generic | `dispatch=1` | `_Generic` call generation from signature-defined operations. |
 | dispatch=builtin | `dispatch=1`, `dispatch_backend=builtin` | Compiler-builtin dispatch backend. |
 | dispatch=postfix | `dispatch=1`, `dispatch_style=postfix`, `dispatch_affix=_method` | Affix parsing and naming; no spelling penalty. |
+| dispatch=truncate | `dispatch=1`, `dispatch_truncate=1` | Bare public macros and direct `<op>_<args>` targets; same selector generation. |
 | stc=explicit | `profile=stc`, `stc_templates=stc_vec` | Explicit STC wrapper selection. |
 | stc=auto | `profile=stc`, `stc_auto=1` | STC detection from template-header contents. |
 | preprocess | `preprocess=1` | Default `full` backend: batched `cc -E -P` expansion. |
@@ -193,7 +194,8 @@ latency.
   usage depends on conditionals, system headers, predefined macros, or other
   compiler-specific expansion.
 - `dispatch=1` and its style/backend variants are cheap. Choose them for
-  readability and API shape, not for performance reasons.
+  readability and API shape, not for performance reasons. `dispatch_truncate=1`
+  changes only the public spelling; it does not change selector cost.
 - STC profiles can be faster or slower depending on how many guarded user types
   the scanner would otherwise inspect. Measure your own project.
 - The plugin's first-open cost is mostly workspace discovery. Later edits only
