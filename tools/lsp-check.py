@@ -429,6 +429,16 @@ def check_dispatch_method(plugin):
 #define RC4(A, B, C, D) RC4_I(A, B, C, D)
 #define Result(T, U) RC4(Result_, T, _, U)
 typedef struct { T ok; U err; } Result(T, U);
+datatype(Result, T, U, (Ok, T), (Err, U))
+
+// -- template function and_then_impl(T, U)
+#define AT3_I(A, B, C) A##B##C
+#define AT3(A, B, C) AT3_I(A, B, C)
+#define and_then_impl(T, U) AT3(and_then_, T, U)
+static inline Result(T, U) and_then_impl(T, U)(Result(T, U) r,
+                                               Result(T, U) (*f)(T)) {
+  return f(r.ok);
+}
 
 // -- template function map_impl(T, U, V)
 // -- dispatch method Result.map explicit V
@@ -447,9 +457,12 @@ static inline Result(T, V) map_impl(T, U, V)(Result(T, U) r, V (*f)(T)) {
         text = """\
 #include "gen/result.h"
 static float from_int(int x) { return (float)x / 2.0f; }
+static Result(int, float) keep(Result(int, float) r) { return r; }
 int main(void) {
   Result(int, float) r = {7, 0};
-  return (int)map(float)(r, from_int) == 3 ? 0 : 1;
+  Result(int, float) chained = and_then(r, keep);
+  Result(float, float) mapped = map(float)(chained, from_int);
+  return (int)mapped.ok == 3 ? 0 : 1;
 }
 """
         result_header = os.path.join(root, "gen", "result.h")
@@ -514,6 +527,51 @@ dispatch_templates=Result
                     with open(log_path, errors="replace") as f:
                         print(f.read()[-4000:], file=sys.stderr)
                     return 1
+
+                def position_of(needle):
+                    idx = text.index(needle)
+                    before = text[:idx]
+                    return {
+                        "line": before.count("\n"),
+                        "character": len(before.rsplit("\n", 1)[-1]),
+                    }
+
+                with open(os.path.join(root, "tmpl", "result.h")) as f:
+                    template_header = f.read()
+                for request_id, needle, decl in (
+                    (3, "map(float)", "map_impl"),
+                    (4, "and_then(r", "and_then_impl"),
+                ):
+                    send(proc, {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "method": "textDocument/definition",
+                        "params": {
+                            "textDocument": {"uri": "file://" + source},
+                            "position": position_of(needle),
+                        },
+                    })
+                    response = receive_response(proc, request_id)
+                    locations = response.get("result") if response else None
+                    if (not locations or len(locations) != 1 or
+                            not locations[0]["uri"].endswith("tmpl/result.h")):
+                        print("definition did not reach template function: " +
+                              needle, file=sys.stderr)
+                        print(response, file=sys.stderr)
+                        with open(log_path, errors="replace") as f:
+                            print(f.read()[-4000:], file=sys.stderr)
+                        return 1
+                    start = locations[0]["range"]["start"]
+                    offset = sum(
+                        len(line) + 1
+                        for line in template_header.splitlines()[:start["line"]]
+                    )
+                    offset += start["character"]
+                    if not template_header[offset:].startswith(decl):
+                        print("definition pointed at the wrong declaration: " +
+                              needle, file=sys.stderr)
+                        print(response, file=sys.stderr)
+                        return 1
             finally:
                 try:
                     send(proc, {"jsonrpc": "2.0", "id": 2,

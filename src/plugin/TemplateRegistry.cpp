@@ -923,12 +923,14 @@ void TemplateRegistry::scanTree(StringRef Dir) {
     if (!Found)
       continue;
     // A datatype(...) declaration describes its variants in the header itself,
-    // and the CLI generator turns those into payload-aware dispatch selectors.
-    // The plugin's function-declaration heuristic would invent unrelated ops
-    // from calls in helper bodies and overwrite that dispatch section.
+    // and the CLI generator owns its payload-aware dispatch section. The flag
+    // keeps the plugin from rewriting that section; ops are still collected
+    // below for go-to-definition.
     Def->HasDatatypeDispatch = Full.contains("datatype(");
-    if (!Def->HasDatatypeDispatch)
-      collectDispatchOps(Full, *Def);
+    // The CLI owns dispatch generation for datatype(...) headers, but op
+    // offsets are still needed to send go-to-definition to the authored
+    // function declarations in those headers.
+    collectDispatchOps(Full, *Def);
 
     for (auto &Method : FileMethods)
       MethodDefs.push_back(std::move(Method));

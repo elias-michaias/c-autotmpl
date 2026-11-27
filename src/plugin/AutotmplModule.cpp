@@ -1430,6 +1430,22 @@ static DispatchNavTarget dispatchTargetAt(StringRef Text, size_t Offset,
     return Result;
 
   StringRef Ident = Text.slice(Start, End);
+
+  // Curried methods keep a bare public spelling even when ordinary dispatch
+  // calls use an affix, so resolve them before the affix check. Their target is
+  // the annotated function template rather than the owner type header.
+  size_t Call = End;
+  while (Call < Text.size() && isSpace(Text[Call]))
+    ++Call;
+  if (Call < Text.size() && Text[Call] == '(') {
+    if (const DispatchMethodDef *Method =
+            State.Registry.findDispatchMethod(Ident)) {
+      Result.Template = &Method->Impl;
+      Result.Op = Method->Impl.Name.empty() ? Method->Op : Method->Impl.Name;
+      return Result;
+    }
+  }
+
   StringRef Affix(State.Dispatch.Affix);
   bool AffixIsIdent = dispatchAffixIsIdent(State.Dispatch);
   bool IsDispatch = State.Dispatch.Truncate;
