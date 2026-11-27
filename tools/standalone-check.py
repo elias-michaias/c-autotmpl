@@ -934,6 +934,67 @@ dispatch_truncate=1
         shutil.rmtree(root, ignore_errors=True)
 
 
+def check_explicit_constructor_alias(cli):
+    root = tempfile.mkdtemp(prefix="c-autotmpl-explicit-alias-")
+    try:
+        os.makedirs(os.path.join(root, "tmpl"))
+        os.makedirs(os.path.join(root, "gen"))
+        write(os.path.join(root, "tmpl", "box.h"), """\
+// -- preprocess
+#define Make(T) BOX_CAT(Make, T)
+
+// -- template type Box(T)
+#define BOX_CAT_I(A, B) A##B
+#define BOX_CAT(A, B) BOX_CAT_I(A, B)
+#define Box(T) BOX_CAT(Box_, T)
+typedef struct { T value; } Box(T);
+static inline Box(T) Make(T)(T value) {
+  Box(T) result = {value};
+  return result;
+}
+""")
+        source = os.path.join(root, "main.c")
+        write(source, """\
+#include "gen/box.h"
+int main(void) { return Make(int)(7).value == 7 ? 0 : 1; }
+""")
+        write(os.path.join(root, "autotmpl.conf"), "dispatch=1\n")
+        args = [cli, "--root", root, "--verbose", source]
+        proc = subprocess.run(args, cwd=root, capture_output=True, text=True,
+                              env=env_with())
+        output = proc.stdout + proc.stderr
+        require(proc.returncode == 0, "explicit alias run exited with error",
+                output)
+        require("generated Box(int)" in output,
+                "explicit alias call did not instantiate its type", output)
+
+        generated = os.path.join(root, "gen", "box.h")
+        with open(generated) as f:
+            content = f.read()
+        require("#define Make(T) BOX_CAT(Make, T)" in content,
+                "explicit alias was not emitted", content)
+        require("#define Make(...) C_AUTOTMPL_DISPATCH" not in content,
+                "explicit alias was redefined as a dispatch macro", content)
+
+        compiler = os.environ.get("CC") or next(
+            (name for name in ("cc", "gcc", "clang") if shutil.which(name)),
+            None,
+        )
+        if compiler:
+            built = subprocess.run(
+                [compiler, "-std=c11", "-Wall", "-Wextra", "-Werror",
+                 "main.c", "-o", "alias-demo"],
+                cwd=root, capture_output=True, text=True,
+            )
+            require(built.returncode == 0,
+                    "explicit alias output did not compile",
+                    built.stdout + built.stderr)
+            ran = subprocess.run([os.path.join(root, "alias-demo")], cwd=root)
+            require(ran.returncode == 0, "explicit alias output did not run")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def check_preprocess(cli):
     compiler = os.environ.get("CC") or next(
         (name for name in ("cc", "gcc", "clang") if shutil.which(name)),
@@ -1313,6 +1374,7 @@ def main():
     check_unprefixed_stc(cli)
     check_stc_auto(cli)
     check_dispatch(cli)
+    check_explicit_constructor_alias(cli)
     check_dispatch_truncate(cli)
     check_value_generics(cli)
     check_preprocess(cli)

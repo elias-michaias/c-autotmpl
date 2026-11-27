@@ -119,6 +119,11 @@ operation as `box_set_impl(T)` in the template header; the dispatcher strips
 `<op>_impl(T, U)` and target `<op>_<T>_<U>`. `dispatch_affix` is ignored in this
 mode.
 
+When another backend owns a constructor, expose it as an explicit alias in the
+header preamble, for example `#define Some(T) ADT_CAT(Some, T)`. Calls use
+`Some(int)(7)`; the operation stays visible to the usage scanner but gets no
+payload-dispatched `_Generic` macro, so the public name is not redefined.
+
 #### Bare call example
 
 ```text

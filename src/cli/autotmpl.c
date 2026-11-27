@@ -1158,6 +1158,7 @@ typedef struct {
   size_t nspecs;
   Set adapter_ops;        /* STC operation names seen at call sites */
   Set dispatch_ops;       /* method-like operations for generated dispatch */
+  Set explicit_ops;       /* operation macros authored in the template header */
   Vec dispatch_targets;   /* DispatchTarget*, op-specific call name prefixes */
   Vec dispatch_keys;      /* DispatchKey*, op-specific _Generic key expressions */
   int dispatch_enabled;
@@ -2016,6 +2017,46 @@ static void collect_dispatch_ops_from_header(const char *content,
     i = end;
   }
   free(clean);
+}
+
+/* A header can expose an operation as an explicit function template macro,
+ * for example `#define Some(T) ADT_CAT(Some, T)`. Such an operation is called
+ * with an explicit type argument (`Some(int)(7)`), so it stays available to
+ * the usage scanner but must not get a payload-dispatched `_Generic` macro. */
+static void record_macro_defined_ops(const char *content, TemplateDef *tmpl) {
+  if (!content || tmpl->kind != TEMPLATE_TYPE)
+    return;
+  Set macros;
+  macros.items = NULL;
+  macros.len = macros.cap = 0;
+  const char *p = content;
+  while (*p) {
+    const char *end = strchr(p, '\n');
+    if (!end)
+      end = p + strlen(p);
+    const char *s = p;
+    while (is_space(*s))
+      ++s;
+    if (!strncmp(s, "#define", 7) && is_space(s[7])) {
+      s += 7;
+      while (is_space(*s))
+        ++s;
+      size_t n = 0;
+      while (is_ident_char(s[n]))
+        ++n;
+      if (n && s[n] == '(') {
+        char *name = xstrdup_n(s, n);
+        set_add(&macros, name);
+        free(name);
+      }
+    }
+    if (!*end)
+      break;
+    p = end + 1;
+  }
+  for (size_t i = 0; i < macros.len; ++i)
+    set_add(&tmpl->explicit_ops, macros.items[i]);
+  free(macros.items);
 }
 
 static void apply_dispatch(Registry *reg, const DispatchConfig *cfg) {
@@ -3442,6 +3483,9 @@ static void register_template_section(TemplateScan *scan, const char *path,
       collect_dispatch_ops_from_header(expanded, def);
     free(expanded);
   }
+  /* Only preamble aliases are public constructor spellings owned by another
+   * backend. Section macros such as box_alloc(T) are ordinary dispatch ops. */
+  record_macro_defined_ops(preamble, def);
 
   def->header = path_absolute(path);
   def->generated = generated_header_path(def->header, def->name);
@@ -3794,87 +3838,6 @@ static char *dispatch_type_args_from_call(const char *raw, Registry *reg) {
   free(args.items);
   free(kept.items);
   return out;
-}
-
-/* A payload-dispatched constructor such as Some(2.5f) carries a value rather
- * than a type argument. With local type inference (`let x = Some(2.5f)`) no
- * explicit `Option(float)` spelling remains for the usage scanner, so infer
- * the concrete type from a literal payload. This keeps the constructor and its
- * _Generic dispatch case available even without an explicit type annotation. */
-static char *literal_type_from_expr(const char *expr) {
-  const char *s = expr;
-  while (is_space(*s))
-    ++s;
-  size_t n = strlen(s);
-  while (n && is_space(s[n - 1]))
-    --n;
-  size_t i = 0;
-  if (i < n && (s[i] == '+' || s[i] == '-'))
-    ++i;
-  if (i >= n || !isdigit((unsigned char)s[i]))
-    return NULL;
-  int hex = n > i + 1 && s[i] == '0' && (s[i + 1] == 'x' || s[i + 1] == 'X');
-  int binary =
-      n > i + 1 && s[i] == '0' && (s[i + 1] == 'b' || s[i + 1] == 'B');
-  int floating = 0;
-  for (size_t k = i; k < n; ++k) {
-    char c = s[k];
-    if (c == '.' || c == 'p' || c == 'P' ||
-        (!hex && !binary && (c == 'e' || c == 'E')))
-      floating = 1;
-  }
-  char suffix = s[n - 1];
-  const char *type;
-  if (floating) {
-    if (suffix == 'f' || suffix == 'F')
-      type = "float";
-    else if (suffix == 'l' || suffix == 'L')
-      type = "long double";
-    else
-      type = "double";
-  } else if (suffix == 'u' || suffix == 'U') {
-    type = n >= 2 && (s[n - 2] == 'l' || s[n - 2] == 'L') ? "unsigned long"
-                                                          : "unsigned int";
-  } else if (suffix == 'l' || suffix == 'L') {
-    int twice = n >= 2 && (s[n - 2] == 'l' || s[n - 2] == 'L');
-    int unsigned_l = n >= 2 && (s[n - 2] == 'u' || s[n - 2] == 'U');
-    if (unsigned_l)
-      type = n >= 3 && (s[n - 3] == 'l' || s[n - 3] == 'L')
-                 ? "unsigned long long"
-                 : "unsigned long";
-    else
-      type = twice ? "long long" : "long";
-  } else {
-    type = "int";
-  }
-  return xstrdup(type);
-}
-
-static int tmpl_has_payload_key(const TemplateDef *tmpl) {
-  if (!tmpl || tmpl->kind != TEMPLATE_TYPE || tmpl->nparams != 1)
-    return 0;
-  for (size_t i = 0; i < tmpl->dispatch_keys.len; ++i) {
-    DispatchKey *key = (DispatchKey *)tmpl->dispatch_keys.items[i];
-    if (!strcmp(key->expr, tmpl->params[0]))
-      return 1;
-  }
-  return 0;
-}
-
-static char *dispatch_payload_type_from_call(const char *raw,
-                                             const TemplateDef *tmpl) {
-  if (!tmpl_has_payload_key(tmpl))
-    return NULL;
-  Vec args;
-  args.items = NULL;
-  args.len = args.cap = 0;
-  split_type_args(raw, &args);
-  char *type = args.len ? literal_type_from_expr((const char *)args.items[0])
-                        : NULL;
-  for (size_t i = 0; i < args.len; ++i)
-    free(args.items[i]);
-  free(args.items);
-  return type;
 }
 
 static char *join_strings(Vec *items, const char *sep) {
@@ -4447,13 +4410,6 @@ static void scan_usages_impl(const char *code, Registry *reg, Vec *out,
           if (depth == 0 && close > begin + 1) {
             char *raw = xstrdup_n(clean + begin, close - begin - 1);
             char *type = dispatch_type_args_from_call(raw, reg);
-            if (!type[0]) {
-              char *payload = dispatch_payload_type_from_call(raw, op_tmpl);
-              if (payload) {
-                free(type);
-                type = payload;
-              }
-            }
             if (type[0])
               scan_template_usage(op_tmpl, type, reg, out, scan_headers);
             free(type);
@@ -5163,6 +5119,8 @@ static char *make_dispatch_section(const TemplateDef *tmpl, Vec *cases,
 
   for (size_t i = 0; i < tmpl->dispatch_ops.len; ++i) {
     const char *op = tmpl->dispatch_ops.items[i];
+    if (set_has(&tmpl->explicit_ops, op))
+      continue;
     str_append(&out, "#ifndef C_AUTOTMPL_DISPATCH_");
     str_append(&out, tmpl->name);
     str_append_char(&out, '_');
