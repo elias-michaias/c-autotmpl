@@ -65,6 +65,26 @@ static void appendArgUndefs(std::string &Out, const TemplateDef &Template) {
   }
 }
 
+// Ordinary owner-qualified ops are declared in type-template sections and need
+// a synthetic Owner macro. Method implementations receive Owner as a real
+// trailing template argument, which appendArgDefines already handles.
+static bool needsOwnerDefine(const TemplateDef &Template) {
+  return Template.Kind == TemplateKind::Type && !Template.MangleOwnerOps.empty();
+}
+
+static void appendOwnerDefine(std::string &Out, const TemplateDef &Template) {
+  if (!needsOwnerDefine(Template))
+    return;
+  Out += "#define Owner ";
+  Out += Template.Name;
+  Out += '\n';
+}
+
+static void appendOwnerUndef(std::string &Out, const TemplateDef &Template) {
+  if (needsOwnerDefine(Template))
+    Out += "#undef Owner\n";
+}
+
 static void appendStcDefines(std::string &Out, const TemplateDef &Template,
                              ArrayRef<std::string> Args) {
   if (!usesDerivedStcNames(Template)) {
@@ -467,6 +487,7 @@ std::string makeInstantiationBlock(
   }
 
   appendStcDefines(Out, Template, Args);
+  appendOwnerDefine(Out, Template);
   appendStcAdapters(Out, Template, AdapterOps);
 
   bool SharedStc = Template.Preset == TemplatePreset::StcShared;
@@ -485,6 +506,7 @@ std::string makeInstantiationBlock(
     Out += "#undef TMPL_HEADER\n";
   if (SharedStc)
     Out += "#undef TMPL_HEADER\n";
+  appendOwnerUndef(Out, Template);
   appendStcUndefs(Out, Template, Args);
   for (unsigned I = Guards.size(); I > 0; --I)
     Out += "#endif\n";
@@ -526,20 +548,27 @@ std::string dispatchContainerName(const TemplateDef &Template,
 
 static std::string dispatchCallTarget(const TemplateDef &Template,
                                       StringRef Op, const DispatchCase &Case) {
+  std::string Out;
+  bool MangleOwner = false;
   auto It = Template.DispatchTargets.find(Op);
-  if (It == Template.DispatchTargets.end())
-    return Case.Container + "_" + Op.str();
-  const DispatchTargetInfo &Target = It->second;
-  if (!Target.Base.empty()) {
-    if (!Target.AppendArgs)
-      return Target.Base;
-    std::string Out = Target.Base;
-    for (const std::string &Arg : Case.Args)
-      appendDispatchArg(Out, Arg);
-    return Out;
+  if (It == Template.DispatchTargets.end()) {
+    Out = Case.Container + "_" + Op.str();
+  } else {
+    const DispatchTargetInfo &Target = It->second;
+    MangleOwner = Target.MangleOwner;
+    if (!Target.Base.empty()) {
+      Out = Target.Base;
+      if (Target.AppendArgs)
+        for (const std::string &Arg : Case.Args)
+          appendDispatchArg(Out, Arg);
+    } else {
+      Out = Case.Container + "_" +
+            (Target.Suffix.empty() ? Op.str() : Target.Suffix);
+    }
   }
-  return Case.Container + "_" +
-         (Target.Suffix.empty() ? Op.str() : Target.Suffix);
+  if (MangleOwner)
+    appendDispatchArg(Out, Template.Name);
+  return Out;
 }
 
 static constexpr size_t DispatchMaxArgs = 8;
@@ -745,6 +774,8 @@ static std::string dispatchMethodTarget(const DispatchMethodDef &Method,
     appendDispatchArg(Out, Arg);
   for (const std::string &Arg : ExplicitArgs)
     appendDispatchArg(Out, Arg);
+  if (Method.MangleOwner && Method.Owner)
+    appendDispatchArg(Out, Method.Owner->Name);
   return Out;
 }
 
@@ -931,6 +962,7 @@ std::string makeImplInstantiationBlock(const TemplateDef &Template,
   Out += '\n';
 
   appendStcDefines(Out, Template, ActualArgs);
+  appendOwnerDefine(Out, Template);
   bool SharedStc = Template.Preset == TemplatePreset::StcShared;
   if (SharedStc)
     Out += "#define i_implement 1\n";
@@ -939,6 +971,7 @@ std::string makeImplInstantiationBlock(const TemplateDef &Template,
   Out += "\"\n";
   if (SharedStc)
     Out += "#undef i_implement\n";
+  appendOwnerUndef(Out, Template);
   appendStcUndefs(Out, Template, ActualArgs);
   for (size_t I = GuardMacros.size(); I > 0; --I) {
     if (!GuardMacros[I - 1].empty())

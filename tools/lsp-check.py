@@ -640,6 +640,206 @@ dispatch_templates=Result
     return 0
 
 
+def check_owner_mangling(plugin):
+    root = tempfile.mkdtemp(prefix="c-autotmpl-lsp-owner-")
+    try:
+        os.makedirs(os.path.join(root, "tmpl"))
+        os.makedirs(os.path.join(root, "gen"))
+        write(os.path.join(root, "tmpl", "box.h"), """\
+// -- template type Box(T)
+// -- +owner
+#define BOXC2_I(A, B) A##B
+#define BOXC2(A, B) BOXC2_I(A, B)
+#define BOXC3_I(A, B, C) A##_##B##_##C
+#define BOXC3(A, B, C) BOXC3_I(A, B, C)
+#define Box(T) BOXC2(Box_, T)
+#define get_impl(T, Owner) BOXC3(get, T, Owner)
+typedef struct { T value; } Box(T);
+static inline T get_impl(T, Owner)(Box(T) *b) { return b->value; }
+#undef get_impl
+""")
+        write(os.path.join(root, "tmpl", "container.h"), """\
+// -- template type Container(T)
+// -- mangle +owner
+#define CC2_I(A, B) A##B
+#define CC2(A, B) CC2_I(A, B)
+#define CC3_I(A, B, C) A##_##B##_##C
+#define CC3(A, B, C) CC3_I(A, B, C)
+#define Container(T) CC2(Container_, T)
+#define get_impl(T, Owner) CC3(get, T, Owner)
+typedef struct { T value; } Container(T);
+static inline T get_impl(T, Owner)(Container(T) *c) { return c->value; }
+#undef get_impl
+""")
+        write(os.path.join(root, "tmpl", "option.h"), """\
+// -- template type Option(T)
+#define OC2_I(A, B) A##B
+#define OC2(A, B) OC2_I(A, B)
+#define OC4_I(A, B, C, D) A##_##B##_##C##_##D
+#define OC4(A, B, C, D) OC4_I(A, B, C, D)
+#define Option(T) OC2(Option_, T)
+typedef struct { T value; } Option(T);
+
+// -- template function option_map_impl(T, U, Owner)
+// -- dispatch method Option.map explicit U
+// -- +owner
+#define option_map_impl(T, U, Owner) OC4(map, T, U, Owner)
+static inline Option(U) option_map_impl(T, U, Owner)(Option(T) x, U (*f)(T)) {
+  Option(U) out = {f(x.value)};
+  return out;
+}
+""")
+        write(os.path.join(root, "tmpl", "result.h"), """\
+// -- template type Result(T, U)
+#define RC3_I(A, B, C) A##_##B##_##C
+#define RC3(A, B, C) RC3_I(A, B, C)
+#define RC5_I(A, B, C, D, E) A##_##B##_##C##_##D##_##E
+#define RC5(A, B, C, D, E) RC5_I(A, B, C, D, E)
+#define Result(T, U) RC3(Result, T, U)
+typedef struct { T ok; U err; } Result(T, U);
+
+// -- template function result_map_impl(T, U, V, Owner)
+// -- dispatch method Result.map explicit V
+// -- mangle +owner
+#define result_map_impl(T, U, V, Owner) RC5(map, T, U, V, Owner)
+static inline Result(V, U) result_map_impl(T, U, V, Owner)(Result(T, U) x,
+                                                          V (*f)(T)) {
+  Result(V, U) out = {f(x.ok), x.err};
+  return out;
+}
+""")
+        source = os.path.join(root, "main.c")
+        write(source, "int main(void) { return 0; }\n")
+        text = """\
+#include "gen/box.h"
+#include "gen/container.h"
+#include "gen/option.h"
+#include "gen/result.h"
+#include "gen/dispatch.h"
+
+static int twice(int x) { return 2 * x; }
+static float half(int x) { return (float)x / 2.0f; }
+
+int main(void) {
+  Box(int) b = {7};
+  Container(float) c = {2.5f};
+  Option(int) o = {7};
+  Result(int, float) r = {7, 0};
+
+  int x = get(&b);
+  float y = get(&c);
+  Option(int) oi = map(int)(o, twice);
+  Option(float) of = map(float)(o, half);
+  Result(int, float) ri = map(int)(r, twice);
+  Result(float, float) rf = map(float)(r, half);
+  return x == 7 && y == 2.5f && oi.value == 14 && of.value == 3.5f &&
+         ri.ok == 14 && rf.ok == 3.5f ? 0 : 1;
+}
+"""
+        box_header = os.path.join(root, "gen", "box.h")
+        container_header = os.path.join(root, "gen", "container.h")
+        option_impl = os.path.join(root, "gen", "option_map_impl.h")
+        result_impl = os.path.join(root, "gen", "result_map_impl.h")
+        dispatch_header = os.path.join(root, "gen", "dispatch.h")
+        log_path = os.path.join(root, "clangd.log")
+        write(os.path.join(root, "autotmpl.conf"), """\
+dispatch=1
+dispatch_truncate=1
+dispatch_templates=Box,Container,Option,Result
+""")
+        with open(log_path, "wb") as log:
+            proc = subprocess.Popen(
+                ["clangd", "--log=verbose", "--load=" + plugin],
+                cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=log, env=plugin_env(),
+            )
+            try:
+                send(proc, {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "processId": None,
+                        "rootUri": "file://" + root,
+                        "capabilities": {},
+                    },
+                })
+                send(proc, {"jsonrpc": "2.0", "method": "initialized",
+                            "params": {}})
+                send(proc, {
+                    "jsonrpc": "2.0",
+                    "method": "textDocument/didOpen",
+                    "params": {"textDocument": {
+                        "uri": "file://" + source,
+                        "languageId": "c",
+                        "version": 1,
+                        "text": text,
+                    }},
+                })
+                for path, needle in (
+                    (box_header, "#define Owner Box\n"),
+                    (container_header, "#define Owner Container\n"),
+                    (option_impl, "/* c-autotmpl: option_map_impl(int, int, "
+                                  "Option) */"),
+                    (result_impl, "/* c-autotmpl: result_map_impl(int, float, "
+                                  "int, Result) */"),
+                ):
+                    content = wait_for_content(path, lambda c, n=needle: n in c)
+                    if content is None:
+                        print("plugin owner instantiation was not generated: " +
+                              needle, file=sys.stderr)
+                        with open(log_path, errors="replace") as f:
+                            print(f.read()[-4000:], file=sys.stderr)
+                        return 1
+                    if "#undef Owner\n" not in content:
+                        print("plugin did not undefine Owner: " + path,
+                              file=sys.stderr)
+                        return 1
+
+                dispatch = wait_for_content(
+                    dispatch_header,
+                    lambda c: (
+                        "/* c-autotmpl generated-by=plugin */" in c and
+                        "Box_int: get_int_Box" in c and
+                        "Container_float: get_float_Container" in c and
+                        "Option_int: map_int_int_Option" in c and
+                        "Option_int: map_int_float_Option" in c and
+                        "Result_int_float: map_int_float_int_Result" in c and
+                        "Result_int_float: map_int_float_float_Result" in c
+                    ),
+                )
+                if dispatch is None:
+                    print("plugin owner-mangled dispatch was not generated",
+                          file=sys.stderr)
+                    with open(log_path, errors="replace") as f:
+                        print(f.read()[-4000:], file=sys.stderr)
+                    return 1
+                for unmangled in ("Box_int: get_int,",
+                                  "Container_float: get_float,",
+                                  "Option_int: map_int_int,",
+                                  "Result_int_float: map_int_float_int,"):
+                    if unmangled in dispatch:
+                        print("plugin kept an unmangled target: " + unmangled,
+                              file=sys.stderr)
+                        return 1
+                if "/* c-autotmpl: Option(Option) */" in dispatch:
+                    print("plugin treated Owner as an explicit type argument",
+                          file=sys.stderr)
+                    return 1
+            finally:
+                try:
+                    send(proc, {"jsonrpc": "2.0", "id": 2,
+                                "method": "shutdown", "params": None})
+                    send(proc, {"jsonrpc": "2.0", "method": "exit",
+                                "params": None})
+                    proc.wait(timeout=5)
+                except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
+                    proc.kill()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return 0
+
+
 def check_dispatch_truncate(plugin):
     root = tempfile.mkdtemp(prefix="c-autotmpl-lsp-truncate-")
     try:
@@ -1381,6 +1581,8 @@ def main():
     if check_dispatch(plugin) != 0:
         return 1
     if check_dispatch_method(plugin) != 0:
+        return 1
+    if check_owner_mangling(plugin) != 0:
         return 1
     if check_dispatch_truncate(plugin) != 0:
         return 1

@@ -1303,6 +1303,172 @@ dispatch_truncate=1
         shutil.rmtree(root, ignore_errors=True)
 
 
+def check_owner_mangling(cli):
+    root = tempfile.mkdtemp(prefix="c-autotmpl-owner-mangle-")
+    try:
+        os.makedirs(os.path.join(root, "tmpl"))
+        os.makedirs(os.path.join(root, "gen"))
+        write(os.path.join(root, "tmpl", "box.h"), """\
+// -- template type Box(T)
+// -- +owner
+#define BOX_CAT2_I(A, B) A##B
+#define BOX_CAT2(A, B) BOX_CAT2_I(A, B)
+#define BOX_CAT3_I(A, B, C) A##_##B##_##C
+#define BOX_CAT3(A, B, C) BOX_CAT3_I(A, B, C)
+#define Box(T) BOX_CAT2(Box_, T)
+#define get_impl(T, Owner) BOX_CAT3(get, T, Owner)
+typedef struct { T value; } Box(T);
+static inline T get_impl(T, Owner)(Box(T) *b) { return b->value; }
+#undef get_impl
+""")
+        write(os.path.join(root, "tmpl", "container.h"), """\
+// -- template type Container(T)
+// -- mangle +owner
+#define CONTAINER_CAT2_I(A, B) A##B
+#define CONTAINER_CAT2(A, B) CONTAINER_CAT2_I(A, B)
+#define CONTAINER_CAT3_I(A, B, C) A##_##B##_##C
+#define CONTAINER_CAT3(A, B, C) CONTAINER_CAT3_I(A, B, C)
+#define Container(T) CONTAINER_CAT2(Container_, T)
+#define get_impl(T, Owner) CONTAINER_CAT3(get, T, Owner)
+typedef struct { T inner; } Container(T);
+static inline T get_impl(T, Owner)(Container(T) *c) { return c->inner; }
+#undef get_impl
+""")
+        write(os.path.join(root, "tmpl", "option.h"), """\
+// -- template type Option(T)
+#define OPTION_CAT2_I(A, B) A##B
+#define OPTION_CAT2(A, B) OPTION_CAT2_I(A, B)
+#define OPTION_CAT4_I(A, B, C, D) A##_##B##_##C##_##D
+#define OPTION_CAT4(A, B, C, D) OPTION_CAT4_I(A, B, C, D)
+#define Option(T) OPTION_CAT2(Option_, T)
+typedef struct { int has; T value; } Option(T);
+
+// -- template function option_map_impl(T, U, Owner)
+// -- dispatch method Option.map explicit U
+// -- +owner
+#define option_map_impl(T, U, Owner) OPTION_CAT4(map, T, U, Owner)
+static inline Option(U) option_map_impl(T, U, Owner)(Option(T) x, U (*f)(T)) {
+  Option(U) out = {1, f(x.value)};
+  return out;
+}
+#undef option_map_impl
+""")
+        write(os.path.join(root, "tmpl", "result.h"), """\
+// -- template type Result(T, U)
+#define RESULT_CAT3_I(A, B, C) A##_##B##_##C
+#define RESULT_CAT3(A, B, C) RESULT_CAT3_I(A, B, C)
+#define RESULT_CAT5_I(A, B, C, D, E) A##_##B##_##C##_##D##_##E
+#define RESULT_CAT5(A, B, C, D, E) RESULT_CAT5_I(A, B, C, D, E)
+#define Result(T, U) RESULT_CAT3(Result, T, U)
+typedef struct { int ok; T value; U error; } Result(T, U);
+
+// -- template function result_map_impl(T, U, V, Owner)
+// -- dispatch method Result.map explicit V
+// -- mangle +owner
+#define result_map_impl(T, U, V, Owner) RESULT_CAT5(map, T, U, V, Owner)
+static inline Result(V, U) result_map_impl(T, U, V, Owner)(Result(T, U) x,
+                                                         V (*f)(T)) {
+  Result(V, U) out = {1, f(x.value), x.error};
+  return out;
+}
+#undef result_map_impl
+""")
+        source = os.path.join(root, "main.c")
+        write(source, """\
+#include "gen/box.h"
+#include "gen/container.h"
+#include "gen/option.h"
+#include "gen/result.h"
+#include "gen/dispatch.h"
+static int twice(int x) { return 2 * x; }
+static float half(int x) { return (float)x / 2.0f; }
+int main(void) {
+  Box(int) b = {7};
+  Container(float) c = {3.5f};
+  Option(int) o = {1, 7};
+  Result(int, float) r = {1, 7, 0.0f};
+  Option(int) oi = map(int)(o, twice);
+  Option(float) of = map(float)(o, half);
+  Result(int, float) ri = map(int)(r, twice);
+  Result(float, float) rf = map(float)(r, half);
+  return get(&b) == 7 && get(&c) == 3.5f && oi.value == 14 &&
+                 of.value == 3.5f && ri.value == 14 && rf.value == 3.5f ? 0 : 1;
+}
+""")
+        write(os.path.join(root, "autotmpl.conf"), """\
+dispatch=1
+dispatch_truncate=1
+dispatch_templates=Box,Container,Option,Result
+""")
+        args = [cli, "--root", root, "--verbose", source]
+        proc = subprocess.run(args, cwd=root, capture_output=True, text=True,
+                              env=env_with())
+        output = proc.stdout + proc.stderr
+        require(proc.returncode == 0, "owner mangling run exited with error",
+                output)
+        for needle in ("generated Box(int)", "generated Container(float)",
+                       "generated option_map_impl(int, int, Option)",
+                       "generated result_map_impl(int, float, int, Result)"):
+            require(needle in output,
+                    "owner mangling run missed an instantiation: " + needle,
+                    output)
+
+        for name, owner in (("box.h", "Box"),
+                            ("container.h", "Container")):
+            with open(os.path.join(root, "gen", name)) as f:
+                require("#define Owner " + owner + "\n" in f.read(),
+                        "ordinary owner macro was not defined for " + owner)
+
+        with open(os.path.join(root, "gen", "dispatch.h")) as f:
+            dispatch = f.read()
+        for needle in ("Box_int: get_int_Box",
+                       "Container_float: get_float_Container",
+                       "Option_int: map_int_int_Option",
+                       "Result_int_float: map_int_float_int_Result"):
+            require(needle in dispatch,
+                    "owner-mangled dispatch case is missing: " + needle,
+                    dispatch)
+
+        for name, owner, params in (("option_map_impl.h", "Option",
+                                     "(T, U, Owner)"),
+                                    ("result_map_impl.h", "Result",
+                                     "(T, U, V, Owner)")):
+            with open(os.path.join(root, "gen", name)) as f:
+                impl = f.read()
+            require(params in impl,
+                    "method template did not gain a synthetic Owner: " + name,
+                    impl)
+            require("#define Owner " + owner + "\n" in impl,
+                    "method implementation did not define Owner", impl)
+            require("#undef Owner\n" in impl,
+                    "method implementation did not undefine Owner", impl)
+
+        compiler = os.environ.get("CC") or next(
+            (name for name in ("cc", "gcc", "clang") if shutil.which(name)),
+            None,
+        )
+        if compiler:
+            built = subprocess.run(
+                [compiler, "-std=c11", "-Wall", "-Wextra", "-Werror",
+                 "main.c", "-o", "owner-mangle-demo"],
+                cwd=root, capture_output=True, text=True,
+            )
+            require(built.returncode == 0,
+                    "owner-mangled output did not compile",
+                    built.stdout + built.stderr)
+            ran = subprocess.run([os.path.join(root, "owner-mangle-demo")],
+                                 cwd=root)
+            require(ran.returncode == 0, "owner-mangled output did not run")
+
+        rerun = subprocess.run(args, cwd=root, capture_output=True, text=True,
+                               env=env_with())
+        output = rerun.stdout + rerun.stderr
+        require(rerun.returncode == 0 and "added=0" in output,
+                "owner-mangled generation was not idempotent", output)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def check_preprocess(cli):
     compiler = os.environ.get("CC") or next(
         (name for name in ("cc", "gcc", "clang") if shutil.which(name)),
@@ -1685,6 +1851,7 @@ def main():
     check_explicit_constructor_alias(cli)
     check_explicit_dispatch_method(cli)
     check_shared_dispatch(cli)
+    check_owner_mangling(cli)
     check_dispatch_truncate(cli)
     check_value_generics(cli)
     check_preprocess(cli)

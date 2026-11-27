@@ -1206,6 +1206,8 @@ struct SharedState {
             FullArgs.push_back(Arg);
           for (const std::string &Arg : Use.Args)
             FullArgs.push_back(Arg);
+          if (Method.MangleOwner)
+            FullArgs.push_back(Method.Owner->Name);
           ImplUsage.TypeSpelling = joinExplicitArgs(FullArgs);
           for (const std::string &Arg : FullArgs)
             ImplUsage.Args.push_back(Arg);

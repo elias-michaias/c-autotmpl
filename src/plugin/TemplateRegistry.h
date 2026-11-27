@@ -65,6 +65,7 @@ struct DispatchTargetInfo {
   std::string Base;        // stable function spelling, when name does not vary
   std::string Suffix;      // generated suffix appended to the container
   bool AppendArgs = false; // true for box_alloc(T)-style macro calls
+  bool MangleOwner = false; // append the owning template name to the target
 };
 
 struct TemplateDef;
@@ -86,6 +87,7 @@ struct TemplateDef {
   llvm::StringSet<> DispatchOps;                // method-like operation names
   llvm::StringMap<unsigned> DispatchOpOffsets;  // declaration offsets in Header
   llvm::StringMap<DispatchTargetInfo> DispatchTargets; // op -> call target
+  llvm::StringSet<> MangleOwnerOps; // ops marked with `// -- +owner`
   llvm::SmallVector<const DispatchMethodDef *, 2> DispatchMethods;
   bool DispatchEnabled = false;
 };
@@ -99,6 +101,7 @@ struct DispatchMethodDef {
   llvm::SmallVector<std::string, 2> ExplicitParams;
   const TemplateDef *Owner = nullptr;
   TemplateDef Impl; // the annotated function-template section
+  bool MangleOwner = false; // append the owner name to concrete method targets
 };
 
 /// True for arguments that need include-guard and dependency handling.

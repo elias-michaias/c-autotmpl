@@ -1164,6 +1164,167 @@ int main() {
     c_autotmpl::setDispatchTruncate(false);
   }
 
+  {
+    // Owner mangling is orthogonal to explicit method arguments: ordinary
+    // operations and curried methods may both opt in with a section decorator.
+    SmallString<128> OwnerRoot("/tmp/c-autotmpl-owner-selftest");
+    sys::fs::remove_directories(OwnerRoot);
+    sys::fs::create_directories(join(OwnerRoot, "tmpl"));
+    {
+      std::error_code EC;
+      raw_fd_ostream OS(join(OwnerRoot, "tmpl/box.h"), EC);
+      OS << "// -- template type Box(T)\n"
+            "// -- +owner\n"
+            "#define BOX_CAT2_I(A, B) A##B\n"
+            "#define BOX_CAT2(A, B) BOX_CAT2_I(A, B)\n"
+            "#define BOX_CAT3_I(A, B, C) A##_##B##_##C\n"
+            "#define BOX_CAT3(A, B, C) BOX_CAT3_I(A, B, C)\n"
+            "#define Box(T) BOX_CAT2(Box_, T)\n"
+            "#define get_impl(T, Owner) BOX_CAT3(get, T, Owner)\n"
+            "typedef struct { T value; } Box(T);\n"
+            "static inline T get_impl(T, Owner)(Box(T) *b) { return b->value; }\n"
+            "#undef get_impl\n";
+    }
+    {
+      std::error_code EC;
+      raw_fd_ostream OS(join(OwnerRoot, "tmpl/container.h"), EC);
+      OS << "// -- template type Container(T)\n"
+            "// -- mangle +owner\n"
+            "#define CONTAINER_CAT2_I(A, B) A##B\n"
+            "#define CONTAINER_CAT2(A, B) CONTAINER_CAT2_I(A, B)\n"
+            "#define CONTAINER_CAT3_I(A, B, C) A##_##B##_##C\n"
+            "#define CONTAINER_CAT3(A, B, C) CONTAINER_CAT3_I(A, B, C)\n"
+            "#define Container(T) CONTAINER_CAT2(Container_, T)\n"
+            "#define get_impl(T, Owner) CONTAINER_CAT3(get, T, Owner)\n"
+            "typedef struct { T value; } Container(T);\n"
+            "static inline T get_impl(T, Owner)(Container(T) *c) "
+            "{ return c->value; }\n"
+            "#undef get_impl\n";
+    }
+    {
+      std::error_code EC;
+      raw_fd_ostream OS(join(OwnerRoot, "tmpl/option.h"), EC);
+      OS << "// -- template type Option(T)\n"
+            "#define OPTION_CAT2_I(A, B) A##B\n"
+            "#define OPTION_CAT2(A, B) OPTION_CAT2_I(A, B)\n"
+            "#define OPTION_CAT4_I(A, B, C, D) A##_##B##_##C##_##D\n"
+            "#define OPTION_CAT4(A, B, C, D) OPTION_CAT4_I(A, B, C, D)\n"
+            "#define Option(T) OPTION_CAT2(Option_, T)\n"
+            "typedef struct { T value; } Option(T);\n"
+            "\n"
+            "// -- template function option_map_impl(T, U, Owner)\n"
+            "// -- dispatch method Option.map explicit U\n"
+            "// -- +owner\n"
+            "#define option_map_impl(T, U, Owner) "
+            "OPTION_CAT4(map, T, U, Owner)\n"
+            "static inline Option(U) option_map_impl(T, U, Owner)"
+            "(Option(T) x, U (*f)(T)) {\n"
+            "  Option(U) out = {f(x.value)};\n"
+            "  return out;\n"
+            "}\n";
+    }
+    {
+      std::error_code EC;
+      raw_fd_ostream OS(join(OwnerRoot, "tmpl/result.h"), EC);
+      OS << "// -- template type Result(T, U)\n"
+            "#define RESULT_CAT3_I(A, B, C) A##_##B##_##C\n"
+            "#define RESULT_CAT3(A, B, C) RESULT_CAT3_I(A, B, C)\n"
+            "#define RESULT_CAT5_I(A, B, C, D, E) A##_##B##_##C##_##D##_##E\n"
+            "#define RESULT_CAT5(A, B, C, D, E) RESULT_CAT5_I(A, B, C, D, E)\n"
+            "#define Result(T, U) RESULT_CAT3(Result, T, U)\n"
+            "typedef struct { T value; U error; } Result(T, U);\n"
+            "\n"
+            "// -- template function result_map_impl(T, U, V, Owner)\n"
+            "// -- dispatch method Result.map explicit V\n"
+            "// -- mangle +owner\n"
+            "#define result_map_impl(T, U, V, Owner) "
+            "RESULT_CAT5(map, T, U, V, Owner)\n"
+            "static inline Result(V, U) result_map_impl(T, U, V, Owner)"
+            "(Result(T, U) x, V (*f)(T)) {\n"
+            "  Result(V, U) out = {f(x.value), x.error};\n"
+            "  return out;\n"
+            "}\n";
+    }
+
+    c_autotmpl::TemplateRegistry OwnerRegistry;
+    c_autotmpl::setDispatchTruncate(true);
+    OwnerRegistry.scan(OwnerRoot);
+    c_autotmpl::setDispatchTruncate(false);
+    c_autotmpl::DispatchConfig OwnerCfg;
+    OwnerCfg.Enabled = true;
+    OwnerCfg.Truncate = true;
+    OwnerRegistry.applyDispatch(OwnerCfg);
+
+    const c_autotmpl::TemplateDef *BoxDef =
+        OwnerRegistry.findByName("Box");
+    const c_autotmpl::TemplateDef *ContainerDef =
+        OwnerRegistry.findByName("Container");
+    const c_autotmpl::TemplateDef *OptionDef =
+        OwnerRegistry.findByName("Option");
+    assert(BoxDef && ContainerDef && OptionDef);
+    assert(BoxDef->MangleOwnerOps.contains("get"));
+    assert(ContainerDef->MangleOwnerOps.contains("get"));
+    assert(BoxDef->DispatchTargets.find("get")->second.MangleOwner);
+    assert(ContainerDef->DispatchTargets.find("get")->second.MangleOwner);
+    // A decorated method section does not qualify the type's ordinary ops.
+    assert(OptionDef->MangleOwnerOps.empty());
+
+    SmallVector<const c_autotmpl::DispatchMethodDef *, 2> MapMethods;
+    OwnerRegistry.findDispatchMethods("map", MapMethods);
+    assert(MapMethods.size() == 2);
+    const c_autotmpl::DispatchMethodDef *OptionMap = nullptr;
+    const c_autotmpl::DispatchMethodDef *ResultMap = nullptr;
+    for (const c_autotmpl::DispatchMethodDef *Method : MapMethods) {
+      assert(Method->MangleOwner);
+      if (Method->Owner->Name == "Option") {
+        OptionMap = Method;
+        assert(Method->Impl.Params.size() == 3);
+      } else {
+        ResultMap = Method;
+        assert(Method->Owner->Name == "Result");
+        assert(Method->Impl.Params.size() == 4);
+      }
+    }
+    assert(OptionMap && ResultMap);
+
+    SmallVector<c_autotmpl::DispatchCase, 1> BoxCases{
+        {"int", "Box_int", {"int"}}};
+    SmallVector<c_autotmpl::DispatchCase, 1> ContainerCases{
+        {"float", "Container_float", {"float"}}};
+    SmallVector<StringRef, 1> GetOps{"get"};
+    std::string BoxSection = c_autotmpl::makeDispatchSection(
+        *BoxDef, BoxCases, GetOps, OwnerCfg);
+    std::string ContainerSection = c_autotmpl::makeDispatchSection(
+        *ContainerDef, ContainerCases, GetOps, OwnerCfg);
+    assert(BoxSection.find("Box_int: get_int_Box") != std::string::npos);
+    assert(ContainerSection.find("Container_float: get_float_Container") !=
+           std::string::npos);
+    assert(BoxSection.find("Box_int: get_int,") == std::string::npos);
+    assert(ContainerSection.find("Container_float: get_float,") ==
+           std::string::npos);
+
+    SmallVector<c_autotmpl::DispatchCase, 1> OptionCases{
+        {"int", "Option_int", {"int"}}};
+    SmallVector<c_autotmpl::DispatchCase, 1> ResultCases{
+        {"int, float", "Result_int_float", {"int", "float"}}};
+    SmallVector<c_autotmpl::DispatchMethodUse, 1> IntUses{
+        {"int", {"int"}}};
+    std::string OptionMapSection = c_autotmpl::makeDispatchMethodSection(
+        *OptionMap, OptionCases, IntUses, OwnerCfg, "");
+    std::string ResultMapSection = c_autotmpl::makeDispatchMethodSection(
+        *ResultMap, ResultCases, IntUses, OwnerCfg, "");
+    assert(OptionMapSection.find("Option_int: map_int_int_Option") !=
+           std::string::npos);
+    assert(ResultMapSection.find("Result_int_float: map_int_float_int_Result") !=
+           std::string::npos);
+
+    std::string OptionImpl = c_autotmpl::makeImplInstantiationBlock(
+        OptionMap->Impl, "int, int, Option", {"int", "int", "Option"}, {});
+    assert(OptionImpl.find("#define Owner Option\n") != std::string::npos);
+    assert(OptionImpl.find("#undef Owner\n") != std::string::npos);
+    assert(countOccurrences(OptionImpl, "#define Owner ") == 1);
+  }
+
   std::cout << "selftest OK\n";
   return 0;
 }

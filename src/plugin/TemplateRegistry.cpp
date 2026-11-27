@@ -518,6 +518,26 @@ bool readIdentToken(StringRef &S, std::string &Out) {
   return true;
 }
 
+/// `// -- +owner` (or `// -- mangle +owner`) marks the current template section
+/// as opting into owner-qualified concrete dispatch targets. It is independent
+/// of `explicit`, so ordinary operations and curried methods can both use it.
+bool parseOwnerMangleDecorator(StringRef Line) {
+  StringRef S = Line.ltrim();
+  if (!S.consume_front("//"))
+    return false;
+  S = S.ltrim();
+  if (!S.consume_front("--"))
+    return false;
+  S = S.ltrim();
+  if (S.consume_front("mangle")) {
+    S = S.ltrim();
+    if (S.empty() || !S.consume_front("+owner"))
+      return false;
+    return S.trim().empty();
+  }
+  return S.consume_front("+owner") && S.trim().empty();
+}
+
 /// `// -- dispatch method Result.map explicit V`
 bool parseDispatchMethodAnnotation(StringRef Line, DispatchMethodDef &Out) {
   StringRef S = Line.ltrim();
@@ -896,19 +916,54 @@ void TemplateRegistry::scanTree(StringRef Dir) {
     bool Found = false;
     TemplateDef Section;
     SmallVector<std::unique_ptr<DispatchMethodDef>, 2> FileMethods;
+    size_t SectionStart = 0;
+    size_t SectionMethodBegin = 0;
+    bool SectionMangleOwner = false;
+
+    // Applies section-level decorators before the next section replaces them.
+    auto finishSection = [&](size_t End) {
+      if (!Found || SectionStart >= End)
+        return;
+      // Only a decorated type section contributes ordinary dispatch targets.
+      // A decorated function section is a method implementation: its owner is
+      // supplied as the synthetic trailing template argument instead.
+      if (SectionMangleOwner && Section.Kind == TemplateKind::Type) {
+        TemplateDef Probe;
+        Probe.Kind = Section.Kind;
+        Probe.Name = Section.Name;
+        Probe.Params = Section.Params;
+        collectDispatchOps(Full.substr(SectionStart, End - SectionStart), Probe,
+                           SectionStart);
+        for (const auto &Entry : Probe.DispatchOps)
+          Def->MangleOwnerOps.insert(Entry.getKey());
+      }
+      if (SectionMangleOwner)
+        for (size_t I = SectionMethodBegin; I < FileMethods.size(); ++I)
+          FileMethods[I]->MangleOwner = true;
+    };
+
     while (!Cursor.empty()) {
+      size_t LineOffset = Full.size() - Cursor.size();
       StringRef Line;
       std::tie(Line, Cursor) = Cursor.split('\n');
       TemplateDef Candidate;
       if (parseDecorator(Line, Candidate)) {
+        finishSection(LineOffset);
         fillTemplatePaths(Candidate, It->path(), HasGuard);
         if (!Found) {
           *Def = Candidate;
           Found = true;
         }
         // Only the first section becomes a registered template. Later sections
-        // are tracked just long enough to attach dispatch-method annotations.
+        // are tracked just long enough to attach dispatch annotations.
         Section = std::move(Candidate);
+        SectionStart = LineOffset;
+        SectionMethodBegin = FileMethods.size();
+        SectionMangleOwner = false;
+        continue;
+      }
+      if (parseOwnerMangleDecorator(Line)) {
+        SectionMangleOwner = true;
         continue;
       }
       if (!Found || Section.Kind != TemplateKind::Function)
@@ -920,6 +975,7 @@ void TemplateRegistry::scanTree(StringRef Dir) {
             std::move(Method)));
       }
     }
+    finishSection(Full.size());
     if (!Found)
       continue;
     // A datatype(...) declaration describes its variants in the header itself,
@@ -931,6 +987,11 @@ void TemplateRegistry::scanTree(StringRef Dir) {
     // offsets are still needed to send go-to-definition to the authored
     // function declarations in those headers.
     collectDispatchOps(Full, *Def);
+    for (const auto &Entry : Def->MangleOwnerOps) {
+      auto It = Def->DispatchTargets.find(Entry.getKey());
+      if (It != Def->DispatchTargets.end())
+        It->second.MangleOwner = true;
+    }
 
     for (auto &Method : FileMethods)
       MethodDefs.push_back(std::move(Method));
@@ -950,7 +1011,9 @@ void TemplateRegistry::finishScan() {
         Method.Impl.Kind != TemplateKind::Function)
       continue;
     size_t Base = Owner->Params.size();
-    if (Method.Impl.Params.size() != Base + Method.ExplicitParams.size())
+    size_t Extra = Method.MangleOwner ? 1 : 0;
+    if (Method.Impl.Params.size() !=
+        Base + Method.ExplicitParams.size() + Extra)
       continue;
     bool Matches = true;
     for (size_t I = 0; Matches && I < Base; ++I)

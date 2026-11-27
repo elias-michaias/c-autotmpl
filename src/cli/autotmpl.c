@@ -1148,6 +1148,7 @@ typedef struct {
   Vec explicit_params; /* char*, in function-template parameter order */
   TemplateDef *impl;   /* registry-owned function template */
   Vec uses;            /* ExplicitMethodUse* */
+  int mangle_owner;    /* append the owner name to concrete method targets */
 } DispatchMethod;
 
 typedef struct {
@@ -1155,6 +1156,7 @@ typedef struct {
   char *base;   /* stable function spelling, when the name does not vary */
   char *suffix; /* generated suffix appended to the concrete container */
   int append_args;
+  int mangle_owner;       /* append the owning template name to the target */
   DispatchMethod *method; /* non-NULL for curried explicit methods */
 } DispatchTarget;
 
@@ -1188,6 +1190,7 @@ struct TemplateDef {
   Vec dispatch_keys;      /* DispatchKey*, op-specific _Generic key expressions */
   Vec dispatch_methods;   /* DispatchMethod*, explicit-arg methods on this type */
   int dispatch_enabled;
+  int mangle_owner;       /* section opts into owner-qualified dispatch targets */
 };
 
 typedef struct {
@@ -1457,6 +1460,7 @@ static void set_dispatch_target(TemplateDef *tmpl, const char *op,
       target->base = base ? xstrdup(base) : NULL;
       target->suffix = suffix ? xstrdup(suffix) : NULL;
       target->append_args = append_args;
+      target->mangle_owner = tmpl->mangle_owner;
       target->method = NULL;
       return;
     }
@@ -1466,6 +1470,7 @@ static void set_dispatch_target(TemplateDef *tmpl, const char *op,
   target->base = base ? xstrdup(base) : NULL;
   target->suffix = suffix ? xstrdup(suffix) : NULL;
   target->append_args = append_args;
+  target->mangle_owner = tmpl->mangle_owner;
   target->method = NULL;
   vec_push(&tmpl->dispatch_targets, target);
 }
@@ -2149,11 +2154,12 @@ static void resolve_dispatch_methods(Registry *reg) {
         continue;
       }
       size_t ebase = owner->nparams;
-      if (fn->nparams != ebase + m->explicit_params.len) {
+      size_t extra = m->mangle_owner ? 1 : 0;
+      if (fn->nparams != ebase + m->explicit_params.len + extra) {
         fprintf(stderr,
                 "warning: dispatch method %s.%s ignored: %s has %zu params, expected %zu\n",
                 m->owner_name, m->op, fn->name, fn->nparams,
-                ebase + m->explicit_params.len);
+                ebase + m->explicit_params.len + extra);
         continue;
       }
       int ok = 1;
@@ -3552,6 +3558,41 @@ static int read_ident_token(const char **p, char **out) {
   return 1;
 }
 
+/* `// -- +owner` (or `// -- mangle +owner`) marks the current template section
+ * as opting into owner-qualified concrete dispatch targets. It composes with
+ * both ordinary operations and curried dispatch methods. */
+static int parse_owner_mangle_decorator(const char *line) {
+  const char *s = line;
+  while (is_space(*s))
+    ++s;
+  if (strncmp(s, "//", 2))
+    return 0;
+  s += 2;
+  while (is_space(*s))
+    ++s;
+  if (strncmp(s, "--", 2))
+    return 0;
+  s += 2;
+  while (is_space(*s))
+    ++s;
+
+  if (is_word(s, 0, "mangle")) {
+    s += strlen("mangle");
+    while (is_space(*s))
+      ++s;
+    if (strncmp(s, "+owner", 6))
+      return 0;
+    s += 6;
+  } else if (strncmp(s, "+owner", 6)) {
+    return 0;
+  } else {
+    s += 6;
+  }
+  while (is_space(*s))
+    ++s;
+  return *s == '\0';
+}
+
 /* `// -- dispatch method Result.map explicit V` marks a function-template
  * section as a curried method of the owning type template. The first
  * owner->nparams parameters of the function must match the owner's parameters;
@@ -3641,6 +3682,7 @@ static int parse_dispatch_method_annotation(const char *line,
   out->op = op;
   out->explicit_params = params;
   out->impl = NULL;
+  out->mangle_owner = 0;
   out->uses.items = NULL;
   out->uses.len = out->uses.cap = 0;
   return 1;
@@ -3750,6 +3792,7 @@ static int visit_template_file(const char *path, void *ctx) {
   TemplateDef def;
   memset(&def, 0, sizeof(def));
   int have_section = 0;
+  int section_mangle_owner = 0;
   char *preamble = NULL;
   const char *section_start = NULL;
   const char *p = content;
@@ -3762,14 +3805,22 @@ static int visit_template_file(const char *path, void *ctx) {
     TemplateDef candidate;
     memset(&candidate, 0, sizeof(candidate));
     if (parse_decorator(line, &candidate)) {
-      if (have_section)
+      if (have_section) {
+        def.mangle_owner = section_mangle_owner;
+        for (size_t i = 0; i < def.dispatch_methods.len; ++i)
+          ((DispatchMethod *)def.dispatch_methods.items[i])->mangle_owner =
+              section_mangle_owner;
         register_template_section(scan, path, &def, preamble, section_start, p,
                                   file_preprocess);
+      }
       if (!have_section)
         preamble = xstrdup_n(content, (size_t)(p - content));
       def = candidate;
       have_section = 1;
       section_start = p;
+      section_mangle_owner = 0;
+    } else if (parse_owner_mangle_decorator(line)) {
+      section_mangle_owner = 1;
     } else if (have_section && def.kind == TEMPLATE_FUNCTION &&
                !def.dispatch_methods.len) {
       DispatchMethod ann;
@@ -3789,9 +3840,14 @@ static int visit_template_file(const char *path, void *ctx) {
     p = newline + 1;
   }
 
-  if (have_section)
+  if (have_section) {
+    def.mangle_owner = section_mangle_owner;
+    for (size_t i = 0; i < def.dispatch_methods.len; ++i)
+      ((DispatchMethod *)def.dispatch_methods.items[i])->mangle_owner =
+          section_mangle_owner;
     register_template_section(scan, path, &def, preamble, section_start, p,
                               file_preprocess);
+  }
   free(preamble);
   free(content);
   return 0;
@@ -5168,6 +5224,26 @@ static void append_arg_undefs(Str *out, const TemplateDef *tmpl) {
   }
 }
 
+/* Owner-qualified ordinary ops are declared in type-template sections. Method
+ * implementations receive the owner as a real trailing template argument, so
+ * append_arg_defines already defines their Owner macro. */
+static int needs_owner_define(const TemplateDef *tmpl) {
+  return tmpl->kind == TEMPLATE_TYPE && tmpl->mangle_owner;
+}
+
+static void append_owner_define(Str *out, const TemplateDef *tmpl) {
+  if (!needs_owner_define(tmpl))
+    return;
+  str_append(out, "#define Owner ");
+  str_append(out, tmpl->name);
+  str_append_char(out, '\n');
+}
+
+static void append_owner_undef(Str *out, const TemplateDef *tmpl) {
+  if (needs_owner_define(tmpl))
+    str_append(out, "#undef Owner\n");
+}
+
 static void append_stc_defines(Str *out, const TemplateDef *tmpl, Vec *args) {
   if (!stc_derived_mode(tmpl)) {
     append_arg_defines(out, tmpl, args);
@@ -5305,6 +5381,8 @@ static char *dispatch_call_target(const TemplateDef *tmpl, const char *op,
       str_append_char(&out, '_');
       str_append(&out, target->suffix ? target->suffix : op);
     }
+    if (target->mangle_owner)
+      append_dispatch_arg(&out, tmpl->name);
     return str_take(&out);
   }
   str_append(&out, c->container);
@@ -5343,6 +5421,8 @@ static char *dispatch_explicit_method_target(const TemplateDef *tmpl,
       append_dispatch_arg(&out, arg);
       free(arg);
     }
+    if (method->mangle_owner)
+      append_dispatch_arg(&out, tmpl->name);
     return str_take(&out);
   }
   return dispatch_call_target(tmpl, method->op, c);
@@ -6033,6 +6113,7 @@ static char *make_block(Usage *usage, Set *guards) {
   str_append_char(&out, '\n');
 
   append_stc_defines(&out, tmpl, &usage->args);
+  append_owner_define(&out, tmpl);
   append_stc_adapters(&out, tmpl);
   int shared_stc = tmpl->preset == PRESET_STC_SHARED;
   if (tmpl->has_tmpl_header && !is_stc_preset(tmpl))
@@ -6060,6 +6141,7 @@ static char *make_block(Usage *usage, Set *guards) {
     str_append(&out, "#undef i_header\n");
   if ((tmpl->has_tmpl_header && !is_stc_preset(tmpl)) || shared_stc)
     str_append(&out, "#undef TMPL_HEADER\n");
+  append_owner_undef(&out, tmpl);
   append_stc_undefs(&out, tmpl, &usage->args);
   for (size_t i = guards->len; i > 0; --i)
     str_append(&out, "#endif\n");
@@ -6416,6 +6498,7 @@ static char *make_impl_block(Usage *usage, Set *guards) {
   str_append(&out, presence);
   str_append_char(&out, '\n');
   append_stc_defines(&out, tmpl, &usage->args);
+  append_owner_define(&out, tmpl);
   int shared_stc = tmpl->preset == PRESET_STC_SHARED;
   if (shared_stc)
     str_append(&out, "#define i_implement 1\n");
@@ -6425,6 +6508,7 @@ static char *make_impl_block(Usage *usage, Set *guards) {
   str_append_char(&out, '\n');
   if (shared_stc)
     str_append(&out, "#undef i_implement\n");
+  append_owner_undef(&out, tmpl);
   append_stc_undefs(&out, tmpl, &usage->args);
   for (size_t i = guards->len; i > 0; --i)
     str_append(&out, "#endif\n");
@@ -6982,15 +7066,28 @@ static int emit_explicit_method_instantiations(Vec *groups, EmitCtx *ctx) {
         ExplicitMethodUse *use = (ExplicitMethodUse *)m->uses.items[ui];
         for (size_t ci = 0; ci < group->cases.len; ++ci) {
           DispatchCase *c = (DispatchCase *)group->cases.items[ci];
-          Vec full;
+          Vec full, deps_args;
           full.items = NULL;
           full.len = full.cap = 0;
-          for (size_t k = 0; k < c->args.len; ++k)
-            vec_push(&full, xstrdup((char *)c->args.items[k]));
-          for (size_t k = 0; k < use->args.len; ++k)
-            vec_push(&full, xstrdup((char *)use->args.items[k]));
+          deps_args.items = NULL;
+          deps_args.len = deps_args.cap = 0;
+          for (size_t k = 0; k < c->args.len; ++k) {
+            char *arg = xstrdup((char *)c->args.items[k]);
+            vec_push(&full, arg);
+            vec_push(&deps_args, xstrdup(arg));
+          }
+          for (size_t k = 0; k < use->args.len; ++k) {
+            char *arg = xstrdup((char *)use->args.items[k]);
+            vec_push(&full, arg);
+            vec_push(&deps_args, xstrdup(arg));
+          }
+          if (m->mangle_owner)
+            vec_push(&full, xstrdup(owner->name));
           Usage *usage = usage_new_with_args(m->impl, &full);
-          scan_header_deps(m->impl, &full, ctx->reg, &usage->deps);
+          scan_header_deps(m->impl, &deps_args, ctx->reg, &usage->deps);
+          for (size_t k = 0; k < deps_args.len; ++k)
+            free(deps_args.items[k]);
+          free(deps_args.items);
           int rc = emit_usage(usage, m->impl->generated, ctx, NULL, 0, 0);
           usage_free(usage);
           for (size_t k = 0; k < full.len; ++k)

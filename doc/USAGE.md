@@ -472,9 +472,12 @@ concrete-only declarations such as `slab_set_int` remain accepted as fallbacks.
 
 ### Curried methods with explicit type arguments
 
-A method can take extra type arguments at the call site. Annotate a
-function-template section whose first parameters mirror the owning type, then
-list the remaining parameters after `explicit`:
+This is the ad-hoc polymorphism form of dispatch: unrelated generated types can
+own different functions with the same public operation name, and a call picks
+the right implementation from its argument type. A method can also take extra
+type arguments at the call site. Annotate a function-template section whose
+first parameters mirror the owning type, then list the remaining parameters
+after `explicit`:
 
 ```c
 /* tmpl/result.h */
@@ -515,12 +518,152 @@ int main(void) {
 ```
 
 The target is `<op>_<owner args>_<explicit args>`, so the example calls
-`map_int_float_float`. Explicit arguments are pasted into generated names, so
-use single-token types such as `float`, `int`, or a typedef name. A second
-template may declare `// -- dispatch method Option.map explicit U`; both owners
-contribute guarded tables to the same `map` public macro in `gen/dispatch.h`.
-Both the CLI and the clangd plugin understand the annotation; no source-file
-markers are needed.
+`map_int_float_float`. With the owner decorator below, it becomes
+`<op>_<owner args>_<explicit args>_<Owner>`; `Owner` is supplied by the generator
+and is not a new call-site argument. Explicit arguments are pasted into generated
+names, so use single-token types such as `float`, `int`, or a typedef name. Both
+the CLI and the clangd plugin understand the annotation; no source-file markers
+are needed.
+
+Two owners can share the same public spelling. Concrete functions are pasted
+from their template arguments, so two owners that paste the same argument list
+would collide. Add `// -- +owner` (or `// -- mangle +owner`) to a template section
+to append the owning template name as the final concrete-name component. It is
+opt-in: without the decorator, generated names are unchanged.
+
+For ordinary operations, no extra implementation parameter is needed. The
+generated block defines `Owner` while expanding the section. Both templates
+below take one argument, yet `get(&o)` resolves to distinct functions:
+
+```text
+# autotmpl.conf
+dispatch=1
+dispatch_truncate=1
+dispatch_templates=Box,Container,Option,Result
+```
+
+```c
+/* tmpl/box.h */
+// -- template type Box(T)
+// -- +owner
+#define BOX_CAT2_I(a, b) a##b
+#define BOX_CAT2(a, b) BOX_CAT2_I(a, b)
+#define BOX_CAT3_I(a, b, c) a##_##b##_##c
+#define BOX_CAT3(a, b, c) BOX_CAT3_I(a, b, c)
+#define Box(T) BOX_CAT2(Box_, T)
+#define get_impl(T, Owner) BOX_CAT3(get, T, Owner)
+typedef struct { T value; } Box(T);
+static inline T get_impl(T, Owner)(Box(T) *b) { return b->value; }
+#undef get_impl
+```
+
+```c
+/* tmpl/container.h */
+// -- template type Container(T)
+// -- mangle +owner
+#define CONTAINER_CAT2_I(a, b) a##b
+#define CONTAINER_CAT2(a, b) CONTAINER_CAT2_I(a, b)
+#define CONTAINER_CAT3_I(a, b, c) a##_##b##_##c
+#define CONTAINER_CAT3(a, b, c) CONTAINER_CAT3_I(a, b, c)
+#define Container(T) CONTAINER_CAT2(Container_, T)
+#define get_impl(T, Owner) CONTAINER_CAT3(get, T, Owner)
+typedef struct { T value; } Container(T);
+static inline T get_impl(T, Owner)(Container(T) *c) { return c->value; }
+#undef get_impl
+```
+
+`get(&box)` targets `get_int_Box`; `get(&container)` targets
+`get_float_Container`. The public spelling and arity are unchanged.
+
+For a curried method, add one trailing synthetic parameter to the implementation
+template and its paste macro. The generator supplies the owner as that final
+argument; callers still write `map(float)(o, f)`:
+
+```c
+/* tmpl/option.h */
+// -- template type Option(T)
+#define OPTION_CAT2_I(a, b) a##b
+#define OPTION_CAT2(a, b) OPTION_CAT2_I(a, b)
+#define Option(T) OPTION_CAT2(Option_, T)
+typedef struct { int has; T value; } Option(T);
+
+// -- template function option_map_impl(T, U, Owner)
+// -- dispatch method Option.map explicit U
+// -- +owner
+#define OPTION_MAP4_I(a, b, c, d) a##_##b##_##c##_##d
+#define OPTION_MAP4(a, b, c, d) OPTION_MAP4_I(a, b, c, d)
+#define option_map_impl(T, U, Owner) OPTION_MAP4(map, T, U, Owner)
+static inline Option(U) option_map_impl(T, U, Owner)(Option(T) value,
+                                                     U (*f)(T)) {
+  Option(U) out = {0};
+  if (value.has) { out.has = 1; out.value = f(value.value); }
+  return out;
+}
+```
+
+```c
+/* tmpl/result.h */
+// -- template type Result(T, U)
+#define RESULT_CAT3_I(a, b, c) a##_##b##_##c
+#define RESULT_CAT3(a, b, c) RESULT_CAT3_I(a, b, c)
+#define Result(T, U) RESULT_CAT3(Result, T, U)
+typedef struct { int ok; T value; U error; } Result(T, U);
+
+// -- template function result_map_impl(T, U, V, Owner)
+// -- dispatch method Result.map explicit V
+// -- mangle +owner
+#define RESULT_MAP5_I(a, b, c, d, e) a##_##b##_##c##_##d##_##e
+#define RESULT_MAP5(a, b, c, d, e) RESULT_MAP5_I(a, b, c, d, e)
+#define result_map_impl(T, U, V, Owner) RESULT_MAP5(map, T, U, V, Owner)
+static inline Result(V, U) result_map_impl(T, U, V, Owner)(Result(T, U) value,
+                                                          V (*f)(T)) {
+  Result(V, U) out = {0};
+  if (value.ok) { out.ok = 1; out.value = f(value.value); }
+  else { out.error = value.error; }
+  return out;
+}
+```
+
+```c
+/* main.c */
+#include "gen/box.h"
+#include "gen/container.h"
+#include "gen/option.h"
+#include "gen/result.h"
+#include "gen/dispatch.h"
+
+static int twice(int x) { return 2 * x; }
+static float half(int x) { return (float)x / 2.0f; }
+static float scale(float x) { return 2.0f * x; }
+
+int main(void) {
+  Box(int) b = {7};
+  Container(float) c = {2.5f};
+  Option(int) some_int = {1, 7};
+  Option(float) some_float = {1, 2.5f};
+  Result(int, float) ok_int = {1, 7, 0.0f};
+
+  int x = get(&b);                                      /* get_int_Box */
+  float y = get(&c);                                    /* get_float_Container */
+  Option(int) oi = map(int)(some_int, twice);           /* map_int_int_Option */
+  Option(float) widened = map(float)(some_int, half);   /* map_int_float_Option */
+  Option(float) of = map(float)(some_float, scale);     /* map_float_float_Option */
+  Result(int, float) ri = map(int)(ok_int, twice);      /* map_int_float_int_Result */
+  Result(float, float) rf = map(float)(ok_int, half);   /* map_int_float_float_Result */
+  return x == 7 && y == 2.5f && oi.value == 14 && widened.value == 3.5f &&
+                 of.value == 5.0f && ri.value == 14 && rf.value == 3.5f
+             ? 0 : 1;
+}
+```
+
+The outer argument is the explicit output type; the first value argument is the
+owner discriminator. `map(float)(some_int, half)` selects
+`map_int_float_Option` from `Option.map`, while `map(float)(ok_int, half)`
+selects `map_int_float_float_Result` from `Result.map`. `gen/dispatch.h` emits one
+`map` macro and chains the guarded owner tables. Each owner falls through to the
+next when its instantiation is absent, so the two templates remain independent
+and may be included in either order. The `Owner` suffix is generated only where
+the decorator is present.
 
 The rule covers direct declarations and paste-macro declarations, including
 two-argument templates such as `pair(Key, Value)`:

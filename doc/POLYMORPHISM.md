@@ -1,6 +1,6 @@
 <p align="center">
   <h1 align="center">Polymorphism with template headers</h1>
-  <p align="center">Checked constraints, generated functions, static dispatch, and trait impls from one C header.</p>
+  <p align="center">Checked constraints, generated functions, ad-hoc overloading, static dispatch, and trait impls from one C header.</p>
 </p>
 
 <p align="center">
@@ -15,6 +15,7 @@
   <a href="#checked-constraints-and-generated-functions">Constraints</a> &bull;
   <a href="#function-templates">Function templates</a> &bull;
   <a href="#extendible-generic-calls">Generic calls</a> &bull;
+  <a href="#ad-hoc-overloading-and-explicit-method-types">Ad-hoc overloading</a> &bull;
   <a href="#c-trait-generic-impls">Traits</a>
 </p>
 
@@ -217,8 +218,11 @@ and there is no AST deduction. [USAGE.md](USAGE.md#function-templates) has the
 full header and generated-block rules.
 
 When the caller should not care which concrete function it calls, the next step
-is a generic call. The following section uses extendible `_Generic`. The one
-after that uses c-trait to generate the impl and the dispatcher together.
+is a generic call. This is ad-hoc polymorphism: a single call spelling selects
+one of several separately generated implementations by argument type, rather
+than requiring one generic shape that every type must satisfy. The following
+section uses extendible `_Generic`. The one after that uses c-trait to generate
+the impl and the dispatcher together.
 c-autotmpl generates the same kind of selector from template headers: with
 `dispatch=1` calls carry a configurable affix, and with `dispatch_truncate=1`
 they are bare operation names. The canonical declaration is `<op>_impl(T, U)`,
@@ -227,6 +231,132 @@ concrete-only functions remain accepted fallbacks. The selector tables and the
 single public `<op>` macro live in `gen/dispatch.h`, after the generated
 instantiation headers and before call sites. Same-name operations from different
 templates share that public macro through chained owner tables.
+
+### Ad-hoc overloading and explicit method types
+
+With `dispatch=1` and `dispatch_truncate=1`, one public spelling can select
+separately generated implementations. Concrete C names are pasted from template
+arguments, so owners with the same argument list would otherwise collide.
+`// -- +owner` (or `// -- mangle +owner`) opts a template section into
+owner-qualified concrete targets by appending the owning template name as the
+final paste component. It is independent of `explicit` and is opt-in.
+
+For ordinary operations, no extra implementation parameter is needed. Both
+owners below take one argument, yet `get(&o)` resolves to distinct functions:
+
+```text
+# autotmpl.conf
+dispatch=1
+dispatch_truncate=1
+dispatch_templates=Box,Container,Option,Result
+```
+
+```c
+/* tmpl/box.h */
+// -- template type Box(T)
+// -- +owner
+#define BOX_CAT2_I(a, b) a##b
+#define BOX_CAT2(a, b) BOX_CAT2_I(a, b)
+#define BOX_CAT3_I(a, b, c) a##_##b##_##c
+#define BOX_CAT3(a, b, c) BOX_CAT3_I(a, b, c)
+#define Box(T) BOX_CAT2(Box_, T)
+#define get_impl(T, Owner) BOX_CAT3(get, T, Owner)
+typedef struct { T value; } Box(T);
+static inline T get_impl(T, Owner)(Box(T) *b) { return b->value; }
+#undef get_impl
+```
+
+`get(&box)` targets `get_int_Box`. A `Container(float)` section using
+`// -- mangle +owner` targets `get_float_Container` for the same bare `get`
+spelling.
+
+For a curried method, the implementation template and its paste macro gain one
+trailing synthetic `Owner` parameter. The generator supplies it; callers do not:
+
+```c
+/* tmpl/option.h */
+// -- template type Option(T)
+#define OPTION_CAT2_I(a, b) a##b
+#define OPTION_CAT2(a, b) OPTION_CAT2_I(a, b)
+#define Option(T) OPTION_CAT2(Option_, T)
+typedef struct { int has; T value; } Option(T);
+
+// -- template function option_map_impl(T, U, Owner)
+// -- dispatch method Option.map explicit U
+// -- +owner
+#define OPTION_MAP4_I(a, b, c, d) a##_##b##_##c##_##d
+#define OPTION_MAP4(a, b, c, d) OPTION_MAP4_I(a, b, c, d)
+#define option_map_impl(T, U, Owner) OPTION_MAP4(map, T, U, Owner)
+static inline Option(U) option_map_impl(T, U, Owner)(Option(T) value,
+                                                     U (*f)(T)) {
+  Option(U) out = {0};
+  if (value.has) { out.has = 1; out.value = f(value.value); }
+  return out;
+}
+```
+
+```c
+/* tmpl/result.h */
+// -- template type Result(T, U)
+#define RESULT_CAT3_I(a, b, c) a##_##b##_##c
+#define RESULT_CAT3(a, b, c) RESULT_CAT3_I(a, b, c)
+#define Result(T, U) RESULT_CAT3(Result, T, U)
+typedef struct { int ok; T value; U error; } Result(T, U);
+
+// -- template function result_map_impl(T, U, V, Owner)
+// -- dispatch method Result.map explicit V
+// -- mangle +owner
+#define RESULT_MAP5_I(a, b, c, d, e) a##_##b##_##c##_##d##_##e
+#define RESULT_MAP5(a, b, c, d, e) RESULT_MAP5_I(a, b, c, d, e)
+#define result_map_impl(T, U, V, Owner) RESULT_MAP5(map, T, U, V, Owner)
+static inline Result(V, U) result_map_impl(T, U, V, Owner)(Result(T, U) value,
+                                                          V (*f)(T)) {
+  Result(V, U) out = {0};
+  if (value.ok) { out.ok = 1; out.value = f(value.value); }
+  else { out.error = value.error; }
+  return out;
+}
+```
+
+```c
+/* main.c */
+#include "gen/box.h"
+#include "gen/container.h"
+#include "gen/option.h"
+#include "gen/result.h"
+#include "gen/dispatch.h"
+
+static int twice(int x) { return 2 * x; }
+static float half(int x) { return (float)x / 2.0f; }
+static float scale(float x) { return 2.0f * x; }
+
+int main(void) {
+  Box(int) b = {7};
+  Container(float) c = {2.5f};
+  Option(int) some_int = {1, 7};
+  Option(float) some_float = {1, 2.5f};
+  Result(int, float) ok_int = {1, 7, 0.0f};
+
+  int x = get(&b);                                      /* get_int_Box */
+  float y = get(&c);                                    /* get_float_Container */
+  Option(int) oi = map(int)(some_int, twice);           /* map_int_int_Option */
+  Option(float) widened = map(float)(some_int, half);   /* map_int_float_Option */
+  Option(float) of = map(float)(some_float, scale);     /* map_float_float_Option */
+  Result(int, float) ri = map(int)(ok_int, twice);      /* map_int_float_int_Result */
+  Result(float, float) rf = map(float)(ok_int, half);   /* map_int_float_float_Result */
+  return x == 7 && y == 2.5f && oi.value == 14 && widened.value == 3.5f &&
+                 of.value == 5.0f && ri.value == 14 && rf.value == 3.5f
+             ? 0 : 1;
+}
+```
+
+All six calls use one public spelling per operation. The curried argument
+supplies the output payload (`U` or `V`); `_Generic` on the first value argument
+selects the owner and its concrete input arguments. The concrete target is
+`<op>_<owner args>_<explicit args>_<Owner>`. Owner tables stay independent and
+are chained in `gen/dispatch.h`; see
+[Curried methods with explicit type arguments](USAGE.md#curried-methods-with-explicit-type-arguments)
+for the full rules.
 
 ## Extendible generic calls
 
