@@ -422,6 +422,9 @@ std::string makeInstantiationBlock(
   Out.append(Marker);
   Out += '\n';
 
+  SmallVector<std::string, 4> Args;
+  splitExplicitArgs(TypeSpelling, Template, Args);
+
   // The presence macro lets the same nested type be emitted in several headers
   // without a duplicate definition; whichever block is seen first wins.
   const std::string Presence = presenceMacro(Template.Name, TypeSpelling);
@@ -453,9 +456,16 @@ std::string makeInstantiationBlock(
   Out += "#define ";
   Out += Presence;
   Out += '\n';
+  // Dispatch selectors test the presence macro with #ifdef. Emit an explicit
+  // positive guard only for dispatch-enabled templates; value generics must
+  // remain free of type-style guards.
+  const bool PositivePresenceGuard = Template.DispatchEnabled && !Args.empty();
+  if (PositivePresenceGuard) {
+    Out += "#ifdef ";
+    Out += Presence;
+    Out += '\n';
+  }
 
-  SmallVector<std::string, 4> Args;
-  splitExplicitArgs(TypeSpelling, Template, Args);
   appendStcDefines(Out, Template, Args);
   appendStcAdapters(Out, Template, AdapterOps);
 
@@ -478,7 +488,9 @@ std::string makeInstantiationBlock(
   appendStcUndefs(Out, Template, Args);
   for (unsigned I = Guards.size(); I > 0; --I)
     Out += "#endif\n";
-  Out += "#endif\n";
+  if (PositivePresenceGuard)
+    Out += "#endif\n"; // positive presence guard
+  Out += "#endif\n"; // negative presence guard
   Out += '\n';
   return Out;
 }
@@ -531,6 +543,12 @@ static std::string dispatchCallTarget(const TemplateDef &Template,
 }
 
 static constexpr size_t DispatchMaxArgs = 8;
+static constexpr const char *PluginGeneratedBy =
+    "/* c-autotmpl generated-by=plugin */\n";
+static constexpr const char *CliGeneratedByMarker =
+    "c-autotmpl generated-by=cli";
+static constexpr const char *PluginGeneratedByMarker =
+    "c-autotmpl generated-by=plugin";
 
 static std::string dispatchSelectorName(StringRef TemplateName, StringRef Op,
                                         size_t Arity, size_t Index) {
@@ -585,10 +603,66 @@ static void appendDispatchCaseSelector(std::string &Out,
   Out += "#define " + Name + "(" + Params + ") " + Expr + "\n";
 }
 
+/// Finds the next owner that contributes to one shared public spelling. Each
+/// owner's base selector uses this contributor's case count as its fallback
+/// index, so the public macro can walk every table in registry order.
+static const DispatchContribution *
+nextDispatchContribution(ArrayRef<DispatchSharedGroup> Groups, StringRef Key,
+                         const TemplateDef &Template,
+                         const DispatchMethodDef *Method) {
+  for (const DispatchSharedGroup &Group : Groups) {
+    if (StringRef(Group.Key) != Key)
+      continue;
+    for (size_t I = 0; I + 1 < Group.Contribs.size(); ++I) {
+      const DispatchContribution &Contrib = Group.Contribs[I];
+      bool SameOwner = Contrib.Template == &Template ||
+                       Contrib.Template->Name == Template.Name;
+      if (SameOwner && Contrib.Method == Method)
+        return &Group.Contribs[I + 1];
+    }
+  }
+  return nullptr;
+}
+
+static std::string dispatchFallbackSelector(const DispatchContribution *Fallback,
+                                            StringRef SelectorOp, size_t Arity,
+                                            StringRef Params) {
+  if (!Fallback)
+    return "c_autotmpl_dispatch_missing";
+  StringRef Op = Fallback->SelectorOp.empty() ? SelectorOp
+                                              : StringRef(Fallback->SelectorOp);
+  return dispatchSelectorName(Fallback->Template->Name, Op, Arity,
+                              Fallback->Cases.size()) +
+         "(" + Params.str() + ")";
+}
+
+/// The public spelling enters through the first owner's PICK table. The last
+/// argument repeats arity one so PICK forwards both selector chains.
+static void appendSharedPick(std::string &Out,
+                             const DispatchContribution &First,
+                             StringRef PublicName, StringRef SelectorOp) {
+  Out += "#define " + PublicName.str() + "(...) C_AUTOTMPL_DISPATCH_PICK_" +
+         First.Template->Name + "_" + SelectorOp.str() + "(__VA_ARGS__";
+  for (size_t K = DispatchMaxArgs; K > 0; --K)
+    Out += ", " + dispatchSelectorName(First.Template->Name, SelectorOp, K,
+                                       First.Cases.size());
+  Out += ", " + dispatchSelectorName(First.Template->Name, SelectorOp, 1,
+                                     First.Cases.size()) +
+         ")(__VA_ARGS__)(__VA_ARGS__)\n";
+}
+
+std::string generatedDispatchPath(StringRef GeneratedHeader) {
+  SmallString<256> Dir(sys::path::parent_path(GeneratedHeader));
+  SmallString<256> Path(Dir);
+  sys::path::append(Path, "dispatch.h");
+  return std::string(Path);
+}
+
 std::string makeDispatchSection(const TemplateDef &Template,
                                 ArrayRef<DispatchCase> Cases,
                                 ArrayRef<StringRef> Ops,
-                                const DispatchConfig &Config) {
+                                const DispatchConfig &Config,
+                                ArrayRef<DispatchSharedGroup> SharedGroups) {
   if (!Config.Enabled || !Template.DispatchEnabled || Cases.empty() ||
       Ops.empty())
     return {};
@@ -601,20 +675,23 @@ std::string makeDispatchSection(const TemplateDef &Template,
 
   std::string Out;
   Out += "/* c-autotmpl dispatch begin " + Template.Name + " */\n";
+  Out += PluginGeneratedBy;
   Out += "#ifndef C_AUTOTMPL_DISPATCH_MISSING\n";
   Out += "#define C_AUTOTMPL_DISPATCH_MISSING\n";
   Out += "static inline int c_autotmpl_dispatch_missing(void) "
          "{ return 0; }\n";
   Out += "#endif\n";
   for (const std::string &Op : UniqueOps) {
+    const DispatchContribution *Fallback = nextDispatchContribution(
+        SharedGroups, Op, Template, /*Method=*/nullptr);
     std::string Guard = "C_AUTOTMPL_DISPATCH_" + Template.Name + "_" + Op;
     Out += "#ifndef " + Guard + "\n#define " + Guard + "\n";
 
     for (size_t Arity = 1; Arity <= DispatchMaxArgs; ++Arity) {
       std::string Base = dispatchSelectorName(Template.Name, Op, Arity, 0);
       std::string Params = dispatchParams(Arity);
-      Out += "#define " + Base + "(" + Params +
-             ") c_autotmpl_dispatch_missing\n";
+      Out += "#define " + Base + "(" + Params + ") " +
+             dispatchFallbackSelector(Fallback, Op, Arity, Params) + "\n";
       for (size_t I = 0; I < Cases.size(); ++I) {
         std::string Presence = presenceMacro(Template.Name, Cases[I].Type);
         Out += "#ifdef " + Presence + "\n";
@@ -639,25 +716,13 @@ std::string makeDispatchSection(const TemplateDef &Template,
       Out += "_" + std::to_string(K);
     }
     Out += ", ...) _" + std::to_string(DispatchMaxArgs + 1) + "\n";
-    std::string MacroName = Op;
-    if (!Config.Truncate) {
-      if (Config.Style == DispatchStyle::Prefix)
-        MacroName = Config.Affix + MacroName;
-      else
-        MacroName += Config.Affix;
-    }
-    Out += "#define " + MacroName + "(...) " + Pick + "(__VA_ARGS__";
-    for (size_t K = DispatchMaxArgs; K > 0; --K)
-      Out += ", " + dispatchSelectorName(Template.Name, Op, K, Cases.size());
-    Out += ", " + dispatchSelectorName(Template.Name, Op, 1, Cases.size()) +
-           ")(__VA_ARGS__)(__VA_ARGS__)\n";
     Out += "#endif\n";
   }
   Out += "/* c-autotmpl dispatch end " + Template.Name + " */\n";
   return Out;
 }
 
-static std::string dispatchMethodSuffix(ArrayRef<std::string> Args) {
+std::string dispatchMethodSuffix(ArrayRef<std::string> Args) {
   std::string Out;
   for (const std::string &Arg : Args)
     appendDispatchArg(Out, Arg);
@@ -683,11 +748,10 @@ static std::string dispatchMethodTarget(const DispatchMethodDef &Method,
   return Out;
 }
 
-std::string makeDispatchMethodSection(const DispatchMethodDef &Method,
-                                      ArrayRef<DispatchCase> Cases,
-                                      ArrayRef<DispatchMethodUse> Uses,
-                                      const DispatchConfig &Config,
-                                      StringRef OutputHeader) {
+std::string makeDispatchMethodSection(
+    const DispatchMethodDef &Method, ArrayRef<DispatchCase> Cases,
+    ArrayRef<DispatchMethodUse> Uses, const DispatchConfig &Config,
+    StringRef OutputHeader, ArrayRef<DispatchSharedGroup> SharedGroups) {
   if (!Config.Enabled || !Method.Owner || !Method.Owner->DispatchEnabled ||
       Cases.empty() || Uses.empty())
     return {};
@@ -696,7 +760,7 @@ std::string makeDispatchMethodSection(const DispatchMethodDef &Method,
   std::string Out;
   Out += "/* c-autotmpl dispatch begin " + Owner.Name + "." + Method.Op +
          " */\n";
-  Out += "/* c-autotmpl generated-by=plugin */\n";
+  Out += PluginGeneratedBy;
   Out += "#ifndef C_AUTOTMPL_DISPATCH_MISSING\n";
   Out += "#define C_AUTOTMPL_DISPATCH_MISSING\n";
   Out += "static inline int c_autotmpl_dispatch_missing(void) "
@@ -716,20 +780,12 @@ std::string makeDispatchMethodSection(const DispatchMethodDef &Method,
   std::string Guard =
       "C_AUTOTMPL_DISPATCH_" + Owner.Name + "_" + Method.Op;
   Out += "#ifndef " + Guard + "\n#define " + Guard + "\n";
-  std::string Expr = Method.Op + "_";
-  std::string Params;
-  for (size_t P = 0; P < Method.ExplicitParams.size(); ++P) {
-    if (P)
-      Params += ", ";
-    std::string Param = "E" + std::to_string(P + 1);
-    Params += Param;
-    Expr = "C_AUTOTMPL_DISPATCH_CAT(" + Expr + ", " + Param + ")";
-  }
-  Out += "#define " + Method.Op + "(" + Params + ") " + Expr + "\n";
 
   for (const DispatchMethodUse &Use : Uses) {
     std::string Suffix = dispatchMethodSuffix(Use.Args);
     std::string MacroName = Method.Op + Suffix;
+    const DispatchContribution *Fallback = nextDispatchContribution(
+        SharedGroups, MacroName, Owner, &Method);
     std::string UseGuard = Guard + "_EXPLICIT" + Suffix;
     Out += "#ifndef " + UseGuard + "\n#define " + UseGuard + "\n";
 
@@ -737,8 +793,10 @@ std::string makeDispatchMethodSection(const DispatchMethodDef &Method,
       std::string Base =
           dispatchSelectorName(Owner.Name, MacroName, Arity, 0);
       std::string SelectorParams = dispatchParams(Arity);
-      Out += "#define " + Base + "(" + SelectorParams +
-             ") c_autotmpl_dispatch_missing\n";
+      Out += "#define " + Base + "(" + SelectorParams + ") " +
+             dispatchFallbackSelector(Fallback, MacroName, Arity,
+                                      SelectorParams) +
+             "\n";
       for (size_t I = 0; I < Cases.size(); ++I) {
         std::string Presence = presenceMacro(Owner.Name, Cases[I].Type);
         Out += "#ifdef " + Presence + "\n";
@@ -765,18 +823,77 @@ std::string makeDispatchMethodSection(const DispatchMethodDef &Method,
       Out += "_" + std::to_string(K);
     }
     Out += ", ...) _" + std::to_string(DispatchMaxArgs + 1) + "\n";
-    Out += "#define " + MacroName + "(...) " + Pick + "(__VA_ARGS__";
-    for (size_t K = DispatchMaxArgs; K > 0; --K)
-      Out +=
-          ", " + dispatchSelectorName(Owner.Name, MacroName, K, Cases.size());
-    Out += ", " +
-           dispatchSelectorName(Owner.Name, MacroName, 1, Cases.size()) +
-           ")(__VA_ARGS__)(__VA_ARGS__)\n";
     Out += "#endif\n";
   }
   Out += "#endif\n";
   Out += "/* c-autotmpl dispatch end " + Owner.Name + "." + Method.Op +
          " */\n";
+  return Out;
+}
+
+std::string makeSharedOpSection(const DispatchSharedGroup &Group,
+                                const DispatchConfig &Config) {
+  if (Group.Contribs.empty())
+    return {};
+  const DispatchContribution &First = Group.Contribs.front();
+  StringRef Op = Group.Key;
+
+  std::string Out;
+  Out += "/* c-autotmpl dispatch begin shared." + Group.Key + " */\n";
+  Out += PluginGeneratedBy;
+  std::string PublicName = Op.str();
+  if (!Config.Truncate) {
+    if (Config.Style == DispatchStyle::Prefix)
+      PublicName = Config.Affix + PublicName;
+    else
+      PublicName += Config.Affix;
+  }
+  StringRef SelectorOp =
+      Group.SelectorOp.empty() ? Op : StringRef(Group.SelectorOp);
+  appendSharedPick(Out, First, PublicName, SelectorOp);
+  Out += "/* c-autotmpl dispatch end shared." + Group.Key + " */\n";
+  return Out;
+}
+
+std::string makeSharedMethodSection(const DispatchSharedMethod &Method,
+                                    ArrayRef<DispatchSharedGroup> Groups,
+                                    const DispatchConfig &Config) {
+  (void)Config;
+  if (!Method.FirstMethod || Method.Groups.empty())
+    return {};
+
+  std::string Out;
+  Out += "/* c-autotmpl dispatch begin shared." + Method.Key + " */\n";
+  Out += PluginGeneratedBy;
+  Out += "#ifndef C_AUTOTMPL_DISPATCH_CAT\n";
+  Out += "#define C_AUTOTMPL_DISPATCH_CAT_I(A, B) A##B\n";
+  Out += "#define C_AUTOTMPL_DISPATCH_CAT(A, B) "
+         "C_AUTOTMPL_DISPATCH_CAT_I(A, B)\n";
+  Out += "#endif\n";
+
+  std::string Params;
+  std::string Expr = Method.Key + "_";
+  for (size_t P = 0; P < Method.FirstMethod->ExplicitParams.size(); ++P) {
+    if (P)
+      Params += ", ";
+    std::string Param = "E" + std::to_string(P + 1);
+    Params += Param;
+    Expr = "C_AUTOTMPL_DISPATCH_CAT(" + Expr + ", " + Param + ")";
+  }
+  Out += "#define " + Method.Key + "(" + Params + ") " + Expr + "\n";
+
+  for (size_t Index : Method.Groups) {
+    if (Index >= Groups.size())
+      continue;
+    const DispatchSharedGroup &Group = Groups[Index];
+    if (Group.Contribs.empty())
+      continue;
+    StringRef SelectorOp = Group.SelectorOp.empty()
+                               ? StringRef(Group.Key)
+                               : StringRef(Group.SelectorOp);
+    appendSharedPick(Out, Group.Contribs.front(), Group.Key, SelectorOp);
+  }
+  Out += "/* c-autotmpl dispatch end shared." + Method.Key + " */\n";
   return Out;
 }
 
@@ -1085,75 +1202,11 @@ bool Instantiator::ensureDispatch(const TemplateDef &Template,
                                   const DispatchConfig &Config,
                                   StringRef OutputHeader,
                                   std::string &Error) {
-  std::lock_guard<std::mutex> Lock(Mutex);
-  StringRef Path =
+  StringRef Source =
       OutputHeader.empty() ? Template.GeneratedHeader : OutputHeader;
-  FileState &State = getState(Path);
-  StringRef Content(State.Content);
+  std::string Path = generatedDispatchPath(Source);
   std::string Section = makeDispatchSection(Template, Cases, Ops, Config);
-  std::string Begin = "/* c-autotmpl dispatch begin " + Template.Name + " */";
-  std::string End = "/* c-autotmpl dispatch end " + Template.Name + " */";
-  size_t B = Content.find(Begin);
-  size_t E = B == StringRef::npos ? StringRef::npos : Content.find(End, B);
-
-  std::string NewContent;
-  if (B != StringRef::npos && E != StringRef::npos) {
-    size_t After = Content.find('\n', E);
-    After = After == StringRef::npos ? E + End.size() : After + 1;
-    NewContent.append(Content.data(), B);
-    NewContent += Section;
-    NewContent.append(Content.data() + After, Content.size() - After);
-  } else {
-    if (Section.empty())
-      return false;
-    if (Content.empty()) {
-      NewContent += "#ifndef ";
-      NewContent += generatedHeaderFileGuard(Path);
-      NewContent += "\n#define ";
-      NewContent += generatedHeaderFileGuard(Path);
-      NewContent += "\n\n";
-      NewContent += Section;
-      NewContent += "#endif\n";
-    } else {
-      size_t Pos = Content.rfind("#endif");
-      size_t Insert = Content.size();
-      if (Pos != StringRef::npos) {
-        size_t LineStart = Content.rfind('\n', Pos);
-        Insert = LineStart == StringRef::npos ? 0 : LineStart + 1;
-        if (!Content.slice(Insert, Pos).trim().empty())
-          Insert = Content.size();
-      }
-      NewContent.append(Content.data(), Insert);
-      NewContent += Section;
-      NewContent.append(Content.data() + Insert, Content.size() - Insert);
-    }
-  }
-  if (NewContent == Content.str())
-    return false;
-
-  std::error_code EC;
-  SmallString<256> Dir(sys::path::parent_path(Path));
-  if (!Dir.empty()) {
-    EC = sys::fs::create_directories(Dir);
-    if (EC) {
-      Error = EC.message();
-      return false;
-    }
-  }
-  raw_fd_ostream OS(Path, EC, sys::fs::CD_CreateAlways);
-  if (EC) {
-    Error = EC.message();
-    return false;
-  }
-  OS << NewContent;
-  OS.close();
-  if (OS.has_error()) {
-    Error = "failed writing " + Path.str();
-    return false;
-  }
-  State.Content = std::move(NewContent);
-  State.Stamp = stampFor(Path);
-  return true;
+  return writeDispatchSection(Path, Template.Name, Section, Error);
 }
 
 bool Instantiator::ensureDispatchMethod(const DispatchMethodDef &Method,
@@ -1162,64 +1215,66 @@ bool Instantiator::ensureDispatchMethod(const DispatchMethodDef &Method,
                                         const DispatchConfig &Config,
                                         StringRef OutputHeader,
                                         std::string &Error) {
-  std::lock_guard<std::mutex> Lock(Mutex);
   if (!Method.Owner || Uses.empty() || Cases.empty())
     return false;
-  StringRef Path =
+  StringRef Source =
       OutputHeader.empty() ? Method.Owner->GeneratedHeader : OutputHeader;
-  FileState &State = getState(Path);
-  StringRef Content(State.Content);
-
-  std::string Begin = "/* c-autotmpl dispatch begin " + Method.Owner->Name +
-                      "." + Method.Op + " */";
-  std::string End = "/* c-autotmpl dispatch end " + Method.Owner->Name + "." +
-                    Method.Op + " */";
-  size_t B = Content.find(Begin);
-  size_t E = B == StringRef::npos ? StringRef::npos : Content.find(End, B);
-
+  std::string Path = generatedDispatchPath(Source);
   std::string Section =
       makeDispatchMethodSection(Method, Cases, Uses, Config, Path);
-  std::string NewContent;
-  if (B != StringRef::npos && E != StringRef::npos) {
-    size_t After = Content.find('\n', E);
-    After = After == StringRef::npos ? E + End.size() : After + 1;
-    StringRef Existing = Content.slice(B, After);
-    // The CLI owns datatype(...) dispatch sections, including annotated method
-    // sections in CLI-generated headers. Never replace them from the plugin.
-    if (!Existing.contains("c-autotmpl generated-by=plugin"))
-      return false;
-    NewContent.append(Content.data(), B);
-    NewContent += Section;
-    NewContent.append(Content.data() + After, Content.size() - After);
-  } else {
-    if (Section.empty())
-      return false;
-    if (Content.empty()) {
-      std::string Guard = generatedHeaderFileGuard(Path);
-      NewContent += "#ifndef ";
-      NewContent += Guard;
-      NewContent += "\n#define ";
-      NewContent += Guard;
-      NewContent += "\n\n";
-      NewContent += Section;
-      NewContent += "#endif\n";
-    } else {
-      size_t Pos = Content.rfind("#endif");
-      size_t Insert = Content.size();
-      if (Pos != StringRef::npos) {
-        size_t LineStart = Content.rfind('\n', Pos);
-        Insert = LineStart == StringRef::npos ? 0 : LineStart + 1;
-        if (!Content.slice(Insert, Pos).trim().empty())
-          Insert = Content.size();
-      }
-      NewContent.append(Content.data(), Insert);
-      NewContent += Section;
-      NewContent.append(Content.data() + Insert, Content.size() - Insert);
-    }
-  }
-  if (NewContent == Content.str())
-    return false;
+  std::string Key = Method.Owner->Name + "." + Method.Op;
+  return writeDispatchSection(Path, Key, Section, Error);
+}
 
+namespace {
+
+struct DispatchSectionRange {
+  size_t Begin = 0;
+  size_t End = 0; // first byte after the section's end marker
+  std::string Key;
+};
+
+bool nextDispatchSection(StringRef Content, size_t Pos,
+                         DispatchSectionRange &Range) {
+  constexpr StringLiteral BeginPrefix("/* c-autotmpl dispatch begin ");
+  size_t Begin = Content.find(BeginPrefix, Pos);
+  if (Begin == StringRef::npos)
+    return false;
+  size_t KeyStart = Begin + BeginPrefix.size();
+  size_t KeyEnd = Content.find(" */", KeyStart);
+  if (KeyEnd == StringRef::npos)
+    return false;
+  std::string Key = Content.slice(KeyStart, KeyEnd).str();
+  std::string EndMarker = "/* c-autotmpl dispatch end " + Key + " */";
+  size_t End = Content.find(EndMarker, KeyEnd);
+  if (End == StringRef::npos)
+    return false;
+  End += EndMarker.size();
+  if (size_t Newline = Content.find('\n', End); Newline != StringRef::npos)
+    End = Newline + 1;
+  Range = {Begin, End, std::move(Key)};
+  return true;
+}
+
+size_t dispatchInsertPosition(StringRef Content) {
+  size_t Insert = Content.size();
+  size_t Pos = Content.rfind("#endif");
+  if (Pos == StringRef::npos)
+    return Insert;
+  size_t LineStart = Content.rfind('\n', Pos);
+  size_t Candidate = LineStart == StringRef::npos ? 0 : LineStart + 1;
+  if (Content.slice(Candidate, Pos).trim().empty())
+    Insert = Candidate;
+  return Insert;
+}
+
+} // namespace
+
+bool Instantiator::commitDispatchText(StringRef Path, FileState &State,
+                                      const std::string &Text,
+                                      std::string &Error) {
+  if (Text == State.Content)
+    return false;
   std::error_code EC;
   SmallString<256> Dir(sys::path::parent_path(Path));
   if (!Dir.empty()) {
@@ -1234,15 +1289,98 @@ bool Instantiator::ensureDispatchMethod(const DispatchMethodDef &Method,
     Error = EC.message();
     return false;
   }
-  OS << NewContent;
+  OS << Text;
   OS.close();
   if (OS.has_error()) {
     Error = "failed writing " + Path.str();
     return false;
   }
-  State.Content = std::move(NewContent);
+  State.Content = Text;
   State.Stamp = stampFor(Path);
   return true;
+}
+
+bool Instantiator::writeDispatchSection(StringRef Path, StringRef Key,
+                                        StringRef Section,
+                                        std::string &Error) {
+  std::lock_guard<std::mutex> Lock(Mutex);
+  FileState &State = getState(Path);
+  StringRef Content(State.Content);
+  std::string Begin = "/* c-autotmpl dispatch begin " + Key.str() + " */";
+  std::string End = "/* c-autotmpl dispatch end " + Key.str() + " */";
+  size_t B = Content.find(Begin);
+  size_t E = B == StringRef::npos ? StringRef::npos : Content.find(End, B);
+
+  std::string NewContent;
+  if (B != StringRef::npos && E != StringRef::npos) {
+    size_t After = Content.find('\n', E);
+    After = After == StringRef::npos ? E + End.size() : After + 1;
+    StringRef Existing = Content.slice(B, After);
+    // The CLI owns sections without our marker. Never clobber them.
+    if (Existing.contains(CliGeneratedByMarker))
+      return false;
+    NewContent.append(Content.data(), B);
+    NewContent.append(Section.data(), Section.size());
+    NewContent.append(Content.data() + After, Content.size() - After);
+  } else {
+    if (Section.empty())
+      return false;
+    if (Content.empty()) {
+      std::string Guard = generatedHeaderFileGuard(Path);
+      NewContent += "#ifndef " + Guard + "\n#define " + Guard + "\n\n";
+      NewContent.append(Section.data(), Section.size());
+      NewContent += "#endif\n";
+    } else {
+      size_t Insert = dispatchInsertPosition(Content);
+      NewContent.append(Content.data(), Insert);
+      NewContent.append(Section.data(), Section.size());
+      NewContent.append(Content.data() + Insert, Content.size() - Insert);
+    }
+  }
+  return commitDispatchText(Path, State, NewContent, Error);
+}
+
+bool Instantiator::stripDispatchSections(StringRef Path, std::string &Error) {
+  std::lock_guard<std::mutex> Lock(Mutex);
+  FileState &State = getState(Path);
+  StringRef Content(State.Content);
+  std::string NewContent;
+  size_t Pos = 0;
+  DispatchSectionRange Range;
+  while (nextDispatchSection(Content, Pos, Range)) {
+    StringRef Body = Content.slice(Range.Begin, Range.End);
+    if (Body.contains(PluginGeneratedByMarker))
+      NewContent.append(Content.data() + Pos, Range.Begin - Pos);
+    else
+      NewContent.append(Content.data() + Pos, Range.End - Pos);
+    Pos = Range.End;
+  }
+  NewContent.append(Content.data() + Pos, Content.size() - Pos);
+  return commitDispatchText(Path, State, NewContent, Error);
+}
+
+bool Instantiator::pruneDispatchSections(StringRef Path,
+                                         const StringSet<> &Keep,
+                                         std::vector<std::string> &Removed,
+                                         std::string &Error) {
+  std::lock_guard<std::mutex> Lock(Mutex);
+  FileState &State = getState(Path);
+  StringRef Content(State.Content);
+  std::string NewContent;
+  size_t Pos = 0;
+  DispatchSectionRange Range;
+  while (nextDispatchSection(Content, Pos, Range)) {
+    StringRef Body = Content.slice(Range.Begin, Range.End);
+    bool Preserve =
+        Body.contains(CliGeneratedByMarker) || Keep.contains(Range.Key);
+    if (Preserve)
+      NewContent.append(Content.data() + Pos, Range.End - Pos);
+    else
+      Removed.push_back(Range.Key);
+    Pos = Range.End;
+  }
+  NewContent.append(Content.data() + Pos, Content.size() - Pos);
+  return commitDispatchText(Path, State, NewContent, Error);
 }
 
 bool Instantiator::prune(const TemplateDef &Template, const StringSet<> &Keep,

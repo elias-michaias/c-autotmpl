@@ -389,6 +389,8 @@ struct UsageFile {
   llvm::StringMap<llvm::StringSet<>> Wanted;
   // Implementation-source path -> instantiation markers used by this file.
   llvm::StringMap<llvm::StringSet<>> ImplWanted;
+  // Central dispatch section keys used by this file.
+  llvm::StringSet<> DispatchKeys;
 };
 
 /// Shared state, surviving across AST builds and listener instances.
@@ -397,6 +399,7 @@ struct SharedState {
   TypeIndex Types;
   Instantiator Inst;
   DispatchConfig Dispatch;
+  std::string DispatchHeader;
 
   std::mutex ScanMutex;
   std::atomic<bool> Scanned{false};
@@ -418,6 +421,7 @@ struct SharedState {
   llvm::StringMap<UsageFile> UsageCache;
   llvm::StringMap<llvm::StringSet<>> Wanted;
   llvm::StringMap<llvm::StringSet<>> WantedImpl;
+  llvm::StringSet<> WantedDispatchKeys;
   bool UsageScanned = false;
   std::chrono::steady_clock::time_point LastUsageScan;
   // Latest unsaved text from LSP notifications, keyed by absolute path.
@@ -429,6 +433,20 @@ struct SharedState {
   ~SharedState() {
     if (WorkspaceThread.joinable())
       WorkspaceThread.join();
+  }
+
+  /// Template definition headers are parse-only inputs. Their bodies spell
+  /// generic parameters such as `Result(T, U)`; treating those spellings as
+  /// concrete usages would generate invalid specializations and dispatch
+  /// sections every time the header is opened or edited.
+  bool isTemplateDefinition(StringRef Path) const {
+    if (Path.empty())
+      return false;
+    auto Absolute = makeAbsolute(Path);
+    for (const auto &Owned : Registry.templates())
+      if (makeAbsolute(Owned->Header) == Absolute)
+        return true;
+    return false;
   }
 
   void ensureScanned(StringRef MainFile) {
@@ -485,6 +503,12 @@ struct SharedState {
       GeneratedHeaders.insert(Def->GeneratedHeader);
       if (!Def->GeneratedImplSource.empty())
         GeneratedImplSources.insert(Def->GeneratedImplSource);
+    }
+    if (!Registry.templates().empty()) {
+      DispatchHeader =
+          generatedDispatchPath(Registry.templates().front()->GeneratedHeader);
+      // The central header is generated output, never a usage input.
+      GeneratedHeaders.insert(DispatchHeader);
     }
 
     Scanned.store(true, std::memory_order_release);
@@ -561,8 +585,8 @@ struct SharedState {
 
   void collectUsages(StringRef Text, StringRef Path,
                      llvm::StringMap<llvm::StringSet<>> &Out,
-                     llvm::StringMap<llvm::StringSet<>> *ImplOut = nullptr)
-      const {
+                     llvm::StringMap<llvm::StringSet<>> *ImplOut = nullptr,
+                     llvm::StringSet<> *DispatchOut = nullptr) const {
     SmallVector<FoundUsage, 32> Usages;
     SmallVector<FoundMethodUsage, 8> MethodUsages;
     scanUsages(Text, Registry, Usages, &MethodUsages);
@@ -607,6 +631,29 @@ struct SharedState {
         }
       }
     }
+
+    if (DispatchOut && Dispatch.Enabled) {
+      for (const FoundUsage &Usage : Usages) {
+        if (!Usage.Template || !Usage.Template->DispatchEnabled ||
+            Usage.Template->Kind != TemplateKind::Type)
+          continue;
+        DispatchOut->insert(Usage.Template->Name);
+        for (const auto &Op : Usage.Template->DispatchOps)
+          DispatchOut->insert("shared." + Op.getKey().str());
+      }
+      for (const auto &OwnedMethod : Registry.methods()) {
+        const DispatchMethodDef &Method = *OwnedMethod;
+        if (!Method.Owner)
+          continue;
+        bool Used = false;
+        for (const FoundMethodUsage &Found : MethodUsages)
+          Used |= Found.Method == &Method;
+        if (!Used)
+          continue;
+        DispatchOut->insert(Method.Owner->Name + "." + Method.Op);
+        DispatchOut->insert("shared." + Method.Op);
+      }
+    }
     (void)Path;
   }
 
@@ -614,6 +661,7 @@ struct SharedState {
   void rebuildWanted() {
     Wanted.clear();
     WantedImpl.clear();
+    WantedDispatchKeys.clear();
     for (const auto &File : UsageCache) {
       for (const auto &Entry : File.second.Wanted)
         for (const auto &Marker : Entry.second)
@@ -621,6 +669,8 @@ struct SharedState {
       for (const auto &Entry : File.second.ImplWanted)
         for (const auto &Marker : Entry.second)
           WantedImpl[Entry.getKey()].insert(Marker.getKey());
+      for (const auto &Key : File.second.DispatchKeys)
+        WantedDispatchKeys.insert(Key.getKey());
     }
   }
 
@@ -650,7 +700,8 @@ struct SharedState {
 
     UsageFile Entry;
     Entry.Stamp = Stamp;
-    collectUsages(Text, Path, Entry.Wanted, &Entry.ImplWanted);
+    collectUsages(Text, Path, Entry.Wanted, &Entry.ImplWanted,
+                  &Entry.DispatchKeys);
     UsageCache[Path] = std::move(Entry);
   }
 
@@ -675,7 +726,7 @@ struct SharedState {
 
       std::string Path = makeAbsolute(It->path());
       if (GeneratedHeaders.contains(Path) ||
-          GeneratedImplSources.contains(Path))
+          GeneratedImplSources.contains(Path) || isTemplateDefinition(Path))
         continue;
       Seen.insert(Path);
       updateUsageLocked(Path);
@@ -763,6 +814,8 @@ struct SharedState {
       return;
     if (GeneratedImplSources.contains(makeAbsolute(Path)))
       return;
+    if (isTemplateDefinition(Path))
+      return;
 
     auto AfterScan = std::chrono::steady_clock::now();
     bool ReadyForPrune = false;
@@ -801,12 +854,14 @@ struct SharedState {
     static const llvm::StringSet<> Empty;
     llvm::StringMap<llvm::StringSet<>> Snapshot;
     llvm::StringMap<llvm::StringSet<>> ImplSnapshot;
+    llvm::StringSet<> DispatchSnapshot;
     {
       std::lock_guard<std::mutex> Lock(UsageMutex);
       if (!PruningReady)
         return;
       Snapshot = Wanted;
       ImplSnapshot = WantedImpl;
+      DispatchSnapshot = WantedDispatchKeys;
     }
 
     SmallVector<const TemplateDef *, 8> Templates;
@@ -830,6 +885,18 @@ struct SharedState {
       for (const std::string &Marker : Removed) {
         log("removed " + Marker + " from " + Header.str());
       }
+    }
+
+    if (!DispatchHeader.empty()) {
+      Removed.clear();
+      Error.clear();
+      if (!Inst.pruneDispatchSections(DispatchHeader, DispatchSnapshot, Removed,
+                                      Error)) {
+        if (!Error.empty())
+          log(std::string("dispatch prune failed: ") + Error);
+      }
+      for (const std::string &Key : Removed)
+        log("removed dispatch section " + Key + " from " + DispatchHeader);
     }
 
     for (const auto &Entry : GeneratedImplSources) {
@@ -984,24 +1051,22 @@ struct SharedState {
                                                      Usage.Args.end())});
   }
 
-  /// Rewrites every dispatch section from scratch so added specializations,
-  /// removed specializations, and env changes all stay in sync with the
-  /// current source scan.
+  /// Rewrites the central dispatch header from the current source scan. Owner
+  /// sections hold only selector tables; the shared sections own each public
+  /// spelling. CLI-owned sections are left untouched by the section writer.
   void generateDispatch(
       ArrayRef<FoundUsage> Usages,
       const llvm::StringMap<llvm::StringSet<>> &AdapterOps = {},
       ArrayRef<FoundMethodUsage> MethodUsages = {},
       clang::CompilerInstance *CI = nullptr) {
+    if (!Dispatch.Enabled || DispatchHeader.empty())
+      return;
+
     llvm::SmallVector<DispatchGroup, 4> Groups;
     for (const auto &Owned : Registry.templates()) {
       const TemplateDef *Template = Owned.get();
       if (Template->Kind != TemplateKind::Type)
         continue;
-      // CLI-generated datatype headers already contain dispatch selectors
-      // derived from their variant list. Keep them in the group so annotated
-      // curried methods can be added, but never rewrite that base section.
-      if (Template->HasDatatypeDispatch)
-        log("keeping CLI dispatch for " + Template->Name);
       Groups.push_back({Template, Template->GeneratedHeader, {}});
     }
     for (const FoundUsage &Usage : Usages)
@@ -1017,10 +1082,73 @@ struct SharedState {
         addDispatchCase(Groups, Output, Usages[J]);
     }
 
+    llvm::SmallVector<DispatchSharedGroup, 4> SharedGroups;
+    llvm::SmallVector<size_t, 4> SharedOpIndexes;
+    auto addContribution = [&](StringRef Key, StringRef SelectorOp,
+                               const TemplateDef *Owner,
+                               const DispatchMethodDef *Method,
+                               ArrayRef<DispatchCase> Cases) -> size_t {
+      DispatchSharedGroup *Group = nullptr;
+      size_t Index = 0;
+      for (size_t I = 0; I < SharedGroups.size(); ++I) {
+        if (StringRef(SharedGroups[I].Key) == Key) {
+          Group = &SharedGroups[I];
+          Index = I;
+          break;
+        }
+      }
+      if (!Group) {
+        Index = SharedGroups.size();
+        SharedGroups.push_back({Key.str(), SelectorOp.str(), {}});
+        Group = &SharedGroups.back();
+      }
+      for (const DispatchContribution &Contrib : Group->Contribs)
+        if (Contrib.Template == Owner && Contrib.Method == Method)
+          return Index;
+      DispatchContribution Contrib;
+      Contrib.Template = Owner;
+      Contrib.Method = Method;
+      Contrib.Cases.assign(Cases.begin(), Cases.end());
+      Contrib.SelectorOp = SelectorOp.str();
+      Group->Contribs.push_back(std::move(Contrib));
+      return Index;
+    };
+
+    // Ordinary operations are shared by every owner that exposes the spelling.
+    for (const DispatchGroup &Group : Groups) {
+      // datatype(...) sections are CLI-owned: the CLI emits their public
+      // macros and selector tables. Mirroring the raw ops here would redefine
+      // constructor spellings such as Ok and Err.
+      if (Group.Cases.empty() || !Group.Template->DispatchEnabled ||
+          Group.Template->HasDatatypeDispatch)
+        continue;
+      llvm::StringSet<> SeenOps;
+      for (const auto &Entry : Group.Template->DispatchOps)
+        if (SeenOps.insert(Entry.getKey()).second)
+          SharedOpIndexes.push_back(
+              addContribution(Entry.getKey(), Entry.getKey(), Group.Template,
+                              nullptr, Group.Cases));
+      auto It = AdapterOps.find(Group.Template->Name);
+      if (It != AdapterOps.end())
+        for (const auto &Entry : It->second) {
+          std::string PublicOp =
+              (Group.Template->Name + "_" + Entry.getKey()).str();
+          if (SeenOps.insert(PublicOp).second)
+            SharedOpIndexes.push_back(addContribution(
+                PublicOp, PublicOp, Group.Template, nullptr, Group.Cases));
+        }
+    }
+
     // Curried methods cross every owner specialization with every explicit
-    // type tuple seen at a `map(float)(...)` call. The implementation template
-    // is synthesized like any other function specialization, then the method
-    // section is emitted into the owner's generated header.
+    // type tuple seen at a `map(float)(...)` call. Each owner contributes a
+    // separate selector table keyed by method plus explicit suffix.
+    struct MethodState {
+      const DispatchMethodDef *Method;
+      DispatchGroup *Group;
+      SmallVector<DispatchMethodUse, 4> Uses;
+    };
+    llvm::SmallVector<MethodState, 2> Methods;
+    llvm::SmallVector<DispatchSharedMethod, 2> SharedMethods;
     for (const auto &OwnedMethod : Registry.methods()) {
       const DispatchMethodDef &Method = *OwnedMethod;
       if (!Method.Owner || !Method.Owner->DispatchEnabled)
@@ -1030,12 +1158,12 @@ struct SharedState {
       if (!Group)
         continue;
 
-      SmallVector<DispatchMethodUse, 4> Uses;
+      MethodState State{&Method, Group, {}};
       for (const FoundMethodUsage &Found : MethodUsages) {
         if (Found.Method != &Method)
           continue;
         bool Duplicate = false;
-        for (const DispatchMethodUse &Use : Uses)
+        for (const DispatchMethodUse &Use : State.Uses)
           if (Use.Key == Found.Key)
             Duplicate = true;
         if (Duplicate)
@@ -1044,10 +1172,32 @@ struct SharedState {
         Use.Key = Found.Key;
         for (const std::string &Arg : Found.Args)
           Use.Args.push_back(Arg);
-        Uses.push_back(std::move(Use));
+        State.Uses.push_back(std::move(Use));
+      }
+      if (State.Uses.empty() || Group->Cases.empty())
+        continue;
+
+      DispatchSharedMethod *SharedMethod = nullptr;
+      for (DispatchSharedMethod &Candidate : SharedMethods)
+        if (Candidate.Key == Method.Op)
+          SharedMethod = &Candidate;
+      if (!SharedMethod) {
+        SharedMethods.push_back({Method.Op, &Method, {}});
+        SharedMethod = &SharedMethods.back();
+      }
+      for (const DispatchMethodUse &Use : State.Uses) {
+        std::string Suffix = dispatchMethodSuffix(Use.Args);
+        std::string Key = Method.Op + Suffix;
+        size_t Index =
+            addContribution(Key, Key, Method.Owner, &Method, Group->Cases);
+        // One shared section owns each public spelling. Multiple owners add
+        // selector tables to the same group, but the shared PICK is emitted
+        // once and chains through those tables.
+        if (!llvm::is_contained(SharedMethod->Groups, Index))
+          SharedMethod->Groups.push_back(Index);
       }
 
-      for (const DispatchMethodUse &Use : Uses) {
+      for (const DispatchMethodUse &Use : State.Uses) {
         for (const DispatchCase &Case : Group->Cases) {
           FoundUsage ImplUsage;
           ImplUsage.Template = &Method.Impl;
@@ -1062,16 +1212,12 @@ struct SharedState {
           generateInto(ImplUsage, Method.Impl.GeneratedHeader, CI, {}, {});
         }
       }
-
-      std::string Error;
-      Inst.ensureDispatchMethod(Method, Group->Cases, Uses, Dispatch,
-                                Group->Output, Error);
-      if (!Error.empty())
-        log(std::string("failed explicit method dispatch: ") + Error);
+      Methods.push_back(std::move(State));
     }
 
     for (const DispatchGroup &Group : Groups) {
-      if (Group.Template->HasDatatypeDispatch)
+      if (Group.Cases.empty() || !Group.Template->DispatchEnabled ||
+          Group.Template->HasDatatypeDispatch)
         continue;
       TemplateDef DispatchTemplate = *Group.Template;
       SmallVector<std::string, 4> OwnedOps;
@@ -1094,11 +1240,53 @@ struct SharedState {
       SmallVector<StringRef, 4> Ops;
       for (const std::string &Op : OwnedOps)
         Ops.push_back(Op);
+      std::string Section = makeDispatchSection(DispatchTemplate, Group.Cases,
+                                                Ops, Dispatch, SharedGroups);
       std::string Error;
-      Inst.ensureDispatch(DispatchTemplate, Group.Cases, Ops, Dispatch,
-                          Group.Output, Error);
+      Inst.writeDispatchSection(DispatchHeader, Group.Template->Name, Section,
+                                Error);
       if (!Error.empty())
         log(std::string("failed dispatch: ") + Error);
+    }
+
+    for (const MethodState &State : Methods) {
+      std::string Section = makeDispatchMethodSection(
+          *State.Method, State.Group->Cases, State.Uses, Dispatch,
+          DispatchHeader, SharedGroups);
+      std::string Key =
+          State.Method->Owner->Name + "." + State.Method->Op;
+      std::string Error;
+      Inst.writeDispatchSection(DispatchHeader, Key, Section, Error);
+      if (!Error.empty())
+        log(std::string("failed explicit method dispatch: ") + Error);
+    }
+
+    for (size_t Index : SharedOpIndexes) {
+      std::string Section =
+          makeSharedOpSection(SharedGroups[Index], Dispatch);
+      std::string Key = "shared." + SharedGroups[Index].Key;
+      std::string Error;
+      Inst.writeDispatchSection(DispatchHeader, Key, Section, Error);
+      if (!Error.empty())
+        log(std::string("failed shared dispatch: ") + Error);
+    }
+    for (const DispatchSharedMethod &Method : SharedMethods) {
+      std::string Section =
+          makeSharedMethodSection(Method, SharedGroups, Dispatch);
+      std::string Key = "shared." + Method.Key;
+      std::string Error;
+      Inst.writeDispatchSection(DispatchHeader, Key, Section, Error);
+      if (!Error.empty())
+        log(std::string("failed shared method dispatch: ") + Error);
+    }
+
+    // Generated instantiation headers keep only concrete blocks. Remove
+    // sections left by older plugin versions; the CLI manages its own.
+    for (const auto &Owned : Registry.templates()) {
+      std::string Error;
+      Inst.stripDispatchSections(Owned.get()->GeneratedHeader, Error);
+      if (!Error.empty())
+        log(std::string("failed stripping dispatch: ") + Error);
     }
   }
 
@@ -1412,11 +1600,14 @@ static bool dispatchAffixIsIdent(const DispatchConfig &Config) {
   return !Config.Affix.empty() && navIdentStart(Config.Affix.front());
 }
 
-/// Recognizes `$vec_int_push(...)` or `vec_int_push$(...)` at the cursor and
-/// maps the function spelling back to its template and operation.
-static DispatchNavTarget dispatchTargetAt(StringRef Text, size_t Offset,
-                                          const SharedState &State) {
-  DispatchNavTarget Result;
+using DispatchNavTargets = llvm::SmallVector<DispatchNavTarget, 2>;
+
+/// Recognizes `$vec_int_push(...)`, `vec_int_push$(...)` or a curried
+/// `map(float)(...)` at the cursor and maps the spelling back to the authored
+/// template declarations. A shared method spelling may have several owners.
+static DispatchNavTargets dispatchTargetsAt(StringRef Text, size_t Offset,
+                                            const SharedState &State) {
+  DispatchNavTargets Result;
   if (!State.Dispatch.Enabled || Offset > Text.size())
     return Result;
 
@@ -1438,12 +1629,16 @@ static DispatchNavTarget dispatchTargetAt(StringRef Text, size_t Offset,
   while (Call < Text.size() && isSpace(Text[Call]))
     ++Call;
   if (Call < Text.size() && Text[Call] == '(') {
-    if (const DispatchMethodDef *Method =
-            State.Registry.findDispatchMethod(Ident)) {
-      Result.Template = &Method->Impl;
-      Result.Op = Method->Impl.Name.empty() ? Method->Op : Method->Impl.Name;
-      return Result;
+    llvm::SmallVector<const DispatchMethodDef *, 2> Methods;
+    State.Registry.findDispatchMethods(Ident, Methods);
+    for (const DispatchMethodDef *Method : Methods) {
+      DispatchNavTarget Target;
+      Target.Template = &Method->Impl;
+      Target.Op = Method->Impl.Name.empty() ? Method->Op : Method->Impl.Name;
+      Result.push_back(std::move(Target));
     }
+    if (!Result.empty())
+      return Result;
   }
 
   StringRef Affix(State.Dispatch.Affix);
@@ -1473,14 +1668,19 @@ static DispatchNavTarget dispatchTargetAt(StringRef Text, size_t Offset,
 
   if (!navIdent(Ident))
     return Result;
-  for (const auto &Owned : State.Registry.templates()) {
-    const TemplateDef *Def = Owned.get();
+  // One ordinary spelling may belong to several dispatch-enabled type
+  // templates. Return all owners; goToTemplateFunction() already dedupes by
+  // header when several targets point at the same authored declaration.
+  llvm::SmallVector<const TemplateDef *, 4> Owners;
+  State.Registry.findDispatchOps(Ident, Owners);
+  for (const TemplateDef *Def : Owners) {
     if (!Def || !Def->DispatchEnabled || Def->Kind != TemplateKind::Type ||
-        Def->Name.empty() || !Def->DispatchOps.contains(Ident))
+        Def->Name.empty())
       continue;
-    Result.Template = Def;
-    Result.Op = Ident.str();
-    break;
+    DispatchNavTarget Target;
+    Target.Template = Def;
+    Target.Op = Ident.str();
+    Result.push_back(std::move(Target));
   }
   return Result;
 }
@@ -1540,7 +1740,8 @@ public:
   }
 
   void sawDiagnostic(const clang::Diagnostic &Info, Diag &D) override {
-    if (!CI || !isTemplateDiag(Info.getID()))
+    if (!CI || State->isTemplateDefinition(MainFile) ||
+        !isTemplateDiag(Info.getID()))
       return;
 
     SmallString<64> MangledStorage = argString(Info, 0);
@@ -1579,8 +1780,11 @@ public:
     State->generateDispatch(Usages);
     State->generateImplUsages(Usages, CI);
     State->writeImplMakefile();
-    bool IncludePresent = sourceIncludesGeneratedHeader(SM, GenPath);
-    addIncludeFix(SM, Outer.Template->Name, GenPath, D, IncludePresent);
+    bool IncludePresent = sourceIncludesPath(SM, GenPath);
+    bool DispatchPresent =
+        State->Dispatch.Enabled && sourceIncludesPath(SM, State->DispatchHeader);
+    addIncludeFix(SM, Outer.Template->Name, GenPath, D, IncludePresent,
+                  DispatchPresent);
 
     // A generated header can be written after clangd has already started this
     // parse, leaving the AST stale for one pass. If the source already includes
@@ -1598,44 +1802,89 @@ public:
   }
 
 private:
-  bool sourceIncludesGeneratedHeader(const clang::SourceManager &SM,
-                                     StringRef GenPath) const {
-    if (MainFile.empty() || GenPath.empty())
+  bool sourceIncludesPath(const clang::SourceManager &SM,
+                          StringRef Path) const {
+    if (MainFile.empty() || Path.empty())
       return false;
     std::string Rel =
-        computeRelativePath(sys::path::parent_path(MainFile), GenPath);
+        computeRelativePath(sys::path::parent_path(MainFile), Path);
     // Sources in a subdirectory normally include generated headers spelling
     // the path from the project root, e.g. "gen/box.h" rather than
     // "../gen/box.h". Accept that spelling too, or we add a duplicate include
     // at offset 0 and reorder the user's include block on every diagnostic.
-    std::string FromRoot = computeRelativePath(State->Root, GenPath);
+    std::string FromRoot = computeRelativePath(State->Root, Path);
     bool Invalid = false;
     StringRef Buffer = SM.getBufferData(SM.getMainFileID(), &Invalid);
     return !Invalid && (Buffer.contains(Rel) || Buffer.contains(FromRoot) ||
-                        Buffer.contains(GenPath));
+                        Buffer.contains(Path));
+  }
+
+  /// Appends new includes at the end of the existing include block. That keeps
+  /// the central dispatch header after generated instantiation headers and
+  /// before call sites or helper bodies that use dispatch macros.
+  Position includeInsertPosition(const clang::SourceManager &SM) const {
+    bool Invalid = false;
+    StringRef Buffer = SM.getBufferData(SM.getMainFileID(), &Invalid);
+    if (Invalid)
+      return {};
+    unsigned Line = 0;
+    unsigned Offset = 0;
+    unsigned InsertOffset = 0;
+    unsigned InsertLine = 0;
+    while (Offset < Buffer.size()) {
+      size_t EOL = Buffer.find('\n', Offset);
+      if (EOL == StringRef::npos)
+        EOL = Buffer.size();
+      StringRef Text = Buffer.slice(Offset, EOL);
+      size_t Hash = Text.find_first_not_of(" \t");
+      if (Hash != StringRef::npos && Text.substr(Hash).starts_with("#include")) {
+        InsertOffset = static_cast<unsigned>(EOL) +
+                       (EOL < Buffer.size() ? 1 : 0);
+        InsertLine = Line + 1;
+      }
+      if (EOL == Buffer.size())
+        break;
+      Offset = static_cast<unsigned>(EOL) + 1;
+      ++Line;
+    }
+    if (InsertOffset == 0)
+      return {};
+    return Position{static_cast<int>(InsertLine), 0};
   }
 
   void addIncludeFix(const clang::SourceManager &SM, StringRef TemplateName,
-                     StringRef GenPath, Diag &D, bool IncludePresent) {
+                     StringRef GenPath, Diag &D, bool IncludePresent,
+                     bool DispatchPresent) {
     if (MainFile.empty() || AddedInclude)
       return;
-    if (IncludePresent) {
-      AddedInclude = true;
-      return;
-    }
 
-    std::string Rel =
-        computeRelativePath(sys::path::parent_path(MainFile), GenPath);
+    std::string NewText;
+    if (!IncludePresent && !GenPath.empty()) {
+      std::string Rel =
+          computeRelativePath(sys::path::parent_path(MainFile), GenPath);
+      NewText += "#include \"" + Rel + "\"\n";
+    }
+    // Dispatch macros live in the central header, after every generated
+    // instantiation header and before any call site that uses them.
+    if (State->Dispatch.Enabled && !State->DispatchHeader.empty() &&
+        !DispatchPresent) {
+      std::string Rel = computeRelativePath(
+          sys::path::parent_path(MainFile), State->DispatchHeader);
+      NewText += "#include \"" + Rel + "\"\n";
+    }
+    AddedInclude = true;
+    if (NewText.empty())
+      return;
+
     TextEdit Edit;
-    Edit.range.start = Position{0, 0};
-    Edit.range.end = Position{0, 0};
-    Edit.newText = "#include \"" + Rel + "\"\n";
+    Edit.range.start = includeInsertPosition(SM);
+    Edit.range.end = Edit.range.start;
+    Edit.newText = std::move(NewText);
     SmallVector<TextEdit, 1> Edits;
     Edits.push_back(std::move(Edit));
     D.Fixes.push_back(Fix{
         std::string("include generated header for ") + TemplateName.str(),
         std::move(Edits), {}});
-    AddedInclude = true;
   }
 
   std::shared_ptr<SharedState> State;
@@ -1722,35 +1971,41 @@ private:
       return false;
     }
 
-    DispatchNavTarget Target =
-        dispatchTargetAt(Text, *Offset, *State);
-    if (!Target.Template)
+    DispatchNavTargets Targets = dispatchTargetsAt(Text, *Offset, *State);
+    if (Targets.empty())
       return false;
 
-    auto HeaderBuffer =
-        MemoryBuffer::getFile(Target.Template->Header, /*IsText=*/true);
-    if (!HeaderBuffer)
-      return false;
-    StringRef HeaderText = (*HeaderBuffer)->getBuffer();
-    unsigned HeaderOffset = 0;
-    if (auto It = Target.Template->DispatchOpOffsets.find(Target.Op);
-        It != Target.Template->DispatchOpOffsets.end())
-      HeaderOffset = It->second;
-    else if (size_t Found = HeaderText.find(Target.Op);
-             Found != StringRef::npos)
-      HeaderOffset = static_cast<unsigned>(Found);
-    else if (size_t Found = HeaderText.find(Target.Template->Name);
-             Found != StringRef::npos)
-      HeaderOffset = static_cast<unsigned>(Found);
-    if (HeaderOffset >= HeaderText.size())
-      HeaderOffset = 0;
-
-    Location Loc;
-    Loc.uri = URIForFile::canonicalize(Target.Template->Header, MainFile);
-    Loc.range.start = offsetToPosition(HeaderText, HeaderOffset);
-    Loc.range.end = Loc.range.start;
     llvm::json::Array Result;
-    Result.push_back(toJSON(Loc));
+    llvm::StringSet<> Seen;
+    for (const DispatchNavTarget &Target : Targets) {
+      if (!Target.Template || !Seen.insert(Target.Template->Header).second)
+        continue;
+      auto HeaderBuffer =
+          MemoryBuffer::getFile(Target.Template->Header, /*IsText=*/true);
+      if (!HeaderBuffer)
+        continue;
+      StringRef HeaderText = (*HeaderBuffer)->getBuffer();
+      unsigned HeaderOffset = 0;
+      if (auto It = Target.Template->DispatchOpOffsets.find(Target.Op);
+          It != Target.Template->DispatchOpOffsets.end())
+        HeaderOffset = It->second;
+      else if (size_t Found = HeaderText.find(Target.Op);
+               Found != StringRef::npos)
+        HeaderOffset = static_cast<unsigned>(Found);
+      else if (size_t Found = HeaderText.find(Target.Template->Name);
+               Found != StringRef::npos)
+        HeaderOffset = static_cast<unsigned>(Found);
+      if (HeaderOffset >= HeaderText.size())
+        HeaderOffset = 0;
+
+      Location Loc;
+      Loc.uri = URIForFile::canonicalize(Target.Template->Header, MainFile);
+      Loc.range.start = offsetToPosition(HeaderText, HeaderOffset);
+      Loc.range.end = Loc.range.start;
+      Result.push_back(toJSON(Loc));
+    }
+    if (Result.empty())
+      return false;
     Reply(std::move(Result));
     return true;
   }

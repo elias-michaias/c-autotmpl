@@ -2,8 +2,9 @@
 
 Use the CLI for build scripts and reproducible generation. Use the clangd module
 for generation from unsaved buffers, type lookup through the AST, and pruning.
-Both write the same public headers, implementation sources, and makefile fragment
-for split templates. Build instructions are in [BUILD.md](BUILD.md).
+Both write the same public headers, the central `gen/dispatch.h`, implementation
+sources, and makefile fragment for split templates. Build instructions are in
+[BUILD.md](BUILD.md).
 
 ## CLI
 
@@ -74,7 +75,7 @@ over defaults. Restart clangd after changing configuration.
 | Call affix | `dispatch_affix` | `C_AUTOTMPL_DISPATCH_AFFIX` | Set the generic-call affix, default `$`. |
 | Bare generic calls | `dispatch_truncate` | `C_AUTOTMPL_DISPATCH_TRUNCATE` | Use bare operation macros and direct `<op>_<args>` targets; ignore the affix. |
 | Call templates | `dispatch_templates` | `C_AUTOTMPL_DISPATCH_TEMPLATES` | Comma-separated templates that get generic calls, such as `vec,list`. |
-| Dispatch header preprocess | `dispatch_preprocess_headers` | n/a | Expand template headers while discovering generic calls; `1` means all, otherwise a comma-separated template list. |
+| Template header preprocess for dispatch | `dispatch_preprocess_headers` | n/a | Expand template headers while discovering generic calls; `1` means all, otherwise a comma-separated template list. This is unrelated to the central `gen/dispatch.h` output. |
 | Preprocess | `preprocess` | `C_AUTOTMPL_PREPROCESS` | CLI only: scan expanded source so macro-generated usages are visible. Off by default. |
 | Preprocess backend | `preprocess_backend` | `C_AUTOTMPL_PREPROCESS_BACKEND` | `local` (internal expander) or `full` (batched `cc -E -P`, default). |
 | Preprocessor | `preprocess_cc` | `C_AUTOTMPL_PREPROCESS_CC` | Command used by the `full` backend; default `cc`. |
@@ -383,8 +384,18 @@ application needs an explicit wrapper template.
 ## Generic calls
 
 Set `dispatch=1` in `autotmpl.conf` to write method-like calls such as
-`$Vec_push(&xs, 7)`. The generated selector chooses the concrete operation at
-compile time from the argument types. An operation is eligible when a
+`$Vec_push(&xs, 7)`. All generated selectors and public operation macros live in
+one `gen/dispatch.h`. Include every generated instantiation header first, then
+`gen/dispatch.h`, then the call sites. Owner sections such as `Vec` and
+`Vec.push` are guarded by concrete type presence macros, and shared sections
+such as `shared.push` define each public spelling exactly once. If two templates
+declare the same operation name, their owner tables are chained behind that one
+public spelling; the argument type chooses the owner. CLI-owned sections are
+marked `generated-by=cli`, plugin-owned sections are marked
+`generated-by=plugin`, and neither generator overwrites the other's sections.
+
+The generated selector chooses the concrete operation at compile time from the
+argument types. An operation is eligible when a
 type-template header declares a function whose parameter list mentions that
 template's call form such as
 `Vec(T)`, `Pair(T, U)`, or `Box(int)`; a template parameter such as `T` or `U`;
@@ -434,6 +445,7 @@ static inline void pair_set_impl(T, U)(pair(T, U) *p, T a, U b) {
 ```c
 /* main.c */
 #include "gen/pair.h"
+#include "gen/dispatch.h"
 
 int main(void) {
   pair(int, float) p = {0};
@@ -452,11 +464,11 @@ autotmpl --root . main.c
 cc -I. -std=c11 -Wall -Wextra -Werror main.c -o demo
 ```
 
-The generated `gen/pair.h` defines `pair_set`, with cases for
-`pair(int, float)` and `pair(float, int)`, so both calls above use one bare
-spelling. Older `BOX_FN(op, T)` paste declarations and concrete-only declarations
-such as `slab_set_int` remain accepted as fallbacks. `dispatch_affix` and
-`dispatch_style` have no effect while truncation is on.
+`gen/dispatch.h` defines the public `pair_set` macro, backed by guarded cases in
+the `pair` owner section for `pair(int, float)` and `pair(float, int)`, so both
+calls above use one bare spelling. Older `BOX_FN(op, T)` paste declarations and
+concrete-only declarations such as `slab_set_int` remain accepted as fallbacks.
+`dispatch_affix` and `dispatch_style` have no effect while truncation is on.
 
 ### Curried methods with explicit type arguments
 
@@ -491,6 +503,7 @@ from the value:
 ```c
 /* main.c */
 #include "gen/result.h"
+#include "gen/dispatch.h"
 
 static float to_float(int x) { return (float)x / 2.0f; }
 
@@ -503,9 +516,11 @@ int main(void) {
 
 The target is `<op>_<owner args>_<explicit args>`, so the example calls
 `map_int_float_float`. Explicit arguments are pasted into generated names, so
-use single-token types such as `float`, `int`, or a typedef name. Both the CLI
-and the clangd plugin understand the annotation; no source-file markers are
-needed.
+use single-token types such as `float`, `int`, or a typedef name. A second
+template may declare `// -- dispatch method Option.map explicit U`; both owners
+contribute guarded tables to the same `map` public macro in `gen/dispatch.h`.
+Both the CLI and the clangd plugin understand the annotation; no source-file
+markers are needed.
 
 The rule covers direct declarations and paste-macro declarations, including
 two-argument templates such as `pair(Key, Value)`:
@@ -531,6 +546,7 @@ static inline T VEC_FN(Vec(T), _at)(int i, Vec(T) v) {
 ```c
 /* src/main.c */
 #include "gen/vec.h"
+#include "gen/dispatch.h"
 
 int main(void) {
   Vec(int) nums = {0};
@@ -698,6 +714,7 @@ adapter calls and method-style calls:
 ```c
 /* src/main.c */
 #include "gen/vec.h"
+#include "gen/dispatch.h"
 
 #include <stdio.h>
 
@@ -722,16 +739,22 @@ autotmpl --root . src
 ```
 
 One explicit call per operation is still enough to keep the adapter macro in
-`gen/`. Call cases are guarded by presence macros such as
-`C_AUTOTMPL_vec_int`, so a header never names a specialization that was not
-included. The same rule covers two-argument wrappers, so `hashmap_insert$`
-selects from a tracked `hashmap(int, int)` case.
+`gen/`. `$vec_push` and `hashmap_insert$` are public macros from shared sections
+in `gen/dispatch.h`, while their guarded cases live in owner sections there and
+depend on presence macros such as `C_AUTOTMPL_vec_int`; a header never names a
+specialization that was not included. The same rule covers two-argument
+wrappers, so `hashmap_insert$` selects from a tracked `hashmap(int, int)` case.
 
 ## Generated files
 
-Generated headers are ordinary C headers in `gen/`. Split templates also get a
-grouped source in `gen/impl/` and a shared `gen/impl/c-autotmpl.mk` fragment. You
-can commit generated files or regenerate them. Keep the `/* c-autotmpl: ... */`
+Generated headers are ordinary C headers in `gen/`. Generic-call selectors and
+public macros live in the single `gen/dispatch.h`: owner sections are keyed by
+template and operation (for example `vec` or `Result.map`), and shared public
+sections are keyed by operation (for example `shared.push` or `shared.map`).
+Every section carries a `generated-by=cli` or `generated-by=plugin` marker, and
+the two generators preserve each other's sections. Split templates also get a grouped
+source in `gen/impl/` and a shared `gen/impl/c-autotmpl.mk` fragment. You can
+commit generated files or regenerate them. Keep the `/* c-autotmpl: ... */`
 markers if you want plugin pruning to work.
 
 If something goes wrong, start with [TROUBLESHOOTING.md](TROUBLESHOOTING.md).

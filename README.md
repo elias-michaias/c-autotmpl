@@ -47,6 +47,7 @@ as a clangd plugin that keeps headers current while you type. Both read the same
 ```c
 #include "gen/box.h"
 #include "gen/vec.h"
+#include "gen/dispatch.h" /* after instantiations, before generic calls */
 
 Box(int) box = {3};
 vec(int) xs = {0};
@@ -56,8 +57,12 @@ $vec_push(&xs, 7);    /* calls vec_int_push */
 ```
 
 c-autotmpl finds the template headers, writes the instantiations into a sibling
-`gen/` directory, and adds the compile-time selectors for generic calls. A
-template header is just a decorator plus the usual preprocessor pattern; see
+`gen/` directory, and collects the compile-time selectors into a single
+`gen/dispatch.h`. Include generated instantiation headers first, then
+`gen/dispatch.h`, then call sites. When several templates expose the same public
+operation (for example `Option.map` and `Result.map`), their guarded selector
+tables share one public spelling. A template header is just a decorator plus the
+usual preprocessor pattern; see
 [what the pattern does](doc/USAGE.md#what-the-pattern-does).
 
 ## Use it
@@ -93,7 +98,8 @@ Both paths use the same project options; see [Configuration](#configuration).
 ## Generic calls
 
 Enable generic calls in [Configuration](#configuration) to give generated
-operations one method-like spelling for every instantiation:
+operations one method-like spelling for every instantiation. Include
+`gen/dispatch.h` after the generated instantiation headers and before the calls:
 
 ```c
 vec(int) xs = {0};
@@ -151,6 +157,7 @@ static inline void pair_set_impl(T, U)(pair(T, U) *p, T a, U b) {
 ```c
 /* main.c */
 #include "gen/pair.h"
+#include "gen/dispatch.h"
 
 int main(void) {
   pair(int, float) p = {0};
@@ -169,11 +176,13 @@ autotmpl --root . main.c
 cc -I. -std=c11 -Wall -Wextra -Werror main.c -o demo
 ```
 
-Each case is guarded by the presence macro of an instantiation that actually
-exists in the generated header, and the public macro forwards arguments
-unchanged. Selection uses C11 `_Generic` by default, with a GCC/Clang builtin
-option for C99. The affix can lead (`$vec_push`) or trail (`vec_push_method`);
-all keys and defaults are in [Configuration](#configuration).
+The public macro lives in `gen/dispatch.h`; each case is guarded by the presence
+macro of an instantiation that actually exists in a generated header, and the
+macro forwards arguments unchanged. Same-name operations from several templates
+share one public spelling through chained owner tables. Selection uses C11
+`_Generic` by default, with a GCC/Clang builtin option for C99. The affix can
+lead (`$vec_push`) or trail (`vec_push_method`); all keys and defaults are in
+[Configuration](#configuration).
 
 See [Generic calls](doc/USAGE.md#generic-calls) for the association rule and
 header pattern.
@@ -214,7 +223,10 @@ include guard such as `FOO_H`; builtin and fixed-width scalars are emitted bare.
 For generic-call discovery, a template header can opt into local expansion with
 `// -- preprocess`, or via `dispatch_preprocess_headers`. A shared header may
 carry several decorators; each marked section is emitted inline with its
-preamble, so related templates do not re-include the whole file.
+preamble, so related templates do not re-include the whole file. Generated
+dispatch is similarly consolidated: owner sections contribute guarded selector
+tables to `gen/dispatch.h`, and shared sections define the public call spelling
+once even when several templates own the same operation.
 
 Advanced generation lives in the usage guide:
 [nested types](doc/USAGE.md#nested-types),
@@ -262,7 +274,7 @@ dispatch_templates=vec,pair
 | Call affix | `dispatch_affix` | `C_AUTOTMPL_DISPATCH_AFFIX` | Affix text; default `$`. |
 | Bare generic calls | `dispatch_truncate` | `C_AUTOTMPL_DISPATCH_TRUNCATE` | Use bare operation macros and directly mangled targets; ignore the affix. |
 | Call templates | `dispatch_templates` | `C_AUTOTMPL_DISPATCH_TEMPLATES` | Comma-separated templates that get generic calls. |
-| Dispatch header preprocess | `dispatch_preprocess_headers` | n/a | Expand selected template headers before discovering generic-call operations; `1` means all, otherwise a comma-separated template list. |
+| Template header preprocess for dispatch | `dispatch_preprocess_headers` | n/a | Expand selected template headers before discovering generic-call operations; `1` means all, otherwise a comma-separated template list. This is unrelated to the central `gen/dispatch.h` output. |
 | Preprocess | `preprocess` | `C_AUTOTMPL_PREPROCESS` | CLI only: scan expanded source so macro-generated usages are visible. Off by default. |
 | Preprocess backend | `preprocess_backend` | `C_AUTOTMPL_PREPROCESS_BACKEND` | `local` internal expander (fast) or `full` batched `cc -E -P` (default, exact). |
 | Preprocessor | `preprocess_cc` | `C_AUTOTMPL_PREPROCESS_CC` | Preprocessor command for the `full` backend; default `cc`. |
@@ -307,7 +319,7 @@ methodology, configuration comparisons, and `make bench` results.
 - `#pragma once` headers cannot provide a testable guard.
 - The CLI uses raw text by default; enable `preprocess=1` to see macro-generated usages.
 - Function templates need explicit type arguments; there is no deduction.
-- Nested blocks depend on include order in the source file.
+- Nested blocks depend on include order in the source file; dispatch calls also require generated instantiation headers before `gen/dispatch.h`, which must precede the call sites.
 - The clangd module must be rebuilt against a matching clangd version.
 
 ---

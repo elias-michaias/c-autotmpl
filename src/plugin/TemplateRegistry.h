@@ -166,12 +166,32 @@ public:
     return nullptr;
   }
 
+  /// Every template exposing `Op`, e.g. two owners of the same ordinary
+  /// dispatch spelling. Scanning and navigation must see all of them.
+  void findDispatchOps(
+      llvm::StringRef Op,
+      llvm::SmallVectorImpl<const TemplateDef *> &Out) const {
+    for (const auto &Def : Owned)
+      if (Def->DispatchOps.contains(Op))
+        Out.push_back(Def.get());
+  }
+
   /// Returns an annotated curried method such as `map(float)(...)`.
   const DispatchMethodDef *findDispatchMethod(llvm::StringRef Op) const {
     for (const auto &Method : MethodDefs)
       if (Method->Owner && Method->Op == Op)
         return Method.get();
     return nullptr;
+  }
+
+  /// Every owner exposing `Op`, e.g. both Option.map and Result.map. Call-site
+  /// discovery and navigation need all of them, not just the first match.
+  void findDispatchMethods(
+      llvm::StringRef Op,
+      llvm::SmallVectorImpl<const DispatchMethodDef *> &Out) const {
+    for (const auto &Method : MethodDefs)
+      if (Method->Owner && Method->Op == Op)
+        Out.push_back(Method.get());
   }
 
   /// Matches e.g. "List_int" to template "List" with type spelling "int".

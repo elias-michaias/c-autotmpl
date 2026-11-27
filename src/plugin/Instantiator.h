@@ -37,6 +37,32 @@ struct DispatchMethodUse {
   std::vector<std::string> Args;         // canonical explicit type args
 };
 
+/// One owner's contribution to a shared public dispatch spelling. `Method` is
+/// null for ordinary operations. `SelectorOp` is the op spelling used by the
+/// generated SEL/PICK names: the plain op, or op plus an explicit suffix.
+struct DispatchContribution {
+  const TemplateDef *Template = nullptr;
+  const DispatchMethodDef *Method = nullptr;
+  std::vector<DispatchCase> Cases;
+  std::string SelectorOp;
+};
+
+/// Contributors to one public spelling, in registry order. The first owner
+/// owns the PICK table entered by the shared public macro; every other owner
+/// is reached through the preceding owner's base selector.
+struct DispatchSharedGroup {
+  std::string Key;        // section key: `map`, `map_float`, ...
+  std::string SelectorOp; // SEL/PICK spelling: `map`, `map_float`, ...
+  std::vector<DispatchContribution> Contribs;
+};
+
+/// All explicit suffixes belonging to one curried method spelling.
+struct DispatchSharedMethod {
+  std::string Key;                       // `map`
+  const DispatchMethodDef *FirstMethod = nullptr; // explicit parameter count
+  std::vector<size_t> Groups;            // indexes into the shared group array
+};
+
 /// Caches generated-header contents and append-only instantiation markers.
 /// Shared between AST worker threads; all mutations are serialized.
 class Instantiator {
@@ -69,6 +95,22 @@ public:
                             const DispatchConfig &Config,
                             llvm::StringRef OutputHeader,
                             std::string &Error);
+
+  /// Writes one marked section into the central dispatch header. Sections
+  /// carrying another generator's ownership marker are never overwritten.
+  bool writeDispatchSection(llvm::StringRef Path, llvm::StringRef Key,
+                            llvm::StringRef Section, std::string &Error);
+
+  /// Removes plugin-owned dispatch sections left in per-template headers.
+  /// CLI-owned sections are preserved for the CLI to manage.
+  bool stripDispatchSections(llvm::StringRef Path, std::string &Error);
+
+  /// Removes plugin-owned sections from the central header whose keys are no
+  /// longer wanted. Returns the removed keys.
+  bool pruneDispatchSections(llvm::StringRef Path,
+                             const llvm::StringSet<> &Keep,
+                             std::vector<std::string> &Removed,
+                             std::string &Error);
 
   /// Removes generated blocks that are not in Keep. Returns true and fills
   /// Removed when the generated header changed.
@@ -108,6 +150,8 @@ private:
 
   FileState &getState(llvm::StringRef Path);
   void loadState(FileState &State, llvm::StringRef Path, uint64_t Stamp);
+  bool commitDispatchText(llvm::StringRef Path, FileState &State,
+                          const std::string &Text, std::string &Error);
 
   std::mutex Mutex;
   llvm::StringMap<std::unique_ptr<FileState>> Files;
@@ -128,16 +172,34 @@ std::string makeInstantiationBlock(
 std::string dispatchContainerName(const TemplateDef &Template,
                                   llvm::ArrayRef<std::string> Args);
 
-std::string makeDispatchSection(const TemplateDef &Template,
-                                llvm::ArrayRef<DispatchCase> Cases,
-                                llvm::ArrayRef<llvm::StringRef> Ops,
+/// Path of the single central dispatch header beside the generated headers.
+std::string generatedDispatchPath(llvm::StringRef GeneratedHeader);
+
+/// Explicit type suffix used by curried method macro names, e.g. `_float`.
+std::string dispatchMethodSuffix(llvm::ArrayRef<std::string> Args);
+
+/// Owner sections contain only guarded selector tables. When several owners
+/// expose the same spelling, each base selector falls through to the next
+/// contributor's table (indexed by that owner's case count).
+std::string makeDispatchSection(
+    const TemplateDef &Template, llvm::ArrayRef<DispatchCase> Cases,
+    llvm::ArrayRef<llvm::StringRef> Ops, const DispatchConfig &Config,
+    llvm::ArrayRef<DispatchSharedGroup> SharedGroups = {});
+
+std::string makeDispatchMethodSection(
+    const DispatchMethodDef &Method, llvm::ArrayRef<DispatchCase> Cases,
+    llvm::ArrayRef<DispatchMethodUse> Uses, const DispatchConfig &Config,
+    llvm::StringRef OutputHeader,
+    llvm::ArrayRef<DispatchSharedGroup> SharedGroups = {});
+
+/// Shared sections define each public spelling exactly once, entering through
+/// the first contributor's PICK table and chaining the owner selectors.
+std::string makeSharedOpSection(const DispatchSharedGroup &Group,
                                 const DispatchConfig &Config);
 
-std::string makeDispatchMethodSection(const DispatchMethodDef &Method,
-                                      llvm::ArrayRef<DispatchCase> Cases,
-                                      llvm::ArrayRef<DispatchMethodUse> Uses,
-                                      const DispatchConfig &Config,
-                                      llvm::StringRef OutputHeader);
+std::string makeSharedMethodSection(const DispatchSharedMethod &Method,
+                                    llvm::ArrayRef<DispatchSharedGroup> Groups,
+                                    const DispatchConfig &Config);
 
 /// Presence macro used by generated implementation sources. It deliberately
 /// uses a different prefix from public headers so the two block sets cannot

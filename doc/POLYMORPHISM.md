@@ -223,7 +223,10 @@ c-autotmpl generates the same kind of selector from template headers: with
 `dispatch=1` calls carry a configurable affix, and with `dispatch_truncate=1`
 they are bare operation names. The canonical declaration is `<op>_impl(T, U)`,
 which generates `<op>` targeting `<op>_<args>`; older paste declarations and
-concrete-only functions remain accepted fallbacks.
+concrete-only functions remain accepted fallbacks. The selector tables and the
+single public `<op>` macro live in `gen/dispatch.h`, after the generated
+instantiation headers and before call sites. Same-name operations from different
+templates share that public macro through chained owner tables.
 
 ## Extendible generic calls
 

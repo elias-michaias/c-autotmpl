@@ -256,7 +256,8 @@ std::string joinExplicitArgs(ArrayRef<std::string> Args) {
 
 static std::string substituteParams(StringRef Source,
                                     const TemplateDef &Template,
-                                    ArrayRef<std::string> Args) {
+                                    ArrayRef<std::string> Args,
+                                    size_t ParamStart = 0) {
   std::string Out;
   Out.reserve(Source.size());
   for (unsigned I = 0; I < Source.size();) {
@@ -266,10 +267,10 @@ static std::string substituteParams(StringRef Source,
         ++I;
       StringRef Ident = Source.slice(Start, I);
       bool Replaced = false;
-      for (size_t P = 0;
-           P < Template.Params.size() && P < Args.size(); ++P) {
+      for (size_t P = ParamStart;
+           P < Template.Params.size() && P - ParamStart < Args.size(); ++P) {
         if (Ident == StringRef(Template.Params[P])) {
-          Out += Args[P];
+          Out += Args[P - ParamStart];
           Replaced = true;
           break;
         }
@@ -286,14 +287,16 @@ static std::string substituteParams(StringRef Source,
 static void scanHeaderDeps(const TemplateDef &Template,
                            ArrayRef<std::string> Args,
                            const TemplateRegistry &Registry,
-                           SmallVectorImpl<FoundUsage> &Out) {
+                           SmallVectorImpl<FoundUsage> &Out,
+                           size_t ParamStart = 0) {
   if (Template.Header.empty() || Args.empty())
     return;
   auto Buf = MemoryBuffer::getFile(Template.Header, /*IsText=*/true);
   if (!Buf)
     return;
 
-  std::string Source = substituteParams((*Buf)->getBuffer(), Template, Args);
+  std::string Source =
+      substituteParams((*Buf)->getBuffer(), Template, Args, ParamStart);
   SmallVector<FoundUsage, 4> Header;
   scanUsagesImpl(Source, Registry, Header, nullptr, /*ScanHeaders=*/false);
 
@@ -463,6 +466,24 @@ bool isDeclaredParam(const TemplateDef &Template, StringRef Arg) {
   return false;
 }
 
+/// A shared template header can declare extra parameters in method sections
+/// (for example `V` in `Result.map`). When scanning a substituted copy of that
+/// header, those names are still placeholders even though the called template
+/// does not declare them itself.
+bool isHeaderParam(const TemplateDef &Template, StringRef Arg,
+                   const TemplateRegistry &Registry) {
+  if (isDeclaredParam(Template, Arg))
+    return true;
+  for (const auto &Owned : Registry.templates())
+    if (Owned->Header == Template.Header && isDeclaredParam(*Owned, Arg))
+      return true;
+  for (const auto &Owned : Registry.methods())
+    if (Owned->Impl.Header == Template.Header &&
+        isDeclaredParam(Owned->Impl, Arg))
+      return true;
+  return false;
+}
+
 void appendUsageChain(const TemplateDef &Template,
                       ArrayRef<std::string> CanonArgs,
                       SmallVectorImpl<FoundUsage> &Expanded,
@@ -504,7 +525,7 @@ void scanTemplateUsage(const TemplateDef &Template, StringRef RawType,
     return;
   if (!ScanHeaders)
     for (const std::string &Arg : RawArgs)
-      if (isDeclaredParam(Template, Arg))
+      if (isHeaderParam(Template, Arg, Registry))
         return;
 
   SmallVector<std::string, 4> CanonArgs;
@@ -535,7 +556,7 @@ static void scanFunctionUsage(const TemplateDef &Template, StringRef RawType,
     return;
   if (!ScanHeaders)
     for (const std::string &Arg : RawArgs)
-      if (isDeclaredParam(Template, Arg))
+      if (isHeaderParam(Template, Arg, Registry))
         return;
 
   SmallVector<FoundUsage, 4> Expanded;
@@ -679,7 +700,7 @@ static void addDispatchMethodUse(const DispatchMethodDef &Method,
         canonicalizeArgument(RawArgs[I], Method.Impl, Base + I, Registry,
                              Expanded));
   if (ScanHeaders)
-    scanHeaderDeps(Method.Impl, CanonArgs, Registry, Expanded);
+    scanHeaderDeps(Method.Impl, CanonArgs, Registry, Expanded, Base);
 
   FoundMethodUsage Use;
   Use.Method = &Method;
@@ -763,56 +784,14 @@ static void scanUsagesImpl(StringRef Code, const TemplateRegistry &Registry,
           }
         }
       }
-    } else if (const DispatchMethodDef *Method =
-                   Registry.findDispatchMethod(Ident)) {
+    } else {
       // Curried explicit method: map(float)(result, f). The inner call carries
-      // only the explicit args; T and U are recovered later from the owner's
-      // cases by the module's dispatch generation.
-      unsigned K = End;
-      while (K < S.size() && isSpace(S[K]))
-        ++K;
-      if (K < S.size() && S[K] == '(') {
-        unsigned Start = K + 1;
-        int Depth = 1;
-        unsigned Close = Start;
-        for (; Close < S.size() && Depth > 0; ++Close) {
-          if (S[Close] == '(')
-            ++Depth;
-          else if (S[Close] == ')')
-            --Depth;
-        }
-        if (Depth == 0 && Close > Start + 1) {
-          StringRef Raw = S.slice(Start, Close - 1).trim();
-          unsigned After = Close;
-          while (After < S.size() && isSpace(S[After]))
-            ++After;
-          if (After < S.size() && S[After] == '(') {
-            unsigned CallStart = After + 1;
-            int CallDepth = 1;
-            unsigned CallClose = CallStart;
-            for (; CallClose < S.size() && CallDepth > 0; ++CallClose) {
-              if (S[CallClose] == '(')
-                ++CallDepth;
-              else if (S[CallClose] == ')')
-                --CallDepth;
-            }
-            if (CallDepth == 0) {
-              addDispatchMethodUse(*Method, Raw, Registry, Out, MethodOut,
-                                   ScanHeaders);
-              I = CallClose;
-              continue;
-            }
-          }
-          I = Close;
-          continue;
-        }
-      }
-    } else if (DispatchTruncate) {
-      // A bare dispatch call such as box_set(Box(int) *, T) can spell its
-      // template argument at the call site. Scan it like the CLI does, but
-      // leave pointers and other non-type arguments alone. Affixed dispatch
-      // calls were already skipped above, so this is truncate-only.
-      if (const TemplateDef *OpDef = Registry.findDispatchOp(Ident)) {
+      // only the explicit args; owner args are recovered per owner later. A
+      // public spelling may belong to several templates (Option.map and
+      // Result.map), so every owner must see the use.
+      SmallVector<const DispatchMethodDef *, 2> Methods;
+      Registry.findDispatchMethods(Ident, Methods);
+      if (!Methods.empty()) {
         unsigned K = End;
         while (K < S.size() && isSpace(S[K]))
           ++K;
@@ -827,12 +806,73 @@ static void scanUsagesImpl(StringRef Code, const TemplateRegistry &Registry,
               --Depth;
           }
           if (Depth == 0 && Close > Start + 1) {
-            std::string Type =
-                dispatchTypeArgsFromCall(S.slice(Start, Close - 1), Registry);
-            if (!Type.empty())
-              scanTemplateUsage(*OpDef, Type, Registry, Out, ScanHeaders);
+            StringRef Raw = S.slice(Start, Close - 1).trim();
+            unsigned After = Close;
+            while (After < S.size() && isSpace(S[After]))
+              ++After;
+            if (After < S.size() && S[After] == '(') {
+              unsigned CallStart = After + 1;
+              int CallDepth = 1;
+              unsigned CallClose = CallStart;
+              for (; CallClose < S.size() && CallDepth > 0; ++CallClose) {
+                if (S[CallClose] == '(')
+                  ++CallDepth;
+                else if (S[CallClose] == ')')
+                  --CallDepth;
+              }
+              if (CallDepth == 0) {
+                for (const DispatchMethodDef *Method : Methods)
+                  addDispatchMethodUse(*Method, Raw, Registry, Out, MethodOut,
+                                       ScanHeaders);
+                I = CallClose;
+                continue;
+              }
+            }
             I = Close;
             continue;
+          }
+        }
+      }
+      // A bare dispatch call such as box_set(Box(int) *, T) can spell its
+      // template argument at the call site. Scan it like the CLI does, but
+      // leave pointers and other non-type arguments alone. Affixed dispatch
+      // calls were already skipped above, so this is truncate-only.
+      if (DispatchTruncate) {
+        SmallVector<const TemplateDef *, 2> OpDefs;
+        Registry.findDispatchOps(Ident, OpDefs);
+        if (!OpDefs.empty()) {
+          unsigned K = End;
+          while (K < S.size() && isSpace(S[K]))
+            ++K;
+          if (K < S.size() && S[K] == '(') {
+            unsigned Start = K + 1;
+            int Depth = 1;
+            unsigned Close = Start;
+            for (; Close < S.size() && Depth > 0; ++Close) {
+              if (S[Close] == '(')
+                ++Depth;
+              else if (S[Close] == ')')
+                --Depth;
+            }
+            if (Depth == 0 && Close > Start + 1) {
+              // Pointer and non-type arguments are already filtered by
+              // dispatchTypeArgsFromCall(). Every owner of the shared spelling
+              // must see the same call, but only once per template.
+              std::string Type = dispatchTypeArgsFromCall(
+                  S.slice(Start, Close - 1), Registry);
+              if (!Type.empty()) {
+                SmallVector<const TemplateDef *, 2> Scanned;
+                for (const TemplateDef *OpDef : OpDefs) {
+                  if (std::find(Scanned.begin(), Scanned.end(), OpDef) !=
+                      Scanned.end())
+                    continue;
+                  scanTemplateUsage(*OpDef, Type, Registry, Out, ScanHeaders);
+                  Scanned.push_back(OpDef);
+                }
+              }
+              I = Close;
+              continue;
+            }
           }
         }
       }

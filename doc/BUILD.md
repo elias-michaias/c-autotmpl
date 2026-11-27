@@ -218,6 +218,9 @@ Restart clangd after replacing the module. A verbose run should show lines like:
 [c-autotmpl] workspace scan complete
 ```
 
+With `dispatch=1`, selectors are written to `/project/gen/dispatch.h`; include it
+after the generated instantiation headers and before call sites.
+
 ### Platform notes
 
 Linux is the main development platform and uses the `.so` name from the

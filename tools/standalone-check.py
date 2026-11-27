@@ -500,6 +500,7 @@ static inline int box_secret(T)(Box(T) *b) { return b->value; }
 #include "gen/vec.h"
 #include "gen/pair.h"
 #include "gen/box.h"
+#include "gen/dispatch.h"
 
 int main(void) {
   vec(int) v = {0};
@@ -520,6 +521,7 @@ int main(void) {
         generated = os.path.join(root, "gen", "vec.h")
         generated_pair = os.path.join(root, "gen", "pair.h")
         generated_box = os.path.join(root, "gen", "box.h")
+        generated_dispatch = os.path.join(root, "gen", "dispatch.h")
         write(os.path.join(root, "autotmpl.conf"), """\
 # project settings
 profile=stc
@@ -543,9 +545,27 @@ dispatch=1
 
         with open(generated) as f:
             content = f.read()
+        for needle in ("/* c-autotmpl: vec(int) */",
+                       "/* c-autotmpl: vec(float) */",
+                       "#ifndef C_AUTOTMPL_vec_int",
+                       "#ifndef C_AUTOTMPL_vec_float"):
+            require(needle in content, "missing instantiation text: " + needle,
+                    content)
+        require("c-autotmpl dispatch begin" not in content,
+                "dispatch leaked into a per-template header", content)
+        with open(generated_pair) as f:
+            pair_content = f.read()
+        require("c-autotmpl dispatch begin" not in pair_content,
+                "pair dispatch leaked into a per-template header", pair_content)
+        with open(generated_box) as f:
+            box_content = f.read()
+        require("c-autotmpl dispatch begin" not in box_content,
+                "Box dispatch leaked into a per-template header", box_content)
+
+        with open(generated_dispatch) as f:
+            dispatch_content = f.read()
         for needle in ("/* c-autotmpl dispatch begin vec */",
                        "/* c-autotmpl dispatch end vec */",
-                       "#ifdef C_AUTOTMPL_vec_int",
                        "vec_int: vec_int_push",
                        "vec_int: vec_int_clear",
                        "vec_int: vec_int_size",
@@ -554,44 +574,42 @@ dispatch=1
                        "#define $vec_clear(...)",
                        "#define $vec_size(...)",
                        "#define $vec_pick(...)"):
-            require(needle in content, "missing dispatch text: " + needle,
-                    content)
-        require("$helper" not in content and
-                "C_AUTOTMPL_DISPATCH_vec_vec_helper" not in content,
+            require(needle in dispatch_content,
+                    "missing dispatch text: " + needle, dispatch_content)
+        require("$helper" not in dispatch_content and
+                "C_AUTOTMPL_DISPATCH_vec_vec_helper" not in dispatch_content,
                 "ordinary helper was treated as a dispatch operation",
-                content)
-        with open(generated_pair) as f:
-            pair_content = f.read()
+                dispatch_content)
         for needle in ("/* c-autotmpl dispatch begin pair */",
                        "#ifdef C_AUTOTMPL_pair_int_2C_20float",
                        "_Generic((p2), pair_int_float: pair_int_float_sum",
                        "#define $pair_sum(...)"):
-            require(needle in pair_content,
+            require(needle in dispatch_content,
                     "two-arity dispatch text is missing: " + needle,
-                    pair_content)
-        require("c-autotmpl dispatch begin vec_push" not in content,
-                "dispatch macro call was scanned as a mangled type", content)
-        with open(generated_box) as f:
-            box_content = f.read()
+                    dispatch_content)
+        require("c-autotmpl dispatch begin vec_push" not in dispatch_content,
+                "dispatch macro call was scanned as a mangled type",
+                dispatch_content)
         for needle in ("/* c-autotmpl dispatch begin Box */",
                        "Box_int: box_alloc_int", "Box_int*: box_alloc_int",
                        "Box_int: box_free_int", "Box_int*: box_free_int",
                        "Box_int: inspect", "Box_int*: inspect",
                        "#define $box_alloc(...)", "#define $box_free(...)",
                        "#define $inspect(...)"):
-            require(needle in box_content,
+            require(needle in dispatch_content,
                     "signature-based dispatch text is missing: " + needle,
-                    box_content)
-        require("$Box_alloc(...)" not in box_content and
-                "$Box_free(...)" not in box_content,
-                "dispatch macro did not use the function spelling", box_content)
-        require("$_Alignas(...)" not in box_content,
+                    dispatch_content)
+        require("$Box_alloc(...)" not in dispatch_content and
+                "$Box_free(...)" not in dispatch_content,
+                "dispatch macro did not use the function spelling",
+                dispatch_content)
+        require("$_Alignas(...)" not in dispatch_content,
                 "struct alignment attribute was treated as a function",
-                box_content)
-        require("$box_secret(...)" not in box_content and
-                "C_AUTOTMPL_DISPATCH_Box_box_secret" not in box_content,
+                dispatch_content)
+        require("$box_secret(...)" not in dispatch_content and
+                "C_AUTOTMPL_DISPATCH_Box_box_secret" not in dispatch_content,
                 "implementation-only helper was treated as a dispatch op",
-                box_content)
+                dispatch_content)
 
         compiler = os.environ.get("CC") or next(
             (name for name in ("cc", "gcc", "clang") if shutil.which(name)),
@@ -615,15 +633,18 @@ dispatch=1
         output = rerun.stdout + rerun.stderr
         require(rerun.returncode == 0 and "added=0" in output,
                 "dispatch output was not idempotent", output)
-        with open(generated) as f:
-            content = f.read()
-        require(content.count("/* c-autotmpl dispatch begin vec */") == 1,
-                "dispatch section was duplicated", content)
+        with open(generated_dispatch) as f:
+            dispatch_content = f.read()
+        require(dispatch_content.count(
+            "/* c-autotmpl dispatch begin vec */") == 1,
+                "dispatch section was duplicated", dispatch_content)
 
         os.remove(generated)
         os.remove(generated_pair)
         if os.path.exists(generated_box):
             os.remove(generated_box)
+        if os.path.exists(generated_dispatch):
+            os.remove(generated_dispatch)
         builtin_env = dict(env)
         builtin_env["C_AUTOTMPL_DISPATCH_BACKEND"] = "builtin"
         proc = subprocess.run(args, cwd=root, capture_output=True, text=True,
@@ -631,14 +652,14 @@ dispatch=1
         output = proc.stdout + proc.stderr
         require(proc.returncode == 0 and "dispatch backend=builtin" in output,
                 "builtin dispatch backend was not selected", output)
-        with open(generated) as f:
-            content = f.read()
+        with open(generated_dispatch) as f:
+            dispatch_content = f.read()
         for needle in ("__builtin_types_compatible_p(__typeof__(p1), vec_int)",
                        "__builtin_types_compatible_p(__typeof__(p1), vec_int*)",
                        "__builtin_choose_expr"):
-            require(needle in content,
+            require(needle in dispatch_content,
                     "builtin dispatch selectors are missing: " + needle,
-                    content)
+                    dispatch_content)
         if compiler:
             built = subprocess.run(
                 [compiler, "-std=c99", "-Wall", "-Wextra", "-Werror",
@@ -653,8 +674,11 @@ dispatch=1
         os.remove(generated_pair)
         if os.path.exists(generated_box):
             os.remove(generated_box)
+        if os.path.exists(generated_dispatch):
+            os.remove(generated_dispatch)
         write(source, """\
 #include "gen/vec.h"
+#include "gen/dispatch.h"
 
 int main(void) {
   vec(int) v = {0};
@@ -670,10 +694,10 @@ int main(void) {
                               env=postfix_env)
         require(proc.returncode == 0, "filtered dispatch run exited with error",
                 proc.stdout + proc.stderr)
-        with open(generated) as f:
-            content = f.read()
-        require("dispatch begin" not in content,
-                "template filter did not disable dispatch", content)
+        with open(generated_dispatch) as f:
+            dispatch_content = f.read()
+        require("dispatch begin" not in dispatch_content,
+                "template filter did not disable dispatch", dispatch_content)
 
         postfix_env["C_AUTOTMPL_DISPATCH_TEMPLATES"] = "vec"
         proc = subprocess.run(args, cwd=root, capture_output=True, text=True,
@@ -681,11 +705,11 @@ int main(void) {
         output = proc.stdout + proc.stderr
         require(proc.returncode == 0 and "dispatch templates=1" in output,
                 "custom postfix dispatch run exited with error", output)
-        with open(generated) as f:
-            content = f.read()
-        require("#define vec_push_dispatch(...)" in content and
-                "#define vec_push$(...)" not in content,
-                "custom postfix affix was not used", content)
+        with open(generated_dispatch) as f:
+            dispatch_content = f.read()
+        require("#define vec_push_dispatch(...)" in dispatch_content and
+                "#define vec_push$(...)" not in dispatch_content,
+                "custom postfix affix was not used", dispatch_content)
         if compiler:
             built = subprocess.run(
                 [compiler, "-std=c11", "-Wall", "-Wextra", "-Werror",
@@ -699,8 +723,11 @@ int main(void) {
         os.remove(generated)
         if os.path.exists(generated_pair):
             os.remove(generated_pair)
+        if os.path.exists(generated_dispatch):
+            os.remove(generated_dispatch)
         write(source, """\
 #include "gen/vec.h"
+#include "gen/dispatch.h"
 
 int main(void) {
   vec(int) v = {0};
@@ -716,18 +743,21 @@ int main(void) {
         require(proc.returncode == 0,
                 "removed dispatch_suffix run exited with error",
                 proc.stdout + proc.stderr)
-        with open(generated) as f:
-            content = f.read()
-        require("#define $vec_push(...)" in content and
-                "#define vec_push_dispatch(...)" not in content,
+        with open(generated_dispatch) as f:
+            dispatch_content = f.read()
+        require("#define $vec_push(...)" in dispatch_content and
+                "#define vec_push_dispatch(...)" not in dispatch_content,
                 "removed dispatch_suffix option still affected generation",
-                content)
+                dispatch_content)
 
         os.remove(generated)
         if os.path.exists(generated_pair):
             os.remove(generated_pair)
+        if os.path.exists(generated_dispatch):
+            os.remove(generated_dispatch)
         write(source, """\
 #include "gen/vec.h"
+#include "gen/dispatch.h"
 
 int main(void) {
   vec(int) v = {0};
@@ -745,11 +775,12 @@ int main(void) {
         require(proc.returncode == 0 and "dispatch affix=m" in output and
                 "dispatch style=prefix" in output,
                 "custom prefix dispatch run exited with error", output)
-        with open(generated) as f:
-            content = f.read()
-        require("#define mvec_push(...)" in content and
-                "#define $vec_push(...)" not in content,
-                "custom dispatch affix was not used as a prefix", content)
+        with open(generated_dispatch) as f:
+            dispatch_content = f.read()
+        require("#define mvec_push(...)" in dispatch_content and
+                "#define $vec_push(...)" not in dispatch_content,
+                "custom dispatch affix was not used as a prefix",
+                dispatch_content)
         if compiler:
             built = subprocess.run(
                 [compiler, "-std=c11", "-Wall", "-Wextra", "-Werror",
@@ -763,6 +794,8 @@ int main(void) {
         os.remove(generated)
         if os.path.exists(generated_pair):
             os.remove(generated_pair)
+        if os.path.exists(generated_dispatch):
+            os.remove(generated_dispatch)
         os.remove(os.path.join(root, "autotmpl.conf"))
         write(source, """\
 #include "gen/vec.h"
@@ -779,10 +812,13 @@ int main(void) {
                                            C_AUTOTMPL_STC_TEMPLATES="vec"))
         require(proc.returncode == 0, "default dispatch run exited with error",
                 proc.stdout + proc.stderr)
-        with open(generated) as f:
-            content = f.read()
-        require("dispatch begin" not in content,
-                "dispatch was enabled without opt-in", content)
+        if os.path.exists(generated_dispatch):
+            with open(generated_dispatch) as f:
+                dispatch_content = f.read()
+        else:
+            dispatch_content = ""
+        require("dispatch begin" not in dispatch_content,
+                "dispatch was enabled without opt-in", dispatch_content)
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -830,6 +866,7 @@ static inline void slab_set_int(Slab(int) *s, int v) { s->value = v; }
 #include "gen/box.h"
 #include "gen/pair.h"
 #include "gen/slab.h"
+#include "gen/dispatch.h"
 
 int main(void) {
   Box(int) a = {1};
@@ -854,6 +891,7 @@ dispatch_truncate=1
         generated_box = os.path.join(root, "gen", "box.h")
         generated_pair = os.path.join(root, "gen", "pair.h")
         generated_slab = os.path.join(root, "gen", "slab.h")
+        generated_dispatch = os.path.join(root, "gen", "dispatch.h")
         # A configured affix is ignored in truncate mode: public macros are
         # exactly the op spellings from the template header.
         env = env_with(C_AUTOTMPL_DISPATCH_AFFIX="m",
@@ -867,46 +905,48 @@ dispatch_truncate=1
         require("dispatch truncate=1" in output and "dispatch affix=none" in
                 output, "truncate dispatch was not reported", output)
 
-        with open(generated_box) as f:
-            box_content = f.read()
+        for path in (generated_box, generated_slab, generated_pair):
+            with open(path) as f:
+                require("c-autotmpl dispatch begin" not in f.read(),
+                        "dispatch leaked into a per-template header", path)
+
+        with open(generated_dispatch) as f:
+            dispatch_content = f.read()
         for needle in ("/* c-autotmpl dispatch begin Box */",
                        "Box_int: box_set_int", "Box_float: box_set_float",
                        "#define box_set(...)", "#define box_get(...)"):
-            require(needle in box_content,
+            require(needle in dispatch_content,
                     "truncated Box dispatch is missing: " + needle,
-                    box_content)
-        require("#define mbox_set(...)" not in box_content and
-                "#define $box_set(...)" not in box_content,
-                "truncate mode kept a configured affix", box_content)
-        require("C_AUTOTMPL_DISPATCH_SEL_Box_box_set_" in box_content and
-                "C_AUTOTMPL_DISPATCH_SEL_Box_box_set_impl_" not in box_content,
+                    dispatch_content)
+        require("#define mbox_set(...)" not in dispatch_content and
+                "#define $box_set(...)" not in dispatch_content,
+                "truncate mode kept a configured affix", dispatch_content)
+        require("C_AUTOTMPL_DISPATCH_SEL_Box_box_set_" in dispatch_content and
+                "C_AUTOTMPL_DISPATCH_SEL_Box_box_set_impl_" not in
+                dispatch_content,
                 "_impl suffix leaked into the public operation name",
-                box_content)
-        require("dispatch begin box_set" not in box_content,
-                "dispatch call was scanned as a mangled type", box_content)
+                dispatch_content)
+        require("dispatch begin box_set" not in dispatch_content,
+                "dispatch call was scanned as a mangled type", dispatch_content)
 
-        with open(generated_slab) as f:
-            slab_content = f.read()
         for needle in ("/* c-autotmpl dispatch begin Slab */",
                        "Slab_int: slab_set_int", "#define slab_set(...)"):
-            require(needle in slab_content,
+            require(needle in dispatch_content,
                     "concrete-only truncate dispatch is missing: " + needle,
-                    slab_content)
+                    dispatch_content)
 
-        with open(generated_pair) as f:
-            pair_content = f.read()
         for needle in ("/* c-autotmpl dispatch begin pair */",
                        "pair_int_float: pair_set_int_float",
                        "pair_float_int: pair_set_float_int",
                        "#define pair_set(...)"):
-            require(needle in pair_content,
+            require(needle in dispatch_content,
                     "truncated two-argument dispatch is missing: " + needle,
-                    pair_content)
-        require("C_AUTOTMPL_DISPATCH_SEL_pair_pair_set_" in pair_content and
+                    dispatch_content)
+        require("C_AUTOTMPL_DISPATCH_SEL_pair_pair_set_" in dispatch_content and
                 "C_AUTOTMPL_DISPATCH_SEL_pair_pair_set_impl_" not in
-                pair_content,
+                dispatch_content,
                 "_impl suffix leaked into a two-argument operation name",
-                pair_content)
+                dispatch_content)
 
         compiler = os.environ.get("CC") or next(
             (name for name in ("cc", "gcc", "clang") if shutil.which(name)),
@@ -1023,6 +1063,7 @@ static inline Result(T, V) map_impl(T, U, V)(Result(T, U) r, V (*f)(T)) {
         source = os.path.join(root, "main.c")
         write(source, """\
 #include "gen/result.h"
+#include "gen/dispatch.h"
 static float from_int(int x) { return (float)x / 2.0f; }
 static float from_double(double x) { return (float)x / 2.0f; }
 int main(void) {
@@ -1049,6 +1090,9 @@ dispatch_truncate=1
                     output)
 
         with open(os.path.join(root, "gen", "result.h")) as f:
+            require("c-autotmpl dispatch begin" not in f.read(),
+                    "explicit method dispatch leaked into gen/result.h")
+        with open(os.path.join(root, "gen", "dispatch.h")) as f:
             dispatch = f.read()
         require("#define map(E1) C_AUTOTMPL_DISPATCH_CAT(map_, E1)" in dispatch,
                 "curried method macro was not emitted", dispatch)
@@ -1082,6 +1126,179 @@ dispatch_truncate=1
         output = rerun.stdout + rerun.stderr
         require(rerun.returncode == 0 and "added=0" in output,
                 "explicit method generation was not idempotent", output)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def check_shared_dispatch(cli):
+    root = tempfile.mkdtemp(prefix="c-autotmpl-shared-dispatch-")
+    try:
+        os.makedirs(os.path.join(root, "tmpl"))
+        os.makedirs(os.path.join(root, "gen"))
+        write(os.path.join(root, "tmpl", "option.h"), """\
+// -- template type Option(T)
+#define OCAT_I(A, B) A##B
+#define OCAT(A, B) OCAT_I(A, B)
+#define OCAT4_I(A, B, C, D) A##B##C##D
+#define OCAT4(A, B, C, D) OCAT4_I(A, B, C, D)
+#define Option(T) OCAT(Option_, T)
+typedef struct { T value; } Option(T);
+
+// -- template function option_map_impl(T, U)
+// -- dispatch method Option.map explicit U
+#define option_map_impl(T, U) OCAT4(map_, T, _, U)
+static inline Option(U) option_map_impl(T, U)(Option(T) x, U (*f)(T)) {
+  Option(U) out = {f(x.value)};
+  return out;
+}
+""")
+        write(os.path.join(root, "tmpl", "result.h"), """\
+// -- template type Result(T, U)
+#define RCAT4_I(A, B, C, D) A##B##C##D
+#define RCAT4(A, B, C, D) RCAT4_I(A, B, C, D)
+#define RCAT6_I(A, B, C, D, E, F) A##B##C##D##E##F
+#define RCAT6(A, B, C, D, E, F) RCAT6_I(A, B, C, D, E, F)
+#define Result(T, U) RCAT4(Result_, T, _, U)
+typedef struct { T ok; U err; } Result(T, U);
+
+// -- template function result_map_impl(T, U, V)
+// -- dispatch method Result.map explicit V
+#define result_map_impl(T, U, V) RCAT6(map_, T, _, U, _, V)
+static inline Result(V, U) result_map_impl(T, U, V)(Result(T, U) x,
+                                                    V (*f)(T)) {
+  Result(V, U) out = {f(x.ok), x.err};
+  return out;
+}
+""")
+        source = os.path.join(root, "main.c")
+        write(source, """\
+#include "gen/option.h"
+#include "gen/result.h"
+#include "gen/dispatch.h"
+
+static int twice(int x) { return x * 2; }
+static float half(int x) { return (float)x / 2.0f; }
+
+int main(void) {
+  Option(int) o = {7};
+  Result(int, float) r = {11, 0};
+  Option(int) om = map(int)(o, twice);
+  Option(float) omf = map(float)(o, half);
+  Result(int, float) rm = map(int)(r, twice);
+  Result(float, float) rmf = map(float)(r, half);
+  return (om.value == 14 && omf.value == 3.5f && rm.ok == 22 &&
+          rmf.ok == 5.5f) ? 0 : 1;
+}
+""")
+        write(os.path.join(root, "autotmpl.conf"), """\
+dispatch=1
+dispatch_truncate=1
+""")
+        args = [cli, "--root", root, "--verbose", source]
+        proc = subprocess.run(args, cwd=root, capture_output=True, text=True,
+                              env=env_with())
+        output = proc.stdout + proc.stderr
+        require(proc.returncode == 0, "shared dispatch run exited with error",
+                output)
+        for needle in ("generated option_map_impl(int, int)",
+                       "generated option_map_impl(int, float)",
+                       "generated result_map_impl(int, float, int)",
+                       "generated result_map_impl(int, float, float)"):
+            require(needle in output,
+                    "shared dispatch did not synthesize both owners: " + needle,
+                    output)
+
+        for name in ("option.h", "result.h"):
+            with open(os.path.join(root, "gen", name)) as f:
+                require("c-autotmpl dispatch begin" not in f.read(),
+                        "dispatch leaked into gen/" + name)
+
+        with open(os.path.join(root, "gen", "dispatch.h")) as f:
+            dispatch = f.read()
+        for needle in ("/* c-autotmpl dispatch begin Option.map */",
+                       "/* c-autotmpl dispatch begin Result.map */",
+                       "/* c-autotmpl dispatch begin shared.map */",
+                       "Option_int: map_int_int",
+                       "Result_int_float: map_int_float_int",
+                       "Result_int_float: map_int_float_float"):
+            require(needle in dispatch,
+                    "shared dispatch is missing: " + needle, dispatch)
+        require(dispatch.count("#define map(E1) ") == 1 and
+                dispatch.count("#define map_int(...) ") == 1 and
+                dispatch.count("#define map_float(...) ") == 1,
+                "public map macros must be emitted exactly once", dispatch)
+        chained = re.search(
+            r"#define C_AUTOTMPL_DISPATCH_SEL_Result_map_int_1\(p1\) "
+            r"C_AUTOTMPL_DISPATCH_SEL_Option_map_int_1_\d+\(p1\)",
+            dispatch,
+        ) or re.search(
+            r"#define C_AUTOTMPL_DISPATCH_SEL_Option_map_int_1\(p1\) "
+            r"C_AUTOTMPL_DISPATCH_SEL_Result_map_int_1_\d+\(p1\)",
+            dispatch,
+        )
+        require(chained, "owner selector tables were not chained", dispatch)
+
+        compiler = os.environ.get("CC") or next(
+            (name for name in ("cc", "gcc", "clang") if shutil.which(name)),
+            None,
+        )
+        if compiler:
+            built = subprocess.run(
+                [compiler, "-std=c11", "-Wall", "-Wextra", "-Werror",
+                 "main.c", "-o", "shared-dispatch-demo"],
+                cwd=root, capture_output=True, text=True,
+            )
+            require(built.returncode == 0,
+                    "shared dispatch output did not compile",
+                    built.stdout + built.stderr)
+            ran = subprocess.run([os.path.join(root, "shared-dispatch-demo")],
+                                 cwd=root)
+            require(ran.returncode == 0, "shared dispatch output did not run")
+
+        rerun = subprocess.run(args, cwd=root, capture_output=True, text=True,
+                               env=env_with())
+        output = rerun.stdout + rerun.stderr
+        require(rerun.returncode == 0 and "added=0" in output,
+                "shared dispatch generation was not idempotent", output)
+
+        plugin_section = """\
+/* c-autotmpl dispatch begin Plugin.foreign */
+/* c-autotmpl generated-by=plugin */
+#define plugin_foreign_marker 1
+/* c-autotmpl dispatch end Plugin.foreign */
+"""
+        stale_section = """\
+/* c-autotmpl dispatch begin shared.stale */
+/* c-autotmpl generated-by=cli */
+#define stale_dispatch_marker 1
+/* c-autotmpl dispatch end shared.stale */
+"""
+        for path in (os.path.join(root, "gen", "dispatch.h"),
+                     os.path.join(root, "gen", "option.h")):
+            with open(path) as f:
+                content = f.read()
+            insert = content.rfind("#endif\n")
+            require(insert >= 0, "generated header has no guard: " + path)
+            write(path, content[:insert] + plugin_section + stale_section +
+                  content[insert:])
+
+        foreign_rerun = subprocess.run(args, cwd=root, capture_output=True,
+                                       text=True, env=env_with())
+        output = foreign_rerun.stdout + foreign_rerun.stderr
+        require(foreign_rerun.returncode == 0,
+                "regeneration with foreign sections failed", output)
+        with open(os.path.join(root, "gen", "dispatch.h")) as f:
+            dispatch = f.read()
+        with open(os.path.join(root, "gen", "option.h")) as f:
+            option = f.read()
+        for content, name in ((dispatch, "gen/dispatch.h"),
+                              (option, "gen/option.h")):
+            require("/* c-autotmpl dispatch begin Plugin.foreign */" in content,
+                    "CLI clobbered a plugin-owned section in " + name, content)
+            require("#define plugin_foreign_marker 1" in content,
+                    "CLI changed a plugin-owned section in " + name, content)
+            require("stale_dispatch_marker" not in content,
+                    "CLI kept a stale section in " + name, content)
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -1467,6 +1684,7 @@ def main():
     check_dispatch(cli)
     check_explicit_constructor_alias(cli)
     check_explicit_dispatch_method(cli)
+    check_shared_dispatch(cli)
     check_dispatch_truncate(cli)
     check_value_generics(cli)
     check_preprocess(cli)

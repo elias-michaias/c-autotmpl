@@ -5,6 +5,9 @@ Builds a tiny project and opens a source file with unsaved text in a real clangd
 LSP session. The plugin must:
 
   * generate instantiations from that unsaved text before the first parse;
+  * collect dispatch selectors into gen/dispatch.h with owner sections and one
+    shared public macro per operation, including same-name methods from several
+    templates;
   * expand nested applications such as Thing(Box(float)) and deep chains
     such as Thing(Box(Thing(float)));
   * guard user-defined types by their header guard;
@@ -16,6 +19,7 @@ LSP session. The plugin must:
 
 import json
 import os
+import re
 import select
 import shutil
 import subprocess
@@ -208,6 +212,7 @@ static inline int box_secret(T)(Box(T) *b) { return b->value; }
         text = """\
 #include "gen/vec.h"
 #include "gen/box.h"
+#include "gen/dispatch.h"
 
 int main(void) {
   vec(int) v = {0};
@@ -221,6 +226,7 @@ int main(void) {
 """
         generated = os.path.join(root, "gen", "vec.h")
         generated_box = os.path.join(root, "gen", "box.h")
+        generated_dispatch = os.path.join(root, "gen", "dispatch.h")
         log_path = os.path.join(root, "clangd.log")
         uri = "file://" + source
         write(os.path.join(root, "autotmpl.conf"), """\
@@ -270,34 +276,58 @@ dispatch=1
                     }},
                 })
                 content = wait_for_content(generated, lambda c: (
-                    "/* c-autotmpl dispatch begin vec */" in c and
-                    "#ifdef C_AUTOTMPL_vec_int" in c and
-                    "#define $vec_int_push(...)" in c and
-                    "#define $vec_int_set(...)" in c
+                    "/* c-autotmpl: vec(int) */" in c and
+                    "#ifdef C_AUTOTMPL_vec_int" in c
                 ))
                 if content is None:
+                    print("plugin vec instantiation was not generated",
+                          file=sys.stderr)
+                    with open(log_path, errors="replace") as f:
+                        print(f.read()[-4000:], file=sys.stderr)
+                    return 1
+                if "c-autotmpl dispatch begin" in content:
+                    print("plugin dispatch leaked into gen/vec.h",
+                          file=sys.stderr)
+                    return 1
+                box_content = wait_for_content(generated_box, lambda c: (
+                    "/* c-autotmpl: Box(int) */" in c and
+                    "#ifdef C_AUTOTMPL_Box_int" in c
+                ))
+                if box_content is None:
+                    print("plugin Box instantiation was not generated",
+                          file=sys.stderr)
+                    with open(log_path, errors="replace") as f:
+                        print(f.read()[-4000:], file=sys.stderr)
+                    return 1
+                if "c-autotmpl dispatch begin" in box_content:
+                    print("plugin dispatch leaked into gen/box.h",
+                          file=sys.stderr)
+                    return 1
+                dispatch_content = wait_for_content(
+                    generated_dispatch,
+                    lambda c: (
+                        "/* c-autotmpl generated-by=plugin */" in c and
+                        "/* c-autotmpl dispatch begin vec */" in c and
+                        "/* c-autotmpl dispatch begin Box */" in c and
+                        "#define $vec_int_push(...)" in c and
+                        "#define $vec_int_set(...)" in c and
+                        "#define $box_alloc(...)" in c and
+                        "#define $box_free(...)" in c and
+                        "Box_int: box_alloc_int" in c and
+                        "Box_int: box_free_int" in c
+                    ),
+                )
+                if dispatch_content is None:
                     print("plugin dispatch was not generated", file=sys.stderr)
                     with open(log_path, errors="replace") as f:
                         print(f.read()[-4000:], file=sys.stderr)
                     return 1
-                if "/* c-autotmpl dispatch begin vec_push */" in content:
+                if ("/* c-autotmpl dispatch begin vec_push */" in
+                        dispatch_content):
                     print("plugin scanned a dispatch macro as a type",
                           file=sys.stderr)
                     return 1
-                box_content = wait_for_content(generated_box, lambda c: (
-                    "/* c-autotmpl dispatch begin Box */" in c and
-                    "#define $box_alloc(...)" in c and
-                    "#define $box_free(...)" in c and
-                    "Box_int: box_alloc_int" in c and
-                    "Box_int: box_free_int" in c
-                ))
-                if box_content is None:
-                    print("plugin signature-based dispatch was not generated",
-                          file=sys.stderr)
-                    with open(log_path, errors="replace") as f:
-                        print(f.read()[-4000:], file=sys.stderr)
-                    return 1
-                if "box_secret" in box_content:
+                if "box_secret" in dispatch_content:
                     print("plugin exposed an implementation-only helper",
                           file=sys.stderr)
                     return 1
@@ -308,7 +338,7 @@ dispatch=1
                     "method": "textDocument/definition",
                     "params": {
                         "textDocument": {"uri": uri},
-                        "position": {"line": 5, "character": 3},
+                        "position": {"line": 6, "character": 3},
                     },
                 })
                 response = receive_response(proc, 3)
@@ -331,7 +361,7 @@ dispatch=1
                     "method": "textDocument/definition",
                     "params": {
                         "textDocument": {"uri": uri},
-                        "position": {"line": 8, "character": 3},
+                        "position": {"line": 9, "character": 3},
                     },
                 })
                 response = receive_response(proc, 4)
@@ -360,7 +390,7 @@ dispatch=1
                     "method": "textDocument/completion",
                     "params": {
                         "textDocument": {"uri": uri},
-                        "position": {"line": 9, "character": 2},
+                        "position": {"line": 10, "character": 2},
                     },
                 })
                 response = receive_response(proc, 5)
@@ -396,10 +426,13 @@ dispatch=1
                     },
                 })
                 content = wait_for_content(generated, lambda c: (
-                    "dispatch begin" not in c and
                     "/* c-autotmpl: vec(int) */" not in c
                 ))
-                if content is None:
+                dispatch_after = wait_for_content(
+                    generated_dispatch,
+                    lambda c: "dispatch begin" not in c,
+                )
+                if content is None or dispatch_after is None:
                     print("plugin dispatch was not pruned", file=sys.stderr)
                     with open(log_path, errors="replace") as f:
                         print(f.read()[-4000:], file=sys.stderr)
@@ -456,6 +489,7 @@ static inline Result(T, V) map_impl(T, U, V)(Result(T, U) r, V (*f)(T)) {
         write(source, "int main(void) { return 0; }\n")
         text = """\
 #include "gen/result.h"
+#include "gen/dispatch.h"
 static float from_int(int x) { return (float)x / 2.0f; }
 static Result(int, float) keep(Result(int, float) r) { return r; }
 int main(void) {
@@ -466,6 +500,7 @@ int main(void) {
 }
 """
         result_header = os.path.join(root, "gen", "result.h")
+        dispatch_header = os.path.join(root, "gen", "dispatch.h")
         impl_header = os.path.join(root, "gen", "map_impl.h")
         log_path = os.path.join(root, "clangd.log")
         write(os.path.join(root, "autotmpl.conf"), """\
@@ -503,19 +538,38 @@ dispatch_templates=Result
                     }},
                 })
                 content = wait_for_content(result_header, lambda c: (
-                    "/* c-autotmpl: Result(int, float) */" in c and
+                    "/* c-autotmpl: Result(int, float) */" in c
+                ))
+                if content is None:
+                    print("plugin Result instantiation was not generated",
+                          file=sys.stderr)
+                    with open(log_path, errors="replace") as f:
+                        print(f.read()[-4000:], file=sys.stderr)
+                    return 1
+                if "c-autotmpl dispatch begin" in content:
+                    print("plugin dispatch leaked into gen/result.h",
+                          file=sys.stderr)
+                    return 1
+                if "/* c-autotmpl: Result(float) */" in content:
+                    print("plugin treated the explicit method arg as a type",
+                          file=sys.stderr)
+                    return 1
+                dispatch = wait_for_content(dispatch_header, lambda c: (
+                    "/* c-autotmpl generated-by=plugin */" in c and
                     "/* c-autotmpl dispatch begin Result.map */" in c and
+                    "/* c-autotmpl dispatch begin shared.map */" in c and
                     "#define map(E1) C_AUTOTMPL_DISPATCH_CAT(map_, E1)" in c and
                     "Result_int_float: map_int_float_float" in c
                 ))
-                if content is None:
+                if dispatch is None:
                     print("plugin explicit-method dispatch was not generated",
                           file=sys.stderr)
                     with open(log_path, errors="replace") as f:
                         print(f.read()[-4000:], file=sys.stderr)
                     return 1
-                if "/* c-autotmpl: Result(float) */" in content:
-                    print("plugin treated the explicit method arg as a type",
+                if ("dispatch begin shared.Ok" in dispatch or
+                        "dispatch begin shared.Err" in dispatch):
+                    print("plugin generated datatype-owned constructor dispatch",
                           file=sys.stderr)
                     return 1
                 impl = wait_for_content(impl_header, lambda c: (
@@ -621,6 +675,7 @@ static inline void pair_set_impl(T, U)(pair(T, U) *p, T a, U b) {
         text = """\
 #include "gen/box.h"
 #include "gen/pair.h"
+#include "gen/dispatch.h"
 
 int main(void) {
   Box(int) a = {1};
@@ -635,6 +690,7 @@ int main(void) {
 """
         generated = os.path.join(root, "gen", "box.h")
         generated_pair = os.path.join(root, "gen", "pair.h")
+        generated_dispatch = os.path.join(root, "gen", "dispatch.h")
         log_path = os.path.join(root, "clangd.log")
         uri = "file://" + source
         write(os.path.join(root, "autotmpl.conf"), """\
@@ -681,41 +737,65 @@ dispatch_truncate=1
                     }},
                 })
                 content = wait_for_content(generated, lambda c: (
-                    "/* c-autotmpl dispatch begin Box */" in c and
-                    "#define box_set(...)" in c and
-                    "#define box_get(...)" in c and
-                    "Box_int: box_set_int" in c and
-                    "Box_float: box_set_float" in c
+                    "/* c-autotmpl: Box(int) */" in c and
+                    "#ifdef C_AUTOTMPL_Box_int" in c
                 ))
                 if content is None:
+                    print("plugin Box instantiation was not generated",
+                          file=sys.stderr)
+                    with open(log_path, errors="replace") as f:
+                        print(f.read()[-4000:], file=sys.stderr)
+                    return 1
+                if "c-autotmpl dispatch begin" in content:
+                    print("plugin dispatch leaked into gen/box.h",
+                          file=sys.stderr)
+                    return 1
+
+                pair_content = wait_for_content(generated_pair, lambda c: (
+                    "/* c-autotmpl: pair(int, float) */" in c and
+                    "#ifdef C_AUTOTMPL_pair_int_2C_20float" in c
+                ))
+                if pair_content is None:
+                    print("plugin pair instantiation was not generated",
+                          file=sys.stderr)
+                    with open(log_path, errors="replace") as f:
+                        print(f.read()[-4000:], file=sys.stderr)
+                    return 1
+                if "c-autotmpl dispatch begin" in pair_content:
+                    print("plugin dispatch leaked into gen/pair.h",
+                          file=sys.stderr)
+                    return 1
+
+                dispatch = wait_for_content(generated_dispatch, lambda c: (
+                    "/* c-autotmpl generated-by=plugin */" in c and
+                    "/* c-autotmpl dispatch begin Box */" in c and
+                    "/* c-autotmpl dispatch begin pair */" in c and
+                    "/* c-autotmpl dispatch begin shared.box_set */" in c and
+                    "/* c-autotmpl dispatch begin shared.pair_set */" in c and
+                    "#define box_set(...)" in c and
+                    "#define box_get(...)" in c and
+                    "#define pair_set(...)" in c and
+                    "Box_int: box_set_int" in c and
+                    "Box_float: box_set_float" in c and
+                    "pair_int_float: pair_set_int_float" in c
+                ))
+                if dispatch is None:
                     print("plugin truncated dispatch was not generated",
                           file=sys.stderr)
                     with open(log_path, errors="replace") as f:
                         print(f.read()[-4000:], file=sys.stderr)
                     return 1
-                if ("dispatch begin box_set" in content or
-                        "C_AUTOTMPL_DISPATCH_SEL_Box_box_set_impl_" in content):
+                if ("dispatch begin box_set" in dispatch or
+                        "C_AUTOTMPL_DISPATCH_SEL_Box_box_set_impl_" in dispatch):
                     print("plugin exposed an _impl name as a dispatch op",
                           file=sys.stderr)
                     return 1
-                if ("#define $box_set(...)" in content or
-                        "#define mbox_set(...)" in content):
+                if ("#define $box_set(...)" in dispatch or
+                        "#define mbox_set(...)" in dispatch):
                     print("plugin kept a dispatch affix in truncate mode",
                           file=sys.stderr)
                     return 1
-
-                pair_content = wait_for_content(generated_pair, lambda c: (
-                    "/* c-autotmpl dispatch begin pair */" in c and
-                    "#define pair_set(...)" in c and
-                    "pair_int_float: pair_set_int_float" in c
-                ))
-                if pair_content is None:
-                    print("plugin two-argument truncated dispatch missing",
-                          file=sys.stderr)
-                    with open(log_path, errors="replace") as f:
-                        print(f.read()[-4000:], file=sys.stderr)
-                    return 1
-                if "C_AUTOTMPL_DISPATCH_SEL_pair_pair_set_impl_" in pair_content:
+                if "C_AUTOTMPL_DISPATCH_SEL_pair_pair_set_impl_" in dispatch:
                     print("plugin exposed a two-argument _impl op",
                           file=sys.stderr)
                     return 1
@@ -728,7 +808,7 @@ dispatch_truncate=1
                     "method": "textDocument/definition",
                     "params": {
                         "textDocument": {"uri": uri},
-                        "position": {"line": 7, "character": 3},
+                        "position": {"line": 8, "character": 3},
                     },
                 })
                 response = receive_response(proc, 3)
@@ -755,7 +835,7 @@ dispatch_truncate=1
                     "method": "textDocument/completion",
                     "params": {
                         "textDocument": {"uri": uri},
-                        "position": {"line": 10, "character": 2},
+                        "position": {"line": 11, "character": 2},
                     },
                 })
                 response = receive_response(proc, 4)
@@ -791,14 +871,300 @@ dispatch_truncate=1
                     },
                 })
                 content = wait_for_content(generated, lambda c: (
-                    "dispatch begin" not in c and
                     "/* c-autotmpl: Box(int) */" not in c
                 ))
-                if content is None:
+                dispatch_after = wait_for_content(
+                    generated_dispatch,
+                    lambda c: "dispatch begin" not in c,
+                )
+                if content is None or dispatch_after is None:
                     print("plugin truncated dispatch was not pruned",
                           file=sys.stderr)
                     with open(log_path, errors="replace") as f:
                         print(f.read()[-4000:], file=sys.stderr)
+                    return 1
+            finally:
+                try:
+                    send(proc, {"jsonrpc": "2.0", "id": 2,
+                                "method": "shutdown", "params": None})
+                    send(proc, {"jsonrpc": "2.0", "method": "exit",
+                                "params": None})
+                    proc.wait(timeout=5)
+                except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
+                    proc.kill()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return 0
+
+
+def check_shared_dispatch(plugin):
+    root = tempfile.mkdtemp(prefix="c-autotmpl-lsp-shared-dispatch-")
+    try:
+        os.makedirs(os.path.join(root, "tmpl"))
+        os.makedirs(os.path.join(root, "gen"))
+        write(os.path.join(root, "tmpl", "option.h"), """\
+// -- template type Option(T)
+#define OCAT_I(A, B) A##B
+#define OCAT(A, B) OCAT_I(A, B)
+#define OCAT4_I(A, B, C, D) A##B##C##D
+#define OCAT4(A, B, C, D) OCAT4_I(A, B, C, D)
+#define Option(T) OCAT(Option_, T)
+typedef struct { T value; } Option(T);
+
+// -- template function option_map_impl(T, U)
+// -- dispatch method Option.map explicit U
+#define option_map_impl(T, U) OCAT4(map_, T, _, U)
+static inline Option(U) option_map_impl(T, U)(Option(T) x, U (*f)(T)) {
+  Option(U) out = {f(x.value)};
+  return out;
+}
+""")
+        write(os.path.join(root, "tmpl", "result.h"), """\
+// -- template type Result(T, U)
+#ifndef T
+typedef int T;
+#endif
+#ifndef U
+typedef float U;
+#endif
+#ifndef V
+typedef float V;
+#endif
+#define RCAT4_I(A, B, C, D) A##B##C##D
+#define RCAT4(A, B, C, D) RCAT4_I(A, B, C, D)
+#define RCAT6_I(A, B, C, D, E, F) A##B##C##D##E##F
+#define RCAT6(A, B, C, D, E, F) RCAT6_I(A, B, C, D, E, F)
+#define Result(T, U) RCAT4(Result_, T, _, U)
+typedef struct { T ok; U err; } Result(T, U);
+
+// -- template function result_map_impl(T, U, V)
+// -- dispatch method Result.map explicit V
+#define result_map_impl(T, U, V) RCAT6(map_, T, _, U, _, V)
+static inline Result(V, U) result_map_impl(T, U, V)(Result(T, U) x,
+                                                    V (*f)(T)) {
+  Result(V, U) out = {f(x.ok), x.err};
+  return out;
+}
+""")
+        source = os.path.join(root, "main.c")
+        write(source, "int main(void) { return 0; }\n")
+        text = """\
+#include "gen/option.h"
+#include "gen/result.h"
+#include "gen/dispatch.h"
+
+static int twice(int x) { return x * 2; }
+static float half(int x) { return (float)x / 2.0f; }
+
+int main(void) {
+  Option(int) o = {7};
+  Result(int, float) r = {11, 0};
+  Option(int) om = map(int)(o, twice);
+  Option(float) omf = map(float)(o, half);
+  Result(int, float) rm = map(int)(r, twice);
+  Result(float, float) rmf = map(float)(r, half);
+  return (om.value == 14 && omf.value == 3.5f && rm.ok == 22 &&
+          rmf.ok == 5.5f) ? 0 : 1;
+}
+"""
+        option_header = os.path.join(root, "gen", "option.h")
+        result_header = os.path.join(root, "gen", "result.h")
+        dispatch_header = os.path.join(root, "gen", "dispatch.h")
+        log_path = os.path.join(root, "clangd.log")
+        cli_section = """\
+/* c-autotmpl dispatch begin shared.cli_owned */
+/* c-autotmpl generated-by=cli */
+#define cli_owned_marker 1
+/* c-autotmpl dispatch end shared.cli_owned */
+"""
+        write(dispatch_header, "#ifndef GEN_DISPATCH_H\n#define GEN_DISPATCH_H\n\n"
+              + cli_section + "\n#endif\n")
+        write(option_header, "#ifndef GEN_OPTION_H\n#define GEN_OPTION_H\n\n"
+              + cli_section + "\n#endif\n")
+        write(os.path.join(root, "autotmpl.conf"), """\
+dispatch=1
+dispatch_truncate=1
+""")
+        with open(log_path, "wb") as log:
+            proc = subprocess.Popen(
+                ["clangd", "--log=verbose", "--load=" + plugin],
+                cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=log, env=plugin_env(),
+            )
+            try:
+                send(proc, {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "processId": None,
+                        "rootUri": "file://" + root,
+                        "capabilities": {},
+                    },
+                })
+                send(proc, {"jsonrpc": "2.0", "method": "initialized",
+                            "params": {}})
+                send(proc, {
+                    "jsonrpc": "2.0",
+                    "method": "textDocument/didOpen",
+                    "params": {"textDocument": {
+                        "uri": "file://" + source,
+                        "languageId": "c",
+                        "version": 1,
+                        "text": text,
+                    }},
+                })
+                for path, needle in (
+                    (option_header, "/* c-autotmpl: Option(int) */"),
+                    (result_header, "/* c-autotmpl: Result(int, float) */"),
+                ):
+                    content = wait_for_content(path, lambda c, n=needle: n in c)
+                    if content is None:
+                        print("plugin shared instantiation was not generated",
+                              file=sys.stderr)
+                        with open(log_path, errors="replace") as f:
+                            print(f.read()[-4000:], file=sys.stderr)
+                        return 1
+                    leaked = any(
+                        "generated-by=cli" not in section
+                        for section in re.findall(
+                            r"/\* c-autotmpl dispatch begin [^*]+ \*/"
+                            r"(.*?)"
+                            r"/\* c-autotmpl dispatch end [^*]+ \*/",
+                            content, re.S,
+                        )
+                    )
+                    if leaked:
+                        print("plugin dispatch leaked into a per-type header",
+                              file=sys.stderr)
+                        return 1
+                    generic = ("/* c-autotmpl: Result(V, U) */" in content or
+                               "/* c-autotmpl: Option(U) */" in content)
+                    if generic:
+                        print("plugin generated a generic template body",
+                              file=sys.stderr)
+                        return 1
+
+                dispatch = wait_for_content(
+                    dispatch_header,
+                    lambda c: (
+                        "/* c-autotmpl generated-by=plugin */" in c and
+                        "/* c-autotmpl dispatch begin Option.map */" in c and
+                        "/* c-autotmpl dispatch begin Result.map */" in c and
+                        "/* c-autotmpl dispatch begin shared.map */" in c and
+                        "Option_int: map_int_int" in c and
+                        "Result_int_float: map_int_float_int" in c and
+                        "Result_int_float: map_int_float_float" in c and
+                        c.count("#define map(E1) ") == 1 and
+                        c.count("#define map_int(...) ") == 1 and
+                        c.count("#define map_float(...) ") == 1
+                    ),
+                )
+                if dispatch is None:
+                    print("plugin shared dispatch was not generated",
+                          file=sys.stderr)
+                    with open(log_path, errors="replace") as f:
+                        print(f.read()[-4000:], file=sys.stderr)
+                    return 1
+                chained = re.search(
+                    r"#define C_AUTOTMPL_DISPATCH_SEL_Result_map_int_1\(p1\) "
+                    r"C_AUTOTMPL_DISPATCH_SEL_Option_map_int_1_\d+\(p1\)",
+                    dispatch,
+                ) or re.search(
+                    r"#define C_AUTOTMPL_DISPATCH_SEL_Option_map_int_1\(p1\) "
+                    r"C_AUTOTMPL_DISPATCH_SEL_Result_map_int_1_\d+\(p1\)",
+                    dispatch,
+                )
+                if not chained:
+                    print("plugin owner selectors were not chained",
+                          file=sys.stderr)
+                    return 1
+                with open(dispatch_header) as f:
+                    final_dispatch = f.read()
+                with open(option_header) as f:
+                    final_option = f.read()
+                if ("#define cli_owned_marker 1" not in final_dispatch or
+                        "#define cli_owned_marker 1" not in final_option):
+                    print("plugin clobbered a CLI-owned dispatch section",
+                          file=sys.stderr)
+                    return 1
+
+                needle = "map(float)(o"
+                idx = text.index(needle)
+                before = text[:idx]
+                position = {
+                    "line": before.count("\n"),
+                    "character": len(before.rsplit("\n", 1)[-1]),
+                }
+                send(proc, {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "textDocument/definition",
+                    "params": {
+                        "textDocument": {"uri": "file://" + source},
+                        "position": position,
+                    },
+                })
+                response = receive_response(proc, 3)
+                locations = response.get("result") if response else None
+                owners = {loc["uri"] for loc in locations} \
+                    if locations else set()
+                if (not any(uri.endswith("tmpl/option.h") for uri in owners) or
+                        not any(uri.endswith("tmpl/result.h")
+                                for uri in owners)):
+                    print("plugin did not map shared method to both owners",
+                          file=sys.stderr)
+                    print(response, file=sys.stderr)
+                    with open(log_path, errors="replace") as f:
+                        print(f.read()[-4000:], file=sys.stderr)
+                    return 1
+
+                # Opening a template definition must not turn its generic
+                # spellings (`Result(T, U)`) into concrete instantiations or
+                # plugin-owned dispatch sections.
+                with open(dispatch_header) as f:
+                    before_dispatch = f.read()
+                with open(result_header) as f:
+                    before_result = f.read()
+                template_result = os.path.join(root, "tmpl", "result.h")
+                with open(template_result) as f:
+                    template_text = f.read()
+                send(proc, {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "textDocument/didOpen",
+                    "params": {"textDocument": {
+                        "uri": "file://" + template_result,
+                        "languageId": "c",
+                        "version": 1,
+                        "text": template_text,
+                    }},
+                })
+                # A synchronous request forces clangd to finish processing the
+                # didOpen notification before the generated files are compared.
+                send(proc, {
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "textDocument/documentSymbol",
+                    "params": {
+                        "textDocument": {"uri": "file://" + template_result},
+                    },
+                })
+                if receive_response(proc, 5) is None:
+                    print("template header didOpen was not processed",
+                          file=sys.stderr)
+                    return 1
+                with open(dispatch_header) as f:
+                    after_dispatch = f.read()
+                with open(result_header) as f:
+                    after_result = f.read()
+                if after_dispatch != before_dispatch or after_result != before_result:
+                    print("template header didOpen wrote generated files",
+                          file=sys.stderr)
+                    print("dispatch changed:", after_dispatch != before_dispatch,
+                          file=sys.stderr)
+                    print("result changed:", after_result != before_result,
+                          file=sys.stderr)
                     return 1
             finally:
                 try:
@@ -1017,6 +1383,8 @@ def main():
     if check_dispatch_method(plugin) != 0:
         return 1
     if check_dispatch_truncate(plugin) != 0:
+        return 1
+    if check_shared_dispatch(plugin) != 0:
         return 1
     if check_value_generics(plugin) != 0:
         return 1

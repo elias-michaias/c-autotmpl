@@ -1232,14 +1232,25 @@ static TemplateDef *registry_find(const Registry *r, const char *name) {
 
 /* Operations are collected from template-header signatures, so a call such as
  * box_alloc(int)() is enough to instantiate the owning type template even when
- * a local macro hid the direct Box(int) spelling. */
-static TemplateDef *registry_find_op(const Registry *r, const char *name) {
+ * a local macro hid the direct Box(int) spelling. Several type templates may
+ * expose the same operation; callers must consider every owner so one shared
+ * dispatch table can contain all of their specializations. */
+static void registry_find_ops(const Registry *r, const char *name, Vec *out) {
   for (size_t i = 0; i < r->items.len; ++i) {
     TemplateDef *d = (TemplateDef *)r->items.items[i];
     if (d->kind == TEMPLATE_TYPE && set_has(&d->dispatch_ops, name))
-      return d;
+      vec_push(out, d);
   }
-  return NULL;
+}
+
+static TemplateDef *registry_find_op(const Registry *r, const char *name) {
+  Vec owners;
+  owners.items = NULL;
+  owners.len = owners.cap = 0;
+  registry_find_ops(r, name, &owners);
+  TemplateDef *result = owners.len ? (TemplateDef *)owners.items[0] : NULL;
+  free(owners.items);
+  return result;
 }
 
 static int is_type_arg(const TemplateDef *tmpl, size_t i) {
@@ -2159,13 +2170,9 @@ static void resolve_dispatch_methods(Registry *reg) {
                 m->owner_name, m->op, fn->name);
         continue;
       }
-      TemplateDef *previous = registry_find_op(reg, m->op);
-      if (previous && previous != owner && !find_dispatch_method(previous, m->op)) {
-        fprintf(stderr,
-                "warning: dispatch method %s.%s ignored: op already owned by %s\n",
-                m->owner_name, m->op, previous->name);
-        continue;
-      }
+      /* The same public method spelling may be owned by several type
+       * templates. Their cases are merged into one shared dispatch table, so
+       * an existing owner is not a conflict. */
 
       m->impl = fn;
       set_add(&owner->dispatch_ops, m->op);
@@ -3435,6 +3442,12 @@ static char *generated_header_path(const char *header, const char *name) {
   return abs;
 }
 
+/* All generated dispatch sections are co-located. Per-type generated headers
+ * keep only concrete instantiation blocks and their presence macros. */
+static char *generated_dispatch_path(const char *header) {
+  return generated_header_path(header, "dispatch");
+}
+
 static char *generated_impl_path(const char *header, const char *name) {
   char *generated = generated_header_path(header, name);
   char *gen_dir = path_dirname(generated);
@@ -4646,8 +4659,12 @@ static void scan_usages_impl(const char *code, Registry *reg, Vec *out,
         }
       }
     } else {
-      TemplateDef *op_tmpl = registry_find_op(reg, match_ident);
-      if (op_tmpl) {
+      Vec owners;
+      owners.items = NULL;
+      owners.len = owners.cap = 0;
+      registry_find_ops(reg, match_ident, &owners);
+      if (owners.len) {
+        TemplateDef *op_tmpl = (TemplateDef *)owners.items[0];
         size_t k = end;
         while (k < n && is_space(clean[k]))
           ++k;
@@ -4663,24 +4680,40 @@ static void scan_usages_impl(const char *code, Registry *reg, Vec *out,
           }
           if (depth == 0 && close > begin + 1) {
             char *raw = xstrdup_n(clean + begin, close - begin - 1);
-            DispatchMethod *method = find_dispatch_method(op_tmpl, match_ident);
+            Vec methods;
+            methods.items = NULL;
+            methods.len = methods.cap = 0;
+            for (size_t oi = 0; oi < owners.len; ++oi) {
+              TemplateDef *owner = (TemplateDef *)owners.items[oi];
+              DispatchMethod *m = find_dispatch_method(owner, match_ident);
+              if (m)
+                vec_push(&methods, (void *)m);
+            }
             size_t after = close;
             while (after < n && is_space(clean[after]))
               ++after;
 
-            if (method) {
-              /* A curried explicit-method call: map(float)(result, f). */
+            if (methods.len) {
+              /* A curried explicit-method call: map(float)(result, f). The
+               * explicit tuple is recorded on every owner of this op; the
+               * shared selector chain picks the one matching the value. */
               size_t call_close = matching_paren(clean, after, n);
               if (after < n && clean[after] == '(' && call_close < n) {
-                Vec raw_args, canon_args, expanded;
+                Vec raw_args;
                 raw_args.items = NULL;
                 raw_args.len = raw_args.cap = 0;
-                canon_args.items = NULL;
-                canon_args.len = canon_args.cap = 0;
-                expanded.items = NULL;
-                expanded.len = expanded.cap = 0;
                 split_type_args(raw, &raw_args);
-                if (raw_args.len == method->explicit_params.len) {
+                for (size_t mi = 0; mi < methods.len; ++mi) {
+                  DispatchMethod *method =
+                      (DispatchMethod *)methods.items[mi];
+                  TemplateDef *owner = registry_find(reg, method->owner_name);
+                  if (!owner || raw_args.len != method->explicit_params.len)
+                    continue;
+                  Vec canon_args, expanded;
+                  canon_args.items = NULL;
+                  canon_args.len = canon_args.cap = 0;
+                  expanded.items = NULL;
+                  expanded.len = expanded.cap = 0;
                   int ok = 1;
                   for (size_t a = 0; ok && a < raw_args.len; ++a) {
                     if (is_declared_param(method->impl,
@@ -4690,7 +4723,7 @@ static void scan_usages_impl(const char *code, Registry *reg, Vec *out,
                     }
                     char *canon = canonicalize_argument(
                         (char *)raw_args.items[a], method->impl,
-                        op_tmpl->nparams + a, reg, &expanded);
+                        owner->nparams + a, reg, &expanded);
                     if (!canon[0])
                       ok = 0;
                     if (ok)
@@ -4701,13 +4734,13 @@ static void scan_usages_impl(const char *code, Registry *reg, Vec *out,
                   if (ok)
                     add_explicit_method_use(method, &canon_args, &expanded,
                                             out);
+                  for (size_t a = 0; a < canon_args.len; ++a)
+                    free(canon_args.items[a]);
+                  free(canon_args.items);
+                  for (size_t a = 0; a < expanded.len; ++a)
+                    usage_free((Usage *)expanded.items[a]);
+                  free(expanded.items);
                 }
-                for (size_t a = 0; a < canon_args.len; ++a)
-                  free(canon_args.items[a]);
-                free(canon_args.items);
-                for (size_t a = 0; a < expanded.len; ++a)
-                  usage_free((Usage *)expanded.items[a]);
-                free(expanded.items);
                 for (size_t a = 0; a < raw_args.len; ++a)
                   free(raw_args.items[a]);
                 free(raw_args.items);
@@ -4723,12 +4756,15 @@ static void scan_usages_impl(const char *code, Registry *reg, Vec *out,
               free(type);
               i = close;
             }
+            free(methods.items);
             free(raw);
             free(match_ident);
             free(ident);
+            free(owners.items);
             continue;
           }
         }
+        free(owners.items);
       }
       /* A generated STC adapter reads as vec_push(int)(...). The leading
        * identifier is a call, not the mangled type vec_push. For STC-derived
@@ -5329,6 +5365,95 @@ static char *dispatch_key_container(const TemplateDef *tmpl, const char *op,
 }
 
 #define DISPATCH_MAX_ARGS 8
+#define CLI_GENERATED_BY "/* c-autotmpl generated-by=cli */\n"
+#define PLUGIN_GENERATED_BY "/* c-autotmpl generated-by=plugin */"
+
+/* Contributors to one public dispatch operation. A single op, such as `map`,
+ * may be owned by several type templates; the final public macro chains their
+ * guarded selector tables in registry order. */
+typedef struct {
+  const TemplateDef *tmpl;
+  const DispatchMethod *method; /* NULL for ordinary type dispatch ops */
+  Vec *cases;
+} DispatchContrib;
+
+typedef struct {
+  char *key;
+  Vec contribs; /* DispatchContrib* */
+} DispatchSharedGroup;
+
+typedef struct {
+  char *key;
+  Vec contribs; /* DispatchContrib* */
+  Vec uses;     /* char*, one explicit-type suffix per shared public macro */
+} DispatchSharedOp;
+
+static DispatchSharedGroup *find_shared_group(Vec *groups, const char *key) {
+  for (size_t i = 0; i < groups->len; ++i) {
+    DispatchSharedGroup *g = (DispatchSharedGroup *)groups->items[i];
+    if (!strcmp(g->key, key))
+      return g;
+  }
+  return NULL;
+}
+
+static DispatchSharedOp *find_shared_op(Vec *ops, const char *key) {
+  for (size_t i = 0; i < ops->len; ++i) {
+    DispatchSharedOp *g = (DispatchSharedOp *)ops->items[i];
+    if (!strcmp(g->key, key))
+      return g;
+  }
+  return NULL;
+}
+
+static char *dispatch_shared_key(const char *a, const char *b) {
+  Str out;
+  str_init(&out);
+  str_append(&out, a);
+  if (b) {
+    str_append_char(&out, '.');
+    str_append(&out, b);
+  }
+  return str_take(&out);
+}
+
+static void add_shared_group(Vec *groups, const char *key,
+                             const TemplateDef *tmpl,
+                             const DispatchMethod *method, Vec *cases) {
+  DispatchSharedGroup *g = find_shared_group(groups, key);
+  if (!g) {
+    g = (DispatchSharedGroup *)xmalloc(sizeof(DispatchSharedGroup));
+    g->key = xstrdup(key);
+    g->contribs.items = NULL;
+    g->contribs.len = g->contribs.cap = 0;
+    vec_push(groups, g);
+  }
+  for (size_t i = 0; i < g->contribs.len; ++i)
+    if (((DispatchContrib *)g->contribs.items[i])->tmpl == tmpl &&
+        ((DispatchContrib *)g->contribs.items[i])->method == method)
+      return;
+  DispatchContrib *c =
+      (DispatchContrib *)xmalloc(sizeof(DispatchContrib));
+  c->tmpl = tmpl;
+  c->method = method;
+  c->cases = cases;
+  vec_push(&g->contribs, c);
+}
+
+static const DispatchContrib *next_shared_contrib(Vec *groups,
+                                                  const char *key,
+                                                  const TemplateDef *tmpl,
+                                                  const DispatchMethod *method) {
+  DispatchSharedGroup *g = find_shared_group(groups, key);
+  if (!g)
+    return NULL;
+  for (size_t i = 0; i + 1 < g->contribs.len; ++i) {
+    DispatchContrib *c = (DispatchContrib *)g->contribs.items[i];
+    if (c->tmpl == tmpl && c->method == method)
+      return (const DispatchContrib *)g->contribs.items[i + 1];
+  }
+  return NULL;
+}
 
 static void append_size(Str *out, size_t value) {
   char buf[32];
@@ -5444,7 +5569,8 @@ static void append_dispatch_case_selector(Str *out, const DispatchConfig *cfg,
 }
 
 static char *make_dispatch_section(const TemplateDef *tmpl, Vec *cases,
-                                    const DispatchConfig *cfg) {
+                                   const DispatchConfig *cfg,
+                                   Vec *shared_op_groups) {
   if (!cfg->enabled || !tmpl->dispatch_enabled || !cases->len ||
       !tmpl->dispatch_ops.len)
     return NULL;
@@ -5454,6 +5580,7 @@ static char *make_dispatch_section(const TemplateDef *tmpl, Vec *cases,
   str_append(&out, "/* c-autotmpl dispatch begin ");
   str_append(&out, tmpl->name);
   str_append(&out, " */\n");
+  str_append(&out, CLI_GENERATED_BY);
   str_append(&out, "#ifndef C_AUTOTMPL_DISPATCH_MISSING\n");
   str_append(&out, "#define C_AUTOTMPL_DISPATCH_MISSING\n");
   str_append(&out,
@@ -5465,6 +5592,8 @@ static char *make_dispatch_section(const TemplateDef *tmpl, Vec *cases,
     const char *op = tmpl->dispatch_ops.items[i];
     if (set_has(&tmpl->explicit_ops, op) || find_dispatch_method(tmpl, op))
       continue;
+    const DispatchContrib *fallback =
+        next_shared_contrib(shared_op_groups, op, tmpl, NULL);
     str_append(&out, "#ifndef C_AUTOTMPL_DISPATCH_");
     str_append(&out, tmpl->name);
     str_append_char(&out, '_');
@@ -5486,7 +5615,17 @@ static char *make_dispatch_section(const TemplateDef *tmpl, Vec *cases,
       str_append(&out, base.data);
       str_append_char(&out, '(');
       str_append(&out, params.data);
-      str_append(&out, ") c_autotmpl_dispatch_missing\n");
+      str_append(&out, ") ");
+      if (fallback) {
+        append_selector_name(&out, fallback->tmpl->name, op, arity,
+                             fallback->cases->len);
+        str_append_char(&out, '(');
+        str_append(&out, params.data);
+        str_append_char(&out, ')');
+      } else {
+        str_append(&out, "c_autotmpl_dispatch_missing");
+      }
+      str_append_char(&out, '\n');
 
       for (size_t j = 0; j < cases->len; ++j) {
         DispatchCase *c = (DispatchCase *)cases->items[j];
@@ -5538,39 +5677,8 @@ static char *make_dispatch_section(const TemplateDef *tmpl, Vec *cases,
     str_append(&out, ", ...) _");
     append_size(&out, DISPATCH_MAX_ARGS + 1);
     str_append(&out, "\n");
-
-    str_append(&out, "#define ");
-    if (!cfg->truncate) {
-      if (cfg->style == DISPATCH_PREFIX)
-        str_append(&out, cfg->affix);
-    }
-    str_append(&out, op);
-    if (!cfg->truncate && cfg->style == DISPATCH_POSTFIX)
-      str_append(&out, cfg->affix);
-    str_append(&out, "(...) C_AUTOTMPL_DISPATCH_PICK_");
-    str_append(&out, tmpl->name);
-    str_append_char(&out, '_');
-    str_append(&out, op);
-    str_append(&out, "(__VA_ARGS__");
-    for (size_t k = DISPATCH_MAX_ARGS; k > 0; --k) {
-      str_append(&out, ", C_AUTOTMPL_DISPATCH_SEL_");
-      str_append(&out, tmpl->name);
-      str_append_char(&out, '_');
-      str_append(&out, op);
-      str_append_char(&out, '_');
-      append_size(&out, k);
-      str_append_char(&out, '_');
-      append_size(&out, cases->len);
-    }
-    str_append(&out, ", C_AUTOTMPL_DISPATCH_SEL_");
-    str_append(&out, tmpl->name);
-    str_append_char(&out, '_');
-    str_append(&out, op);
-    str_append_char(&out, '_');
-    append_size(&out, 1);
-    str_append_char(&out, '_');
-    append_size(&out, cases->len);
-    str_append(&out, ")(__VA_ARGS__)(__VA_ARGS__)\n");
+    /* The public `op(...)` macro is shared by every owner of this operation
+     * and is emitted into the central shared section. */
     str_append(&out, "#endif\n");
   }
   str_append(&out, "/* c-autotmpl dispatch end ");
@@ -5596,7 +5704,8 @@ static char *explicit_method_suffix(Vec *args) {
 static char *make_explicit_method_section(const TemplateDef *tmpl,
                                           const DispatchMethod *method,
                                           Vec *cases, const DispatchConfig *cfg,
-                                          const char *output) {
+                                          const char *output,
+                                          Vec *shared_method_groups) {
   if (!cfg->enabled || !tmpl->dispatch_enabled || !cases->len ||
       !method->uses.len || set_has(&tmpl->explicit_ops, method->op))
     return NULL;
@@ -5608,6 +5717,7 @@ static char *make_explicit_method_section(const TemplateDef *tmpl,
   str_append_char(&out, '.');
   str_append(&out, method->op);
   str_append(&out, " */\n");
+  str_append(&out, CLI_GENERATED_BY);
   str_append(&out, "#ifndef C_AUTOTMPL_DISPATCH_MISSING\n");
   str_append(&out, "#define C_AUTOTMPL_DISPATCH_MISSING\n");
   str_append(&out,
@@ -5643,37 +5753,12 @@ static char *make_explicit_method_section(const TemplateDef *tmpl,
   str_append(&out, method->op);
   str_append_char(&out, '\n');
 
-  Str expr;
-  str_init(&expr);
-  str_append(&expr, method->op);
-  str_append_char(&expr, '_');
-  str_append(&out, "#define ");
-  str_append(&out, method->op);
-  str_append(&out, "(");
-  for (size_t p = 0; p < method->explicit_params.len; ++p) {
-    if (p)
-      str_append(&out, ", ");
-    str_append(&out, "E");
-    append_size(&out, p + 1);
-    Str next;
-    str_init(&next);
-    str_append(&next, "C_AUTOTMPL_DISPATCH_CAT(");
-    str_append(&next, expr.data);
-    str_append_char(&next, ',');
-    str_append(&next, " E");
-    append_size(&next, p + 1);
-    str_append_char(&next, ')');
-    str_free(&expr);
-    expr = next;
-  }
-  str_append(&out, ") ");
-  str_append(&out, expr.data);
-  str_append_char(&out, '\n');
-  str_free(&expr);
-
   for (size_t u = 0; u < method->uses.len; ++u) {
     ExplicitMethodUse *use = (ExplicitMethodUse *)method->uses.items[u];
     char *suffix = explicit_method_suffix(&use->args);
+    char *shared_key = dispatch_shared_key(method->op, suffix);
+    const DispatchContrib *fallback =
+        next_shared_contrib(shared_method_groups, shared_key, tmpl, method);
     Str macro_name;
     str_init(&macro_name);
     str_append(&macro_name, method->op);
@@ -5707,7 +5792,17 @@ static char *make_explicit_method_section(const TemplateDef *tmpl,
       str_append(&out, base.data);
       str_append_char(&out, '(');
       str_append(&out, params.data);
-      str_append(&out, ") c_autotmpl_dispatch_missing\n");
+      str_append(&out, ") ");
+      if (fallback) {
+        append_selector_name(&out, fallback->tmpl->name, macro_name.data,
+                             arity, fallback->cases->len);
+        str_append_char(&out, '(');
+        str_append(&out, params.data);
+        str_append_char(&out, ')');
+      } else {
+        str_append(&out, "c_autotmpl_dispatch_missing");
+      }
+      str_append_char(&out, '\n');
 
       for (size_t j = 0; j < cases->len; ++j) {
         DispatchCase *c = (DispatchCase *)cases->items[j];
@@ -5757,35 +5852,13 @@ static char *make_explicit_method_section(const TemplateDef *tmpl,
     }
     str_append(&out, ", ...) _");
     append_size(&out, DISPATCH_MAX_ARGS + 1);
-    str_append(&out, "\n#define ");
-    str_append(&out, macro_name.data);
-    str_append(&out, "(...) C_AUTOTMPL_DISPATCH_PICK_");
-    str_append(&out, tmpl->name);
-    str_append_char(&out, '_');
-    str_append(&out, macro_name.data);
-    str_append(&out, "(__VA_ARGS__");
-    for (size_t k = DISPATCH_MAX_ARGS; k > 0; --k) {
-      str_append(&out, ", C_AUTOTMPL_DISPATCH_SEL_");
-      str_append(&out, tmpl->name);
-      str_append_char(&out, '_');
-      str_append(&out, macro_name.data);
-      str_append_char(&out, '_');
-      append_size(&out, k);
-      str_append_char(&out, '_');
-      append_size(&out, cases->len);
-    }
-    str_append(&out, ", C_AUTOTMPL_DISPATCH_SEL_");
-    str_append(&out, tmpl->name);
-    str_append_char(&out, '_');
-    str_append(&out, macro_name.data);
-    str_append_char(&out, '_');
-    append_size(&out, 1);
-    str_append_char(&out, '_');
-    append_size(&out, cases->len);
-    str_append(&out, ")(__VA_ARGS__)(__VA_ARGS__)\n");
+    str_append(&out, "\n");
+    /* Public `op<T>(...)` / `op(...)` macros are emitted once in the shared
+     * section and chain every owner's selector table. */
     str_append(&out, "#endif\n");
 
     str_free(&macro_name);
+    free(shared_key);
     free(suffix);
   }
   str_append(&out, "#endif\n");
@@ -5793,6 +5866,147 @@ static char *make_explicit_method_section(const TemplateDef *tmpl,
   str_append(&out, tmpl->name);
   str_append_char(&out, '.');
   str_append(&out, method->op);
+  str_append(&out, " */\n");
+  return str_take(&out);
+}
+
+/* Shared public macros. Owner sections contribute guarded selector tables;
+ * this section defines each public spelling exactly once and chains the tables
+ * so the concrete argument type decides which owner handles the call. */
+static void append_shared_pick(Str *out, const DispatchContrib *first,
+                               const char *public_name,
+                               const char *selector_op) {
+  /* Enter through the first owner's pick table. Each owner's base selector
+   * falls through to the next owner, so one public macro reaches every table. */
+  str_append(out, "#define ");
+  str_append(out, public_name);
+  str_append(out, "(...) C_AUTOTMPL_DISPATCH_PICK_");
+  str_append(out, first->tmpl->name);
+  str_append_char(out, '_');
+  str_append(out, selector_op);
+  str_append(out, "(__VA_ARGS__");
+  for (size_t k = DISPATCH_MAX_ARGS; k > 0; --k) {
+    str_append(out, ", C_AUTOTMPL_DISPATCH_SEL_");
+    str_append(out, first->tmpl->name);
+    str_append_char(out, '_');
+    str_append(out, selector_op);
+    str_append_char(out, '_');
+    append_size(out, k);
+    str_append_char(out, '_');
+    append_size(out, first->cases->len);
+  }
+  str_append(out, ", C_AUTOTMPL_DISPATCH_SEL_");
+  str_append(out, first->tmpl->name);
+  str_append_char(out, '_');
+  str_append(out, selector_op);
+  str_append_char(out, '_');
+  append_size(out, 1);
+  str_append_char(out, '_');
+  append_size(out, first->cases->len);
+  str_append(out, ")(__VA_ARGS__)(__VA_ARGS__)\n");
+}
+
+static char *make_shared_op_section(const DispatchSharedGroup *op,
+                                    const DispatchConfig *cfg) {
+  if (!op->contribs.len)
+    return NULL;
+  const DispatchContrib *first =
+      (const DispatchContrib *)op->contribs.items[0];
+
+  Str out;
+  str_init(&out);
+  str_append(&out, "/* c-autotmpl dispatch begin shared.");
+  str_append(&out, op->key);
+  str_append(&out, " */\n");
+  str_append(&out, CLI_GENERATED_BY);
+
+  Str public_name;
+  str_init(&public_name);
+  if (!cfg->truncate && cfg->style == DISPATCH_PREFIX)
+    str_append(&public_name, cfg->affix);
+  str_append(&public_name, op->key);
+  if (!cfg->truncate && cfg->style == DISPATCH_POSTFIX)
+    str_append(&public_name, cfg->affix);
+  append_shared_pick(&out, first, public_name.data, op->key);
+  str_free(&public_name);
+
+  str_append(&out, "/* c-autotmpl dispatch end shared.");
+  str_append(&out, op->key);
+  str_append(&out, " */\n");
+  return str_take(&out);
+}
+
+static char *make_shared_method_section(const DispatchSharedOp *op,
+                                        Vec *method_groups,
+                                        const DispatchConfig *cfg) {
+  (void)cfg;
+  if (!op->uses.len)
+    return NULL;
+  Str out;
+  str_init(&out);
+  str_append(&out, "/* c-autotmpl dispatch begin shared.");
+  str_append(&out, op->key);
+  str_append(&out, " */\n");
+  str_append(&out, CLI_GENERATED_BY);
+  str_append(&out, "#ifndef C_AUTOTMPL_DISPATCH_CAT\n");
+  str_append(&out, "#define C_AUTOTMPL_DISPATCH_CAT_I(A, B) A##B\n");
+  str_append(&out,
+             "#define C_AUTOTMPL_DISPATCH_CAT(A, B) "
+             "C_AUTOTMPL_DISPATCH_CAT_I(A, B)\n");
+  str_append(&out, "#endif\n");
+
+  const char *suffix = (const char *)op->uses.items[0];
+  char *key = dispatch_shared_key(op->key, suffix);
+  DispatchSharedGroup *first = find_shared_group(method_groups, key);
+  free(key);
+  if (!first || !first->contribs.len) {
+    str_free(&out);
+    return NULL;
+  }
+  const DispatchMethod *method =
+      ((DispatchContrib *)first->contribs.items[0])->method;
+
+  Str curry;
+  str_init(&curry);
+  str_append(&curry, op->key);
+  str_append_char(&curry, '(');
+  for (size_t p = 0; p < method->explicit_params.len; ++p) {
+    if (p)
+      str_append(&curry, ", ");
+    str_append(&curry, "E");
+    append_size(&curry, p + 1);
+  }
+  str_append(&curry, ") C_AUTOTMPL_DISPATCH_CAT(");
+  str_append(&curry, op->key);
+  str_append_char(&curry, '_');
+  for (size_t p = 0; p < method->explicit_params.len; ++p) {
+    str_append(&curry, ", E");
+    append_size(&curry, p + 1);
+  }
+  str_append(&curry, ")\n");
+  str_append(&out, "#define ");
+  str_append(&out, curry.data);
+  str_free(&curry);
+
+  for (size_t u = 0; u < op->uses.len; ++u) {
+    suffix = (const char *)op->uses.items[u];
+    key = dispatch_shared_key(op->key, suffix);
+    DispatchSharedGroup *g = find_shared_group(method_groups, key);
+    free(key);
+    if (!g || !g->contribs.len)
+      continue;
+    const DispatchContrib *first =
+        (const DispatchContrib *)g->contribs.items[0];
+    Str macro_name;
+    str_init(&macro_name);
+    str_append(&macro_name, op->key);
+    str_append(&macro_name, suffix);
+    append_shared_pick(&out, first, macro_name.data, macro_name.data);
+    str_free(&macro_name);
+  }
+
+  str_append(&out, "/* c-autotmpl dispatch end shared.");
+  str_append(&out, op->key);
   str_append(&out, " */\n");
   return str_take(&out);
 }
@@ -5998,9 +6212,10 @@ static int ensure_stc_adapters(const char *path, const TemplateDef *tmpl,
   return rc;
 }
 
-/* Dispatch cases are one marked section per generated header. Rewriting the
- * section keeps guards for missing specializations and lets a later run drop
- * cases whose instantiation blocks were removed. */
+/* Dispatch sections are keyed by public operation and live in the shared
+ * header. A section carrying another generator's ownership marker is foreign:
+ * the CLI never clobbers it, and a missing CLI section is removed so stale
+ * cases disappear on later runs. */
 static int write_dispatch_section(const char *path, const char *key,
                                   const char *section, EmitCtx *ctx) {
   const char *content = cached_file(ctx, path);
@@ -6015,6 +6230,13 @@ static int write_dispatch_section(const char *path, const char *key,
   if (b && e) {
     const char *after = strchr(e, '\n');
     after = after ? after + 1 : e + strlen(end);
+    char *body = xstrdup_n(b, (size_t)(after - b));
+    int foreign = strstr(body, PLUGIN_GENERATED_BY) != NULL;
+    free(body);
+    if (foreign) {
+      str_free(&out);
+      return 0;
+    }
     str_append_n(&out, content, (size_t)(b - content));
     if (section)
       str_append(&out, section);
@@ -6079,6 +6301,97 @@ static int write_dispatch_section(const char *path, const char *key,
   }
   str_free(&out);
   return 0;
+}
+
+static char *dispatch_section_key_at(const char *begin) {
+  const char *prefix = "/* c-autotmpl dispatch begin ";
+  const char *start = begin + strlen(prefix);
+  const char *end = strstr(start, " */");
+  if (!end)
+    return NULL;
+  return xstrdup_n(start, (size_t)(end - start));
+}
+
+static int commit_dispatch_file(const char *path, Str *out,
+                                const char *previous, EmitCtx *ctx) {
+  const char *result = out->data ? out->data : "";
+  if (!strcmp(result, previous)) {
+    str_free(out);
+    return 0;
+  }
+  if (ctx->dry_run) {
+    str_free(out);
+    return 0;
+  }
+  if (write_file(path, result, strlen(result)) != 0) {
+    fprintf(stderr, "error: failed writing %s\n", path);
+    str_free(out);
+    return -1;
+  }
+  map_set(&ctx->files, path, result);
+  str_free(out);
+  return 0;
+}
+
+/* Older generated headers carried their own dispatch sections. They now live
+ * only in gen/dispatch.h, so strip every marked section from type headers. */
+static int strip_dispatch_sections(const char *path, EmitCtx *ctx) {
+  const char *content = cached_file(ctx, path);
+  Str out;
+  str_init(&out);
+  size_t pos = 0;
+  for (;;) {
+    const char *b = strstr(content + pos, "/* c-autotmpl dispatch begin ");
+    if (!b)
+      break;
+    const char *e = strstr(b, "/* c-autotmpl dispatch end ");
+    if (!e)
+      break;
+    const char *after = strchr(e, '\n');
+    after = after ? after + 1 : e + strlen("/* c-autotmpl dispatch end ");
+    char *body = xstrdup_n(b, (size_t)(after - b));
+    int foreign = strstr(body, PLUGIN_GENERATED_BY) != NULL;
+    free(body);
+    if (foreign) {
+      str_append_n(&out, content + pos, (size_t)(after - (content + pos)));
+    } else {
+      str_append_n(&out, content + pos, (size_t)(b - (content + pos)));
+    }
+    pos = (size_t)(after - content);
+  }
+  str_append_n(&out, content + pos, strlen(content + pos));
+  return commit_dispatch_file(path, &out, content, ctx);
+}
+
+/* Drop CLI-owned sections whose owners disappeared. Plugin-owned sections stay
+ * untouched: the plugin is responsible for their lifecycle. */
+static int prune_dispatch_sections(const char *path, Set *keep, EmitCtx *ctx) {
+  const char *content = cached_file(ctx, path);
+  Str out;
+  str_init(&out);
+  size_t pos = 0;
+  for (;;) {
+    const char *b = strstr(content + pos, "/* c-autotmpl dispatch begin ");
+    if (!b)
+      break;
+    const char *e = strstr(b, "/* c-autotmpl dispatch end ");
+    if (!e)
+      break;
+    const char *after = strchr(e, '\n');
+    after = after ? after + 1 : e + strlen("/* c-autotmpl dispatch end ");
+    char *key = dispatch_section_key_at(b);
+    char *body = xstrdup_n(b, (size_t)(after - b));
+    int keep_section = (key && set_has(keep, key)) ||
+                       strstr(body, PLUGIN_GENERATED_BY) != NULL;
+    free(body);
+    free(key);
+    if (keep_section) {
+      str_append_n(&out, content + pos, (size_t)(after - (content + pos)));
+    }
+    pos = (size_t)(after - content);
+  }
+  str_append_n(&out, content + pos, strlen(content + pos));
+  return commit_dispatch_file(path, &out, content, ctx);
 }
 
 /* ------------------------- implementation TUs --------------------------- */
@@ -6614,29 +6927,27 @@ typedef struct {
 } FileUsages;
 
 typedef struct {
-  char *output;
   const TemplateDef *tmpl;
   Vec cases;
 } DispatchGroup;
 
-static DispatchGroup *find_dispatch_group(Vec *groups, const char *output,
+static DispatchGroup *find_dispatch_group(Vec *groups,
                                           const TemplateDef *tmpl) {
   for (size_t i = 0; i < groups->len; ++i) {
     DispatchGroup *group = (DispatchGroup *)groups->items[i];
-    if (group->tmpl == tmpl && strcmp(group->output, output) == 0)
+    if (group->tmpl == tmpl)
       return group;
   }
   return NULL;
 }
 
-static void add_dispatch_case(Vec *groups, const char *output,
-                              const TemplateDef *tmpl, Usage *usage) {
+static void add_dispatch_case(Vec *groups, const TemplateDef *tmpl,
+                               Usage *usage) {
   if (!tmpl->dispatch_enabled || tmpl->kind != TEMPLATE_TYPE)
     return;
-  DispatchGroup *group = find_dispatch_group(groups, output, tmpl);
+  DispatchGroup *group = find_dispatch_group(groups, tmpl);
   if (!group) {
     group = (DispatchGroup *)xmalloc(sizeof(DispatchGroup));
-    group->output = xstrdup(output);
     group->tmpl = tmpl;
     group->cases.items = NULL;
     group->cases.len = group->cases.cap = 0;
@@ -6836,6 +7147,11 @@ int main(int argc, char **argv) {
     return 0;
   }
 
+  char *dispatch_path = dispatch_cfg.enabled
+                            ? generated_dispatch_path(
+                                  ((TemplateDef *)reg.items.items[0])->header)
+                            : NULL;
+
   Set generated_outputs;
   generated_outputs.items = NULL;
   generated_outputs.len = generated_outputs.cap = 0;
@@ -6845,6 +7161,8 @@ int main(int argc, char **argv) {
     if (def->impl)
       set_add(&generated_outputs, def->impl);
   }
+  if (dispatch_path)
+    set_add(&generated_outputs, dispatch_path);
 
   Vec inputs;
   inputs.items = NULL;
@@ -6867,6 +7185,13 @@ int main(int argc, char **argv) {
   preprocess_stubs.len = preprocess_stubs.cap = 0;
   if (pre_cfg.enabled && pre_cfg.backend == PREPROCESS_BACKEND_FULL)
     prepare_preprocessor_stubs(&reg, &preprocess_stubs, opt.verbose);
+  if (dispatch_path && !path_is_file(dispatch_path)) {
+    char *dir = path_dirname(dispatch_path);
+    make_dir(dir);
+    free(dir);
+    if (write_file(dispatch_path, "", 0) == 0 && opt.verbose)
+      printf("created %s\n", dispatch_path);
+  }
 
   int used_preprocessed = 0;
   if (pre_cfg.enabled) {
@@ -6949,13 +7274,13 @@ int main(int argc, char **argv) {
           return 1;
         if (emit_usage(u, output, &emit, &fu->usages, begin, i) != 0)
           return 1;
-        add_dispatch_case(&dispatch_groups, output, u->tmpl, u);
+        add_dispatch_case(&dispatch_groups, u->tmpl, u);
         if (j != i && strcmp(u->tmpl->generated, output) != 0) {
           if (ensure_stc_adapters(u->tmpl->generated, u->tmpl, &emit) != 0)
             return 1;
           if (emit_usage(u, u->tmpl->generated, &emit, NULL, 0, 0) != 0)
             return 1;
-          add_dispatch_case(&dispatch_groups, u->tmpl->generated, u->tmpl, u);
+          add_dispatch_case(&dispatch_groups, u->tmpl, u);
         }
       }
     }
@@ -6964,32 +7289,137 @@ int main(int argc, char **argv) {
   if (emit_explicit_method_instantiations(&dispatch_groups, &emit) != 0)
     return 1;
 
-  for (size_t i = 0; i < dispatch_groups.len; ++i) {
-    DispatchGroup *group = (DispatchGroup *)dispatch_groups.items[i];
-    char *section = make_dispatch_section(group->tmpl, &group->cases,
-                                          &dispatch_cfg);
-    if (write_dispatch_section(group->output, group->tmpl->name, section,
-                               &emit) != 0)
-      return 1;
-    free(section);
+  Vec shared_op_groups;
+  shared_op_groups.items = NULL;
+  shared_op_groups.len = shared_op_groups.cap = 0;
+  Vec shared_method_groups;
+  shared_method_groups.items = NULL;
+  shared_method_groups.len = shared_method_groups.cap = 0;
+  Vec shared_method_ops;
+  shared_method_ops.items = NULL;
+  shared_method_ops.len = shared_method_ops.cap = 0;
+  Set keep_dispatch;
+  keep_dispatch.items = NULL;
+  keep_dispatch.len = keep_dispatch.cap = 0;
 
-    TemplateDef *owner = (TemplateDef *)group->tmpl;
-    for (size_t m = 0; m < owner->dispatch_methods.len; ++m) {
-      DispatchMethod *method = (DispatchMethod *)owner->dispatch_methods.items[m];
-      Str key;
-      str_init(&key);
-      str_append(&key, owner->name);
-      str_append_char(&key, '.');
-      str_append(&key, method->op);
-      char *section_key = str_take(&key);
-      char *extra = make_explicit_method_section(owner, method, &group->cases,
-                                                 &dispatch_cfg, group->output);
-      if (write_dispatch_section(group->output, section_key, extra, &emit) != 0)
-        return 1;
-      free(extra);
-      free(section_key);
+  if (dispatch_path && dispatch_cfg.enabled) {
+    for (size_t i = 0; i < dispatch_groups.len; ++i) {
+      DispatchGroup *group = (DispatchGroup *)dispatch_groups.items[i];
+      TemplateDef *owner = (TemplateDef *)group->tmpl;
+      for (size_t oi = 0; oi < owner->dispatch_ops.len; ++oi) {
+        const char *op = (const char *)owner->dispatch_ops.items[oi];
+        if (set_has(&owner->explicit_ops, op) || find_dispatch_method(owner, op))
+          continue;
+        add_shared_group(&shared_op_groups, op, owner, NULL, &group->cases);
+      }
+      for (size_t mi = 0; mi < owner->dispatch_methods.len; ++mi) {
+        DispatchMethod *method =
+            (DispatchMethod *)owner->dispatch_methods.items[mi];
+        if (!method->uses.len)
+          continue;
+        for (size_t ui = 0; ui < method->uses.len; ++ui) {
+          ExplicitMethodUse *use =
+              (ExplicitMethodUse *)method->uses.items[ui];
+          char *suffix = explicit_method_suffix(&use->args);
+          DispatchSharedOp *shared = find_shared_op(&shared_method_ops,
+                                                    method->op);
+          if (!shared) {
+            shared = (DispatchSharedOp *)xmalloc(sizeof(DispatchSharedOp));
+            shared->key = xstrdup(method->op);
+            shared->contribs.items = NULL;
+            shared->contribs.len = shared->contribs.cap = 0;
+            shared->uses.items = NULL;
+            shared->uses.len = shared->uses.cap = 0;
+            vec_push(&shared_method_ops, shared);
+          }
+          int have_suffix = 0;
+          for (size_t si = 0; si < shared->uses.len; ++si)
+            if (!strcmp((const char *)shared->uses.items[si], suffix))
+              have_suffix = 1;
+          if (!have_suffix)
+            vec_push(&shared->uses, xstrdup(suffix));
+          char *key = dispatch_shared_key(method->op, suffix);
+          add_shared_group(&shared_method_groups, key, owner, method,
+                           &group->cases);
+          free(key);
+          free(suffix);
+        }
+      }
     }
   }
+
+  /* Dispatch helpers used to be written into every generated instantiation
+   * header. Remove those legacy sections; the shared header is authoritative. */
+  for (size_t i = 0; i < reg.items.len; ++i) {
+    TemplateDef *def = (TemplateDef *)reg.items.items[i];
+    if (strip_dispatch_sections(def->generated, &emit) != 0)
+      return 1;
+  }
+
+  if (dispatch_path && dispatch_cfg.enabled) {
+    for (size_t i = 0; i < dispatch_groups.len; ++i) {
+      DispatchGroup *group = (DispatchGroup *)dispatch_groups.items[i];
+      char *section = make_dispatch_section(group->tmpl, &group->cases,
+                                            &dispatch_cfg, &shared_op_groups);
+      if (section)
+        set_add(&keep_dispatch, group->tmpl->name);
+      if (write_dispatch_section(dispatch_path, group->tmpl->name, section,
+                                 &emit) != 0)
+        return 1;
+      free(section);
+
+      TemplateDef *owner = (TemplateDef *)group->tmpl;
+      for (size_t m = 0; m < owner->dispatch_methods.len; ++m) {
+        DispatchMethod *method =
+            (DispatchMethod *)owner->dispatch_methods.items[m];
+        Str key;
+        str_init(&key);
+        str_append(&key, owner->name);
+        str_append_char(&key, '.');
+        str_append(&key, method->op);
+        char *section_key = str_take(&key);
+        char *extra = make_explicit_method_section(
+            owner, method, &group->cases, &dispatch_cfg, dispatch_path,
+            &shared_method_groups);
+        if (extra)
+          set_add(&keep_dispatch, section_key);
+        if (write_dispatch_section(dispatch_path, section_key, extra, &emit) != 0)
+          return 1;
+        free(extra);
+        free(section_key);
+      }
+    }
+
+    for (size_t i = 0; i < shared_op_groups.len; ++i) {
+      DispatchSharedGroup *shared =
+          (DispatchSharedGroup *)shared_op_groups.items[i];
+      char *section_key = dispatch_shared_key("shared", shared->key);
+      char *section = make_shared_op_section(shared, &dispatch_cfg);
+      if (section)
+        set_add(&keep_dispatch, section_key);
+      if (write_dispatch_section(dispatch_path, section_key, section, &emit) != 0)
+        return 1;
+      free(section);
+      free(section_key);
+    }
+    for (size_t i = 0; i < shared_method_ops.len; ++i) {
+      DispatchSharedOp *shared =
+          (DispatchSharedOp *)shared_method_ops.items[i];
+      char *section_key = dispatch_shared_key("shared", shared->key);
+      char *section =
+          make_shared_method_section(shared, &shared_method_groups,
+                                     &dispatch_cfg);
+      if (section)
+        set_add(&keep_dispatch, section_key);
+      if (write_dispatch_section(dispatch_path, section_key, section, &emit) != 0)
+        return 1;
+      free(section);
+      free(section_key);
+    }
+    if (prune_dispatch_sections(dispatch_path, &keep_dispatch, &emit) != 0)
+      return 1;
+  }
+
 
   Vec impl_groups;
   impl_groups.items = NULL;

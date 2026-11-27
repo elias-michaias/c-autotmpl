@@ -56,7 +56,9 @@ benchmark exercises dispatch generation as well as plain type instantiation.
 The STC template exercises `profile`/`stc_auto` configuration. The macro-only
 file exercises both preprocessing backends without changing the default raw-text
 workload: the `full` backend expands all 82 sources in one batched compiler
-invocation, while `local` expands wrapper macros inside the CLI.
+invocation, while `local` expands wrapper macros inside the CLI. Dispatch
+selectors are written to the central `gen/dispatch.h`; rerun `make bench` after
+changing that layout before comparing timings.
 
 ## Methodology
 

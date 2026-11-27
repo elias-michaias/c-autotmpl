@@ -27,6 +27,22 @@ std::string join(StringRef Base, StringRef Tail) {
   sys::path::append(P, Tail);
   return std::string(P);
 }
+
+size_t countOccurrences(StringRef Text, StringRef Needle) {
+  if (Needle.empty())
+    return 0;
+  size_t Count = 0;
+  for (size_t Pos = Text.find(Needle); Pos != StringRef::npos;
+       Pos = Text.find(Needle, Pos + Needle.size()))
+    ++Count;
+  return Count;
+}
+
+std::string readText(StringRef Path) {
+  auto Buffer = MemoryBuffer::getFile(Path, /*IsText=*/true);
+  assert(Buffer);
+  return (*Buffer)->getBuffer().str();
+}
 } // namespace
 
 int main() {
@@ -71,6 +87,7 @@ int main() {
           "{ d.value = x; }\n"
           "static inline void DISPATCH_FN(Dispatch(T), _clear)(Dispatch(T) *d) "
           "{ d->value = 0; }\n"
+          "static inline int observe(Dispatch(T) *d) { return d->value; }\n"
           "static inline int helper(int x) { return x; }\n";
   }
   {
@@ -325,6 +342,7 @@ int main() {
   assert(DispatchDef->DispatchOps.contains("Dispatch_int_push"));
   assert(DispatchDef->DispatchOps.contains("Dispatch_int_set"));
   assert(DispatchDef->DispatchOps.contains("Dispatch_clear"));
+  assert(DispatchDef->DispatchOps.contains("observe"));
   assert(!DispatchDef->DispatchOps.contains("helper"));
   const c_autotmpl::TemplateDef *CrateDef = Registry.findByName("Crate");
   assert(CrateDef && CrateDef->DispatchEnabled);
@@ -333,6 +351,41 @@ int main() {
   assert(CrateDef->DispatchOps.contains("observe"));
   assert(!CrateDef->DispatchOps.contains("secret"));
   assert(!CrateDef->DispatchOps.contains("_Alignas"));
+
+  // `observe` is an ordinary op shared by two owners. Plural lookup and bare
+  // dispatch scanning must see both, exactly once per template.
+  SmallVector<const c_autotmpl::TemplateDef *, 2> ObserveOwners;
+  Registry.findDispatchOps("observe", ObserveOwners);
+  bool SawCrateOwner = false;
+  bool SawDispatchOwner = false;
+  for (const c_autotmpl::TemplateDef *Owner : ObserveOwners) {
+    SawCrateOwner |= Owner == CrateDef;
+    SawDispatchOwner |= Owner == DispatchDef;
+  }
+  assert(ObserveOwners.size() == 2 && SawCrateOwner && SawDispatchOwner);
+  {
+    c_autotmpl::setSourceScanDispatchTruncate(true);
+    SmallVector<c_autotmpl::FoundUsage, 4> SharedOrdinary;
+    // The comment keeps the cheap template-name prefilter happy without
+    // creating a nested template application to expand.
+    c_autotmpl::scanUsages("observe(int) /* Dispatch */;", Registry,
+                           SharedOrdinary);
+    c_autotmpl::setSourceScanDispatchTruncate(false);
+    unsigned CrateUses = 0;
+    unsigned DispatchUses = 0;
+    for (const c_autotmpl::FoundUsage &Usage : SharedOrdinary) {
+      // Header dependency expansion also sees the fixture declarations; only
+      // the direct call usages matter here.
+      if (Usage.IsNested)
+        continue;
+      if (Usage.Template == CrateDef)
+        ++CrateUses;
+      if (Usage.Template == DispatchDef)
+        ++DispatchUses;
+      assert(Usage.TypeSpelling == "int");
+    }
+    assert(CrateUses == 1 && DispatchUses == 1);
+  }
   auto AllocTarget = CrateDef->DispatchTargets.find("crate_alloc");
   assert(AllocTarget != CrateDef->DispatchTargets.end());
   assert(AllocTarget->second.Base == "crate_alloc" &&
@@ -349,14 +402,73 @@ int main() {
              .starts_with("crate_alloc"));
   SmallVector<c_autotmpl::DispatchCase, 1> CrateCases{
       {"int", "Crate_int", {"int"}}};
+  SmallVector<c_autotmpl::DispatchCase, 1> DispatchCases{
+      {"int", "Dispatch_int"}};
   SmallVector<StringRef, 3> CrateOps{"crate_alloc", "crate_free", "observe"};
+  SmallVector<StringRef, 1> DispatchOps{"Dispatch_int_push"};
+
+  auto copyCases = [](ArrayRef<c_autotmpl::DispatchCase> Cases) {
+    return std::vector<c_autotmpl::DispatchCase>(Cases.begin(), Cases.end());
+  };
+  auto makeGroup = [&](StringRef Key, const c_autotmpl::TemplateDef *Owner,
+                       ArrayRef<c_autotmpl::DispatchCase> Cases) {
+    c_autotmpl::DispatchSharedGroup Group;
+    Group.Key = Key.str();
+    Group.SelectorOp = Key.str();
+    Group.Contribs.push_back({Owner, nullptr, copyCases(Cases), Key.str()});
+    return Group;
+  };
+
+  // Two owners of `crate_alloc`: the shared PICK enters Crate's table, whose
+  // base selector falls through to Dispatch's single-case table.
+  c_autotmpl::DispatchSharedGroup CrateAllocGroup =
+      makeGroup("crate_alloc", CrateDef, CrateCases);
+  CrateAllocGroup.Contribs.push_back(
+      {DispatchDef, nullptr, copyCases(DispatchCases), "crate_alloc"});
   std::string CrateSection = c_autotmpl::makeDispatchSection(
-      *CrateDef, CrateCases, CrateOps, DispatchCfg);
+      *CrateDef, CrateCases, CrateOps, DispatchCfg, {CrateAllocGroup});
   for (StringRef Needle : {
+           "/* c-autotmpl dispatch begin Crate */",
+           "/* c-autotmpl generated-by=plugin */",
            "Crate_int: crate_alloc_int", "Crate_int: crate_free_int",
-           "Crate_int: observe", "#define $crate_alloc(...)",
-           "#define $crate_free(...)", "#define $observe(...)"})
+           "Crate_int: observe",
+           "#define C_AUTOTMPL_DISPATCH_SEL_Crate_crate_alloc_1(p1) "
+           "C_AUTOTMPL_DISPATCH_SEL_Dispatch_crate_alloc_1_1(p1)",
+           "#define C_AUTOTMPL_DISPATCH_PICK_Crate_crate_alloc(",
+           "/* c-autotmpl dispatch end Crate */"})
     assert(CrateSection.find(Needle.str()) != std::string::npos);
+
+  c_autotmpl::DispatchSharedGroup ObserveGroup =
+      makeGroup("observe", CrateDef, CrateCases);
+  ObserveGroup.Contribs.push_back(
+      {DispatchDef, nullptr, copyCases(DispatchCases), "observe"});
+  std::string ObserveOwnerSection = c_autotmpl::makeDispatchSection(
+      *CrateDef, CrateCases, CrateOps, DispatchCfg, {ObserveGroup});
+  assert(ObserveOwnerSection.find(
+             "#define C_AUTOTMPL_DISPATCH_SEL_Crate_observe_1(p1) "
+             "C_AUTOTMPL_DISPATCH_SEL_Dispatch_observe_1_1(p1)") !=
+         std::string::npos);
+  // Owner sections carry selectors only; every public spelling lives in one
+  // shared section exactly once.
+  for (StringRef Public : {"#define $crate_alloc(", "#define $crate_free(",
+                           "#define $observe("})
+    assert(countOccurrences(CrateSection, Public) == 0);
+
+  std::string SharedAlloc =
+      c_autotmpl::makeSharedOpSection(CrateAllocGroup, DispatchCfg);
+  for (StringRef Needle : {
+           "/* c-autotmpl dispatch begin shared.crate_alloc */",
+           "/* c-autotmpl generated-by=plugin */",
+           "#define $crate_alloc(...) "
+           "C_AUTOTMPL_DISPATCH_PICK_Crate_crate_alloc(__VA_ARGS__,",
+           "C_AUTOTMPL_DISPATCH_SEL_Crate_crate_alloc_1_1)(__VA_ARGS__)"
+           "(__VA_ARGS__)",
+           "/* c-autotmpl dispatch end shared.crate_alloc */"})
+    assert(SharedAlloc.find(Needle.str()) != std::string::npos);
+  assert(countOccurrences(SharedAlloc, "#define $crate_alloc(") == 1);
+  assert(countOccurrences(CrateSection + SharedAlloc,
+                          "#define $crate_alloc(") == 1);
+
   auto PushOffset = DispatchDef->DispatchOpOffsets.find("Dispatch_int_push");
   assert(PushOffset != DispatchDef->DispatchOpOffsets.end());
   auto DispatchHeader = MemoryBuffer::getFile(DispatchDef->Header);
@@ -364,30 +476,100 @@ int main() {
   assert(StringRef((*DispatchHeader)->getBuffer())
              .substr(PushOffset->second)
              .starts_with("Dispatch_int_push"));
-  SmallVector<c_autotmpl::DispatchCase, 1> DispatchCases{
-      {"int", "Dispatch_int"}};
-  SmallVector<StringRef, 1> DispatchOps{"Dispatch_int_push"};
+  c_autotmpl::DispatchSharedGroup PushGroup =
+      makeGroup("Dispatch_int_push", DispatchDef, DispatchCases);
   std::string DispatchSection = c_autotmpl::makeDispatchSection(
       *DispatchDef, DispatchCases, DispatchOps, DispatchCfg);
   for (StringRef Needle : {
            "/* c-autotmpl dispatch begin Dispatch */",
+           "/* c-autotmpl generated-by=plugin */",
            "#ifdef C_AUTOTMPL_Dispatch_int",
            "_Generic((p1), Dispatch_int: Dispatch_int_push",
            "Dispatch_int*: Dispatch_int_push",
-           "#define $Dispatch_int_push(...)",
+           "#define C_AUTOTMPL_DISPATCH_PICK_Dispatch_Dispatch_int_push(",
            "/* c-autotmpl dispatch end Dispatch */"})
     assert(DispatchSection.find(Needle.str()) != std::string::npos);
+  assert(countOccurrences(DispatchSection, "#define $Dispatch_int_push(") == 0);
 
   DispatchCfg.Style = c_autotmpl::DispatchStyle::Postfix;
   DispatchCfg.Affix = "_method";
-  std::string PostfixSection = c_autotmpl::makeDispatchSection(
-      *DispatchDef, DispatchCases, DispatchOps, DispatchCfg);
+  std::string PostfixSection = c_autotmpl::makeSharedOpSection(PushGroup,
+                                                               DispatchCfg);
   assert(PostfixSection.find("#define Dispatch_int_push_method(...)") !=
          std::string::npos);
   assert(PostfixSection.find("#define $Dispatch_int_push(...)") ==
          std::string::npos);
   DispatchCfg.Style = c_autotmpl::DispatchStyle::Prefix;
   DispatchCfg.Affix = "$";
+
+  // Central-header layout and ownership: CLI sections survive plugin writes,
+  // pruning and stripping; plugin sections carry the plugin marker.
+  assert(c_autotmpl::generatedDispatchPath(join(Root, "gen/vec.h")) ==
+         join(Root, "gen/dispatch.h"));
+  sys::fs::create_directories(join(Root, "gen"));
+  std::string CentralPath = join(Root, "gen/central-dispatch.h");
+  {
+    std::error_code EC;
+    raw_fd_ostream OS(CentralPath, EC);
+    OS << "#ifndef CENTRAL_DISPATCH_H\n#define CENTRAL_DISPATCH_H\n\n"
+          "/* c-autotmpl dispatch begin Crate */\n"
+          "/* c-autotmpl generated-by=cli */\n"
+          "#define CLI_OWNED 1\n"
+          "/* c-autotmpl dispatch end Crate */\n\n"
+          "#endif\n";
+  }
+  c_autotmpl::Instantiator DispatchInst;
+  std::string DispatchError;
+  assert(!DispatchInst.writeDispatchSection(CentralPath, "Crate", CrateSection,
+                                            DispatchError));
+  assert(DispatchError.empty());
+  std::string CentralText = readText(CentralPath);
+  assert(CentralText.find("/* c-autotmpl generated-by=cli */") !=
+         std::string::npos);
+  assert(CentralText.find("#define CLI_OWNED 1") != std::string::npos);
+  assert(countOccurrences(CentralText, "generated-by=plugin") == 0);
+
+  assert(DispatchInst.writeDispatchSection(CentralPath, "shared.crate_alloc",
+                                           SharedAlloc, DispatchError));
+  assert(DispatchError.empty());
+  assert(!DispatchInst.writeDispatchSection(CentralPath, "shared.crate_alloc",
+                                            SharedAlloc, DispatchError));
+  std::string ObserveSection = c_autotmpl::makeSharedOpSection(
+      makeGroup("observe", CrateDef, CrateCases), DispatchCfg);
+  assert(DispatchInst.writeDispatchSection(CentralPath, "shared.observe",
+                                           ObserveSection, DispatchError));
+  llvm::StringSet<> Keep;
+  Keep.insert("Crate");
+  Keep.insert("shared.crate_alloc");
+  std::vector<std::string> Removed;
+  assert(DispatchInst.pruneDispatchSections(CentralPath, Keep, Removed,
+                                            DispatchError));
+  assert(Removed.size() == 1 && Removed.front() == "shared.observe");
+  CentralText = readText(CentralPath);
+  assert(CentralText.find("/* c-autotmpl dispatch begin shared.observe */") ==
+         std::string::npos);
+  assert(CentralText.find("#define CLI_OWNED 1") != std::string::npos);
+  assert(countOccurrences(CentralText, "#define $crate_alloc(") == 1);
+
+  std::string LegacyPath = join(Root, "gen/legacy-dispatch.h");
+  {
+    std::error_code EC;
+    raw_fd_ostream OS(LegacyPath, EC);
+    OS << "/* c-autotmpl dispatch begin Legacy */\n"
+          "/* c-autotmpl generated-by=plugin */\n"
+          "#define LEGACY_PLUGIN 1\n"
+          "/* c-autotmpl dispatch end Legacy */\n"
+          "/* c-autotmpl dispatch begin Kept */\n"
+          "/* c-autotmpl generated-by=cli */\n"
+          "#define LEGACY_CLI 1\n"
+          "/* c-autotmpl dispatch end Kept */\n";
+  }
+  assert(DispatchInst.stripDispatchSections(LegacyPath, DispatchError));
+  assert(DispatchError.empty());
+  std::string LegacyText = readText(LegacyPath);
+  assert(LegacyText.find("LEGACY_PLUGIN") == std::string::npos);
+  assert(LegacyText.find("LEGACY_CLI") != std::string::npos);
+  assert(!DispatchInst.stripDispatchSections(LegacyPath, DispatchError));
 
   DispatchCfg.Templates.push_back("Nope");
   Registry.applyDispatch(DispatchCfg);
@@ -396,9 +578,7 @@ int main() {
   Registry.applyDispatch(DispatchCfg);
   assert(DispatchDef->DispatchEnabled);
 
-  c_autotmpl::Instantiator DispatchInst;
   std::string DispatchPath = join(Root, "gen/dispatch.h");
-  std::string DispatchError;
   assert(DispatchInst.ensureDispatch(*DispatchDef, DispatchCases, DispatchOps,
                                      DispatchCfg, DispatchPath,
                                      DispatchError));
@@ -406,9 +586,17 @@ int main() {
   assert(!DispatchInst.ensureDispatch(*DispatchDef, DispatchCases, DispatchOps,
                                       DispatchCfg, DispatchPath,
                                       DispatchError));
+  std::string SharedPush =
+      c_autotmpl::makeSharedOpSection(PushGroup, DispatchCfg);
+  assert(DispatchInst.writeDispatchSection(
+      DispatchPath, "shared.Dispatch_int_push", SharedPush, DispatchError));
   auto DispatchBuffer = MemoryBuffer::getFile(DispatchPath);
-  assert(DispatchBuffer &&
-         (*DispatchBuffer)->getBuffer().contains("$Dispatch_int_push"));
+  assert(DispatchBuffer);
+  StringRef DispatchText = (*DispatchBuffer)->getBuffer();
+  assert(DispatchText.contains("/* c-autotmpl dispatch begin Dispatch */"));
+  assert(DispatchText.contains(
+      "/* c-autotmpl dispatch begin shared.Dispatch_int_push */"));
+  assert(countOccurrences(DispatchText, "#define $Dispatch_int_push(") == 1);
 
   c_autotmpl::Instantiator Instantiator;
   std::string GenPath, Error;
@@ -957,11 +1145,22 @@ int main() {
         *DirectDef, Cases, Ops, TruncCfg);
     for (StringRef Needle : {
              "/* c-autotmpl dispatch begin Direct */",
+             "/* c-autotmpl generated-by=plugin */",
              "Direct_int_float: direct_set_int_float",
              "Direct_int_float*: direct_set_int_float",
-             "#define direct_set(...)"})
+             "#define C_AUTOTMPL_DISPATCH_PICK_Direct_direct_set("})
       assert(Section.find(Needle.str()) != std::string::npos);
+    assert(Section.find("#define direct_set(...)") == std::string::npos);
     assert(Section.find("#define $direct_set(...)") == std::string::npos);
+    c_autotmpl::DispatchSharedGroup TruncateGroup;
+    TruncateGroup.Key = "direct_set";
+    TruncateGroup.SelectorOp = "direct_set";
+    TruncateGroup.Contribs.push_back(
+        {DirectDef, nullptr, copyCases(Cases), "direct_set"});
+    std::string Shared = c_autotmpl::makeSharedOpSection(TruncateGroup,
+                                                         TruncCfg);
+    assert(Shared.find("#define direct_set(...)") != std::string::npos);
+    assert(countOccurrences(Shared, "#define direct_set(") == 1);
     c_autotmpl::setDispatchTruncate(false);
   }
 
