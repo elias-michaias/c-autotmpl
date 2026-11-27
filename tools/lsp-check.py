@@ -418,6 +418,116 @@ dispatch=1
     return 0
 
 
+def check_dispatch_method(plugin):
+    root = tempfile.mkdtemp(prefix="c-autotmpl-lsp-method-")
+    try:
+        os.makedirs(os.path.join(root, "tmpl"))
+        os.makedirs(os.path.join(root, "gen"))
+        write(os.path.join(root, "tmpl", "result.h"), """\
+// -- template type Result(T, U)
+#define RC4_I(A, B, C, D) A##B##C##D
+#define RC4(A, B, C, D) RC4_I(A, B, C, D)
+#define Result(T, U) RC4(Result_, T, _, U)
+typedef struct { T ok; U err; } Result(T, U);
+
+// -- template function map_impl(T, U, V)
+// -- dispatch method Result.map explicit V
+#define MC6_I(A, B, C, D, E, F) A##B##C##D##E##F
+#define MC6(A, B, C, D, E, F) MC6_I(A, B, C, D, E, F)
+#define map_impl(T, U, V) MC6(map_, T, _, U, _, V)
+static inline Result(T, V) map_impl(T, U, V)(Result(T, U) r, V (*f)(T)) {
+  Result(T, V) out;
+  out.ok = f(r.ok);
+  out.err = 0;
+  return out;
+}
+""")
+        source = os.path.join(root, "main.c")
+        write(source, "int main(void) { return 0; }\n")
+        text = """\
+#include "gen/result.h"
+static float from_int(int x) { return (float)x / 2.0f; }
+int main(void) {
+  Result(int, float) r = {7, 0};
+  return (int)map(float)(r, from_int) == 3 ? 0 : 1;
+}
+"""
+        result_header = os.path.join(root, "gen", "result.h")
+        impl_header = os.path.join(root, "gen", "map_impl.h")
+        log_path = os.path.join(root, "clangd.log")
+        write(os.path.join(root, "autotmpl.conf"), """\
+dispatch=1
+dispatch_truncate=1
+dispatch_templates=Result
+""")
+        with open(log_path, "wb") as log:
+            proc = subprocess.Popen(
+                ["clangd", "--log=verbose", "--load=" + plugin],
+                cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=log, env=plugin_env(),
+            )
+            try:
+                send(proc, {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "processId": None,
+                        "rootUri": "file://" + root,
+                        "capabilities": {},
+                    },
+                })
+                send(proc, {"jsonrpc": "2.0", "method": "initialized",
+                            "params": {}})
+                send(proc, {
+                    "jsonrpc": "2.0",
+                    "method": "textDocument/didOpen",
+                    "params": {"textDocument": {
+                        "uri": "file://" + source,
+                        "languageId": "c",
+                        "version": 1,
+                        "text": text,
+                    }},
+                })
+                content = wait_for_content(result_header, lambda c: (
+                    "/* c-autotmpl: Result(int, float) */" in c and
+                    "/* c-autotmpl dispatch begin Result.map */" in c and
+                    "#define map(E1) C_AUTOTMPL_DISPATCH_CAT(map_, E1)" in c and
+                    "Result_int_float: map_int_float_float" in c
+                ))
+                if content is None:
+                    print("plugin explicit-method dispatch was not generated",
+                          file=sys.stderr)
+                    with open(log_path, errors="replace") as f:
+                        print(f.read()[-4000:], file=sys.stderr)
+                    return 1
+                if "/* c-autotmpl: Result(float) */" in content:
+                    print("plugin treated the explicit method arg as a type",
+                          file=sys.stderr)
+                    return 1
+                impl = wait_for_content(impl_header, lambda c: (
+                    "/* c-autotmpl: map_impl(int, float, float) */" in c
+                ))
+                if impl is None:
+                    print("plugin explicit-method implementation was not "
+                          "generated", file=sys.stderr)
+                    with open(log_path, errors="replace") as f:
+                        print(f.read()[-4000:], file=sys.stderr)
+                    return 1
+            finally:
+                try:
+                    send(proc, {"jsonrpc": "2.0", "id": 2,
+                                "method": "shutdown", "params": None})
+                    send(proc, {"jsonrpc": "2.0", "method": "exit",
+                                "params": None})
+                    proc.wait(timeout=5)
+                except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
+                    proc.kill()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return 0
+
+
 def check_dispatch_truncate(plugin):
     root = tempfile.mkdtemp(prefix="c-autotmpl-lsp-truncate-")
     try:
@@ -845,6 +955,8 @@ def main():
     if check_auto_config(plugin) != 0:
         return 1
     if check_dispatch(plugin) != 0:
+        return 1
+    if check_dispatch_method(plugin) != 0:
         return 1
     if check_dispatch_truncate(plugin) != 0:
         return 1

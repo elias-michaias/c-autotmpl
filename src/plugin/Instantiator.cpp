@@ -657,6 +657,129 @@ std::string makeDispatchSection(const TemplateDef &Template,
   return Out;
 }
 
+static std::string dispatchMethodSuffix(ArrayRef<std::string> Args) {
+  std::string Out;
+  for (const std::string &Arg : Args)
+    appendDispatchArg(Out, Arg);
+  return Out;
+}
+
+static std::string dispatchMethodTarget(const DispatchMethodDef &Method,
+                                        const DispatchCase &Case,
+                                        ArrayRef<std::string> ExplicitArgs) {
+  std::string Out = Method.Op;
+  if (Method.Owner) {
+    auto It = Method.Owner->DispatchTargets.find(Method.Op);
+    if (It != Method.Owner->DispatchTargets.end()) {
+      const DispatchTargetInfo &Target = It->second;
+      if (!Target.Base.empty())
+        Out = Target.Base;
+    }
+  }
+  for (const std::string &Arg : Case.Args)
+    appendDispatchArg(Out, Arg);
+  for (const std::string &Arg : ExplicitArgs)
+    appendDispatchArg(Out, Arg);
+  return Out;
+}
+
+std::string makeDispatchMethodSection(const DispatchMethodDef &Method,
+                                      ArrayRef<DispatchCase> Cases,
+                                      ArrayRef<DispatchMethodUse> Uses,
+                                      const DispatchConfig &Config,
+                                      StringRef OutputHeader) {
+  if (!Config.Enabled || !Method.Owner || !Method.Owner->DispatchEnabled ||
+      Cases.empty() || Uses.empty())
+    return {};
+  const TemplateDef &Owner = *Method.Owner;
+
+  std::string Out;
+  Out += "/* c-autotmpl dispatch begin " + Owner.Name + "." + Method.Op +
+         " */\n";
+  Out += "/* c-autotmpl generated-by=plugin */\n";
+  Out += "#ifndef C_AUTOTMPL_DISPATCH_MISSING\n";
+  Out += "#define C_AUTOTMPL_DISPATCH_MISSING\n";
+  Out += "static inline int c_autotmpl_dispatch_missing(void) "
+         "{ return 0; }\n";
+  Out += "#endif\n";
+
+  StringRef Path = OutputHeader.empty() ? Owner.GeneratedHeader : OutputHeader;
+  SmallString<256> GenDir(sys::path::parent_path(Path));
+  std::string Include = computeRelativePath(GenDir, Method.Impl.GeneratedHeader);
+  Out += "#include \"" + Include + "\"\n";
+  Out += "#ifndef C_AUTOTMPL_DISPATCH_CAT\n";
+  Out += "#define C_AUTOTMPL_DISPATCH_CAT_I(A, B) A##B\n";
+  Out += "#define C_AUTOTMPL_DISPATCH_CAT(A, B) "
+         "C_AUTOTMPL_DISPATCH_CAT_I(A, B)\n";
+  Out += "#endif\n";
+
+  std::string Guard =
+      "C_AUTOTMPL_DISPATCH_" + Owner.Name + "_" + Method.Op;
+  Out += "#ifndef " + Guard + "\n#define " + Guard + "\n";
+  std::string Expr = Method.Op + "_";
+  std::string Params;
+  for (size_t P = 0; P < Method.ExplicitParams.size(); ++P) {
+    if (P)
+      Params += ", ";
+    std::string Param = "E" + std::to_string(P + 1);
+    Params += Param;
+    Expr = "C_AUTOTMPL_DISPATCH_CAT(" + Expr + ", " + Param + ")";
+  }
+  Out += "#define " + Method.Op + "(" + Params + ") " + Expr + "\n";
+
+  for (const DispatchMethodUse &Use : Uses) {
+    std::string Suffix = dispatchMethodSuffix(Use.Args);
+    std::string MacroName = Method.Op + Suffix;
+    std::string UseGuard = Guard + "_EXPLICIT" + Suffix;
+    Out += "#ifndef " + UseGuard + "\n#define " + UseGuard + "\n";
+
+    for (size_t Arity = 1; Arity <= DispatchMaxArgs; ++Arity) {
+      std::string Base =
+          dispatchSelectorName(Owner.Name, MacroName, Arity, 0);
+      std::string SelectorParams = dispatchParams(Arity);
+      Out += "#define " + Base + "(" + SelectorParams +
+             ") c_autotmpl_dispatch_missing\n";
+      for (size_t I = 0; I < Cases.size(); ++I) {
+        std::string Presence = presenceMacro(Owner.Name, Cases[I].Type);
+        Out += "#ifdef " + Presence + "\n";
+        appendDispatchCaseSelector(Out, Config, Owner.Name, MacroName, I + 1,
+                                   Arity, Cases[I].Container,
+                                   dispatchMethodTarget(Method, Cases[I],
+                                                        Use.Args));
+        Out += "#else\n";
+        Out += "#define " +
+               dispatchSelectorName(Owner.Name, MacroName, Arity, I + 1) +
+               "(" + SelectorParams + ") " +
+               dispatchSelectorName(Owner.Name, MacroName, Arity, I) + "(" +
+               SelectorParams + ")\n";
+        Out += "#endif\n";
+      }
+    }
+
+    std::string Pick =
+        "C_AUTOTMPL_DISPATCH_PICK_" + Owner.Name + "_" + MacroName;
+    Out += "#define " + Pick + "(";
+    for (size_t K = 1; K <= DispatchMaxArgs + 1; ++K) {
+      if (K > 1)
+        Out += ", ";
+      Out += "_" + std::to_string(K);
+    }
+    Out += ", ...) _" + std::to_string(DispatchMaxArgs + 1) + "\n";
+    Out += "#define " + MacroName + "(...) " + Pick + "(__VA_ARGS__";
+    for (size_t K = DispatchMaxArgs; K > 0; --K)
+      Out +=
+          ", " + dispatchSelectorName(Owner.Name, MacroName, K, Cases.size());
+    Out += ", " +
+           dispatchSelectorName(Owner.Name, MacroName, 1, Cases.size()) +
+           ")(__VA_ARGS__)(__VA_ARGS__)\n";
+    Out += "#endif\n";
+  }
+  Out += "#endif\n";
+  Out += "/* c-autotmpl dispatch end " + Owner.Name + "." + Method.Op +
+         " */\n";
+  return Out;
+}
+
 std::string makeImplInstantiationBlock(const TemplateDef &Template,
                                        StringRef TypeSpelling,
                                        ArrayRef<std::string> Args,
@@ -988,6 +1111,95 @@ bool Instantiator::ensureDispatch(const TemplateDef &Template,
       NewContent += generatedHeaderFileGuard(Path);
       NewContent += "\n#define ";
       NewContent += generatedHeaderFileGuard(Path);
+      NewContent += "\n\n";
+      NewContent += Section;
+      NewContent += "#endif\n";
+    } else {
+      size_t Pos = Content.rfind("#endif");
+      size_t Insert = Content.size();
+      if (Pos != StringRef::npos) {
+        size_t LineStart = Content.rfind('\n', Pos);
+        Insert = LineStart == StringRef::npos ? 0 : LineStart + 1;
+        if (!Content.slice(Insert, Pos).trim().empty())
+          Insert = Content.size();
+      }
+      NewContent.append(Content.data(), Insert);
+      NewContent += Section;
+      NewContent.append(Content.data() + Insert, Content.size() - Insert);
+    }
+  }
+  if (NewContent == Content.str())
+    return false;
+
+  std::error_code EC;
+  SmallString<256> Dir(sys::path::parent_path(Path));
+  if (!Dir.empty()) {
+    EC = sys::fs::create_directories(Dir);
+    if (EC) {
+      Error = EC.message();
+      return false;
+    }
+  }
+  raw_fd_ostream OS(Path, EC, sys::fs::CD_CreateAlways);
+  if (EC) {
+    Error = EC.message();
+    return false;
+  }
+  OS << NewContent;
+  OS.close();
+  if (OS.has_error()) {
+    Error = "failed writing " + Path.str();
+    return false;
+  }
+  State.Content = std::move(NewContent);
+  State.Stamp = stampFor(Path);
+  return true;
+}
+
+bool Instantiator::ensureDispatchMethod(const DispatchMethodDef &Method,
+                                        ArrayRef<DispatchCase> Cases,
+                                        ArrayRef<DispatchMethodUse> Uses,
+                                        const DispatchConfig &Config,
+                                        StringRef OutputHeader,
+                                        std::string &Error) {
+  std::lock_guard<std::mutex> Lock(Mutex);
+  if (!Method.Owner || Uses.empty() || Cases.empty())
+    return false;
+  StringRef Path =
+      OutputHeader.empty() ? Method.Owner->GeneratedHeader : OutputHeader;
+  FileState &State = getState(Path);
+  StringRef Content(State.Content);
+
+  std::string Begin = "/* c-autotmpl dispatch begin " + Method.Owner->Name +
+                      "." + Method.Op + " */";
+  std::string End = "/* c-autotmpl dispatch end " + Method.Owner->Name + "." +
+                    Method.Op + " */";
+  size_t B = Content.find(Begin);
+  size_t E = B == StringRef::npos ? StringRef::npos : Content.find(End, B);
+
+  std::string Section =
+      makeDispatchMethodSection(Method, Cases, Uses, Config, Path);
+  std::string NewContent;
+  if (B != StringRef::npos && E != StringRef::npos) {
+    size_t After = Content.find('\n', E);
+    After = After == StringRef::npos ? E + End.size() : After + 1;
+    StringRef Existing = Content.slice(B, After);
+    // The CLI owns datatype(...) dispatch sections, including annotated method
+    // sections in CLI-generated headers. Never replace them from the plugin.
+    if (!Existing.contains("c-autotmpl generated-by=plugin"))
+      return false;
+    NewContent.append(Content.data(), B);
+    NewContent += Section;
+    NewContent.append(Content.data() + After, Content.size() - After);
+  } else {
+    if (Section.empty())
+      return false;
+    if (Content.empty()) {
+      std::string Guard = generatedHeaderFileGuard(Path);
+      NewContent += "#ifndef ";
+      NewContent += Guard;
+      NewContent += "\n#define ";
+      NewContent += Guard;
       NewContent += "\n\n";
       NewContent += Section;
       NewContent += "#endif\n";

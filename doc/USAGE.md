@@ -458,6 +458,55 @@ spelling. Older `BOX_FN(op, T)` paste declarations and concrete-only declaration
 such as `slab_set_int` remain accepted as fallbacks. `dispatch_affix` and
 `dispatch_style` have no effect while truncation is on.
 
+### Curried methods with explicit type arguments
+
+A method can take extra type arguments at the call site. Annotate a
+function-template section whose first parameters mirror the owning type, then
+list the remaining parameters after `explicit`:
+
+```c
+/* tmpl/result.h */
+#define RESULT_CAT4_I(A, B, C, D) A##B##C##D
+#define RESULT_CAT4(A, B, C, D) RESULT_CAT4_I(A, B, C, D)
+#define MAP_CAT6_I(A, B, C, D, E, F) A##B##C##D##E##F
+#define MAP_CAT6(A, B, C, D, E, F) MAP_CAT6_I(A, B, C, D, E, F)
+
+// -- template type Result(T, U)
+#define Result(T, U) RESULT_CAT4(Result_, T, _, U)
+typedef struct { T ok; U err; } Result(T, U);
+
+// -- template function map_impl(T, U, V)
+// -- dispatch method Result.map explicit V
+#define map_impl(T, U, V) MAP_CAT6(map_, T, _, U, _, V)
+static inline Result(V, U) map_impl(T, U, V)(Result(T, U) r, V (*f)(T)) {
+  Result(V, U) out = { f(r.ok), r.err };
+  return out;
+}
+```
+
+The generated public macro is curried. Its first call supplies the explicit
+type; the second call uses ordinary dispatch to infer the owner's arguments
+from the value:
+
+```c
+/* main.c */
+#include "gen/result.h"
+
+static float to_float(int x) { return (float)x / 2.0f; }
+
+int main(void) {
+  Result(int, float) r = {7, 0};
+  Result(float, float) mapped = map(float)(r, to_float);
+  return mapped.ok == 3.5f ? 0 : 1;
+}
+```
+
+The target is `<op>_<owner args>_<explicit args>`, so the example calls
+`map_int_float_float`. Explicit arguments are pasted into generated names, so
+use single-token types such as `float`, `int`, or a typedef name. Both the CLI
+and the clangd plugin understand the annotation; no source-file markers are
+needed.
+
 The rule covers direct declarations and paste-macro declarations, including
 two-argument templates such as `pair(Key, Value)`:
 

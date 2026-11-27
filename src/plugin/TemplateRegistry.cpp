@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <tuple>
 
 using namespace llvm;
@@ -504,6 +505,67 @@ StringRef stripStcQualifiers(StringRef S) {
   return S;
 }
 
+bool readIdentToken(StringRef &S, std::string &Out) {
+  while (!S.empty() && isSpace(S.front()))
+    S = S.drop_front();
+  if (S.empty() || !isIdentStart(S.front()))
+    return false;
+  size_t End = 1;
+  while (End < S.size() && isIdentChar(S[End]))
+    ++End;
+  Out = S.take_front(End).str();
+  S = S.drop_front(End);
+  return true;
+}
+
+/// `// -- dispatch method Result.map explicit V`
+bool parseDispatchMethodAnnotation(StringRef Line, DispatchMethodDef &Out) {
+  StringRef S = Line.ltrim();
+  if (!S.consume_front("//"))
+    return false;
+  S = S.ltrim();
+  if (!S.consume_front("--"))
+    return false;
+  S = S.ltrim();
+  if (!isWord(S, 0, "dispatch"))
+    return false;
+  S = S.drop_front(strlen("dispatch")).ltrim();
+  if (!isWord(S, 0, "method"))
+    return false;
+  S = S.drop_front(strlen("method"));
+
+  std::string Owner;
+  std::string Op;
+  if (!readIdentToken(S, Owner))
+    return false;
+  S = S.ltrim();
+  if (!S.consume_front(".") || !readIdentToken(S, Op))
+    return false;
+  S = S.ltrim();
+  if (!isWord(S, 0, "explicit"))
+    return false;
+  S = S.drop_front(strlen("explicit"));
+
+  SmallVector<std::string, 2> Params;
+  for (;;) {
+    std::string Name;
+    if (!readIdentToken(S, Name))
+      break;
+    if (llvm::find(Params, Name) == Params.end())
+      Params.push_back(std::move(Name));
+    S = S.ltrim();
+    if (!S.consume_front(","))
+      break;
+  }
+  if (Params.empty() || !S.trim().empty())
+    return false;
+
+  Out.OwnerName = std::move(Owner);
+  Out.Op = std::move(Op);
+  Out.ExplicitParams = Params;
+  return true;
+}
+
 bool parseDecorator(StringRef Line, TemplateDef &Out) {
   StringRef S = Line.ltrim();
   if (!S.consume_front("//"))
@@ -789,6 +851,23 @@ std::string computeRelativePath(StringRef FromDir, StringRef ToFile) {
   return Out.empty() ? std::string(".") : Out;
 }
 
+namespace {
+
+void fillTemplatePaths(TemplateDef &Def, StringRef HeaderPath, bool HasGuard) {
+  Def.Header = makeAbsolute(HeaderPath);
+  Def.GeneratedHeader = genHeaderPath(Def.Header, Def.Name);
+  Def.GeneratedImplSource = genImplPath(Def.Header, Def.Name);
+  Def.HasTmplHeaderGuard = HasGuard;
+  Def.IncludeFromGenDir =
+      computeRelativePath(sys::path::parent_path(Def.GeneratedHeader),
+                          Def.Header);
+  Def.IncludeFromImplDir =
+      computeRelativePath(sys::path::parent_path(Def.GeneratedImplSource),
+                          Def.Header);
+}
+
+} // namespace
+
 void TemplateRegistry::scanTree(StringRef Dir) {
   std::error_code EC;
   for (sys::fs::recursive_directory_iterator It(Dir, EC,
@@ -815,12 +894,30 @@ void TemplateRegistry::scanTree(StringRef Dir) {
 
     auto Def = std::make_unique<TemplateDef>();
     bool Found = false;
+    TemplateDef Section;
+    SmallVector<std::unique_ptr<DispatchMethodDef>, 2> FileMethods;
     while (!Cursor.empty()) {
       StringRef Line;
       std::tie(Line, Cursor) = Cursor.split('\n');
-      if (parseDecorator(Line, *Def)) {
-        Found = true;
-        break;
+      TemplateDef Candidate;
+      if (parseDecorator(Line, Candidate)) {
+        fillTemplatePaths(Candidate, It->path(), HasGuard);
+        if (!Found) {
+          *Def = Candidate;
+          Found = true;
+        }
+        // Only the first section becomes a registered template. Later sections
+        // are tracked just long enough to attach dispatch-method annotations.
+        Section = std::move(Candidate);
+        continue;
+      }
+      if (!Found || Section.Kind != TemplateKind::Function)
+        continue;
+      DispatchMethodDef Method;
+      if (parseDispatchMethodAnnotation(Line, Method)) {
+        Method.Impl = Section;
+        FileMethods.push_back(std::make_unique<DispatchMethodDef>(
+            std::move(Method)));
       }
     }
     if (!Found)
@@ -833,16 +930,8 @@ void TemplateRegistry::scanTree(StringRef Dir) {
     if (!Def->HasDatatypeDispatch)
       collectDispatchOps(Full, *Def);
 
-    Def->Header = makeAbsolute(It->path());
-    Def->GeneratedHeader = genHeaderPath(Def->Header, Def->Name);
-    Def->GeneratedImplSource = genImplPath(Def->Header, Def->Name);
-    Def->HasTmplHeaderGuard = HasGuard;
-    Def->IncludeFromGenDir =
-        computeRelativePath(sys::path::parent_path(Def->GeneratedHeader),
-                            Def->Header);
-    Def->IncludeFromImplDir =
-        computeRelativePath(sys::path::parent_path(Def->GeneratedImplSource),
-                            Def->Header);
+    for (auto &Method : FileMethods)
+      MethodDefs.push_back(std::move(Method));
 
     const TemplateDef *Ptr = Def.get();
     Owned.push_back(std::move(Def));
@@ -852,6 +941,33 @@ void TemplateRegistry::scanTree(StringRef Dir) {
 }
 
 void TemplateRegistry::finishScan() {
+  for (const auto &OwnedMethod : MethodDefs) {
+    DispatchMethodDef &Method = *OwnedMethod;
+    const TemplateDef *Owner = findByName(Method.OwnerName);
+    if (!Owner || Owner->Kind != TemplateKind::Type ||
+        Method.Impl.Kind != TemplateKind::Function)
+      continue;
+    size_t Base = Owner->Params.size();
+    if (Method.Impl.Params.size() != Base + Method.ExplicitParams.size())
+      continue;
+    bool Matches = true;
+    for (size_t I = 0; Matches && I < Base; ++I)
+      Matches = Method.Impl.Params[I] == Owner->Params[I];
+    for (size_t I = 0; Matches && I < Method.ExplicitParams.size(); ++I)
+      Matches = Method.Impl.Params[Base + I] == Method.ExplicitParams[I];
+    if (!Matches)
+      continue;
+    Method.Owner = Owner;
+    TemplateDef *MutableOwner = const_cast<TemplateDef *>(Owner);
+    MutableOwner->DispatchMethods.push_back(&Method);
+    // The curried macro owns this spelling. Suppress the ordinary dispatch op
+    // inferred from the annotated function declaration so `map(float)(...)`
+    // is not shadowed by a variadic `map(...)` selector.
+    MutableOwner->DispatchOps.erase(Method.Op);
+    MutableOwner->DispatchOpOffsets.erase(Method.Op);
+    MutableOwner->DispatchTargets.erase(Method.Op);
+  }
+
   std::stable_sort(ByLength.begin(), ByLength.end(),
                    [](const TemplateDef *A, const TemplateDef *B) {
                      return A->Name.size() > B->Name.size();
@@ -860,6 +976,7 @@ void TemplateRegistry::finishScan() {
 
 void TemplateRegistry::scan(StringRef Root) {
   Owned.clear();
+  MethodDefs.clear();
   ByName.clear();
   ByLength.clear();
   this->Root = Root.str();
@@ -870,6 +987,7 @@ void TemplateRegistry::scan(StringRef Root) {
 
 void TemplateRegistry::scanPreferTemplateDirs(StringRef Root) {
   Owned.clear();
+  MethodDefs.clear();
   ByName.clear();
   ByLength.clear();
   this->Root = Root.str();

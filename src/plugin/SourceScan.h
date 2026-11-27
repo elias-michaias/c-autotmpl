@@ -21,6 +21,13 @@ struct UsageDep {
   std::string TypeSpelling;
 };
 
+/// One `map(float)` call: the annotated method plus its explicit type args.
+struct FoundMethodUsage {
+  const DispatchMethodDef *Method;
+  std::string Key; // joined canonical explicit args, for dedup
+  llvm::SmallVector<std::string, 2> Args;
+};
+
 struct FoundUsage {
   const TemplateDef *Template;
   std::string TypeSpelling;
@@ -68,7 +75,8 @@ void scanTemplateUsage(const TemplateDef &Template, llvm::StringRef RawType,
 /// Nested template applications in type arguments are expanded and their
 /// dependencies are emitted before the outer usage.
 void scanUsages(llvm::StringRef Code, const TemplateRegistry &Registry,
-                llvm::SmallVectorImpl<FoundUsage> &Out);
+                llvm::SmallVectorImpl<FoundUsage> &Out,
+                llvm::SmallVectorImpl<FoundMethodUsage> *MethodOut = nullptr);
 
 /// Affix and placement used by generated dispatch macros. Dispatch calls are
 /// ignored by the usage scanner so they do not look like mangled types.

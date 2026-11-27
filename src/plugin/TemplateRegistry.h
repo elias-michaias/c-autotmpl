@@ -67,6 +67,9 @@ struct DispatchTargetInfo {
   bool AppendArgs = false; // true for box_alloc(T)-style macro calls
 };
 
+struct TemplateDef;
+struct DispatchMethodDef;
+
 struct TemplateDef {
   TemplateKind Kind = TemplateKind::Type;
   std::string Name;                            // "List"
@@ -83,7 +86,19 @@ struct TemplateDef {
   llvm::StringSet<> DispatchOps;                // method-like operation names
   llvm::StringMap<unsigned> DispatchOpOffsets;  // declaration offsets in Header
   llvm::StringMap<DispatchTargetInfo> DispatchTargets; // op -> call target
+  llvm::SmallVector<const DispatchMethodDef *, 2> DispatchMethods;
   bool DispatchEnabled = false;
+};
+
+/// `// -- dispatch method Result.map explicit V` on a function template. The
+/// first OwnerParams entries of the function's parameters mirror the owning
+/// type template; the rest are explicit args supplied by the caller.
+struct DispatchMethodDef {
+  std::string OwnerName;
+  std::string Op;
+  llvm::SmallVector<std::string, 2> ExplicitParams;
+  const TemplateDef *Owner = nullptr;
+  TemplateDef Impl; // the annotated function-template section
 };
 
 /// True for arguments that need include-guard and dependency handling.
@@ -151,6 +166,14 @@ public:
     return nullptr;
   }
 
+  /// Returns an annotated curried method such as `map(float)(...)`.
+  const DispatchMethodDef *findDispatchMethod(llvm::StringRef Op) const {
+    for (const auto &Method : MethodDefs)
+      if (Method->Owner && Method->Op == Op)
+        return Method.get();
+    return nullptr;
+  }
+
   /// Matches e.g. "List_int" to template "List" with type spelling "int".
   /// Returns nullptr if no known template is a prefix.
   const TemplateDef *matchMangled(llvm::StringRef Mangled,
@@ -185,6 +208,9 @@ public:
   const std::vector<std::unique_ptr<TemplateDef>> &templates() const {
     return Owned;
   }
+  const std::vector<std::unique_ptr<DispatchMethodDef>> &methods() const {
+    return MethodDefs;
+  }
   llvm::StringRef root() const { return Root; }
 
 private:
@@ -194,6 +220,7 @@ private:
   std::string Root;
   // Stable addresses: scan creates owned entries, maps only hold pointers.
   std::vector<std::unique_ptr<TemplateDef>> Owned;
+  std::vector<std::unique_ptr<DispatchMethodDef>> MethodDefs;
   llvm::StringMap<const TemplateDef *> ByName;
   // Longest names first, so "List_List" doesn't match "List".
   llvm::SmallVector<const TemplateDef *, 8> ByLength;

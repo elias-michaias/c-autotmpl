@@ -564,7 +564,8 @@ struct SharedState {
                      llvm::StringMap<llvm::StringSet<>> *ImplOut = nullptr)
       const {
     SmallVector<FoundUsage, 32> Usages;
-    scanUsages(Text, Registry, Usages);
+    SmallVector<FoundMethodUsage, 8> MethodUsages;
+    scanUsages(Text, Registry, Usages, &MethodUsages);
     for (size_t I = 0; I < Usages.size(); ++I) {
       if (Usages[I].IsNested)
         continue;
@@ -584,6 +585,26 @@ struct SharedState {
             !Usage.Template->GeneratedImplSource.empty())
           (*ImplOut)[Usage.Template->GeneratedImplSource].insert(
               std::move(Marker));
+      }
+    }
+
+    for (const auto &OwnedMethod : Registry.methods()) {
+      const DispatchMethodDef &Method = *OwnedMethod;
+      for (const FoundMethodUsage &Found : MethodUsages) {
+        if (Found.Method != &Method)
+          continue;
+        for (const FoundUsage &Usage : Usages) {
+          if (Usage.IsNested || Usage.Template != Method.Owner)
+            continue;
+          SmallVector<std::string, 4> FullArgs;
+          for (const std::string &Arg : Usage.Args)
+            FullArgs.push_back(Arg);
+          for (const std::string &Arg : Found.Args)
+            FullArgs.push_back(Arg);
+          std::string Marker = instantiationMarker(
+              Method.Impl.Name, joinExplicitArgs(FullArgs));
+          Out[Method.Impl.GeneratedHeader].insert(std::move(Marker));
+        }
       }
     }
     (void)Path;
@@ -900,15 +921,16 @@ struct SharedState {
 
   void generateFromText(StringRef Text, clang::CompilerInstance *CI) {
     SmallVector<FoundUsage, 32> Usages;
-    scanUsages(Text, Registry, Usages);
-    generateUsages(Usages, CI);
+    SmallVector<FoundMethodUsage, 8> MethodUsages;
+    scanUsages(Text, Registry, Usages, &MethodUsages);
+    generateUsages(Usages, CI, MethodUsages);
   }
 
   /// Groups each top-level usage with the nested usages emitted immediately
   /// before it. The whole chain is written to one generated header so mutually
   /// dependent types cannot be separated by include order.
-  void generateUsages(ArrayRef<FoundUsage> Usages,
-                      clang::CompilerInstance *CI) {
+  void generateUsages(ArrayRef<FoundUsage> Usages, clang::CompilerInstance *CI,
+                      ArrayRef<FoundMethodUsage> MethodUsages = {}) {
     generateImplUsages(Usages, CI);
     llvm::StringMap<llvm::StringSet<>> AdapterOps;
     for (const FoundUsage &Usage : Usages)
@@ -925,7 +947,7 @@ struct SharedState {
         Chain.push_back(&Usages[J]);
       generateChain(Chain, CI, nullptr, AdapterOps);
     }
-    generateDispatch(Usages, AdapterOps);
+    generateDispatch(Usages, AdapterOps, MethodUsages, CI);
   }
 
   struct DispatchGroup {
@@ -946,8 +968,7 @@ struct SharedState {
   void addDispatchCase(llvm::SmallVectorImpl<DispatchGroup> &Groups,
                        StringRef Output, const FoundUsage &Usage) {
     const TemplateDef *Template = Usage.Template;
-    if (!Template || Template->Kind != TemplateKind::Type ||
-        Template->HasDatatypeDispatch)
+    if (!Template || Template->Kind != TemplateKind::Type)
       return;
     DispatchGroup *Group = findDispatchGroup(Groups, Template, Output);
     if (!Group) {
@@ -966,21 +987,21 @@ struct SharedState {
   /// Rewrites every dispatch section from scratch so added specializations,
   /// removed specializations, and env changes all stay in sync with the
   /// current source scan.
-  void generateDispatch(ArrayRef<FoundUsage> Usages,
-                        const llvm::StringMap<llvm::StringSet<>> &AdapterOps =
-                            {}) {
+  void generateDispatch(
+      ArrayRef<FoundUsage> Usages,
+      const llvm::StringMap<llvm::StringSet<>> &AdapterOps = {},
+      ArrayRef<FoundMethodUsage> MethodUsages = {},
+      clang::CompilerInstance *CI = nullptr) {
     llvm::SmallVector<DispatchGroup, 4> Groups;
     for (const auto &Owned : Registry.templates()) {
       const TemplateDef *Template = Owned.get();
       if (Template->Kind != TemplateKind::Type)
         continue;
       // CLI-generated datatype headers already contain dispatch selectors
-      // derived from their variant list. Rewriting them here would replace
-      // payload-dispatched constructors with container-only selectors.
-      if (Template->HasDatatypeDispatch) {
+      // derived from their variant list. Keep them in the group so annotated
+      // curried methods can be added, but never rewrite that base section.
+      if (Template->HasDatatypeDispatch)
         log("keeping CLI dispatch for " + Template->Name);
-        continue;
-      }
       Groups.push_back({Template, Template->GeneratedHeader, {}});
     }
     for (const FoundUsage &Usage : Usages)
@@ -996,7 +1017,62 @@ struct SharedState {
         addDispatchCase(Groups, Output, Usages[J]);
     }
 
+    // Curried methods cross every owner specialization with every explicit
+    // type tuple seen at a `map(float)(...)` call. The implementation template
+    // is synthesized like any other function specialization, then the method
+    // section is emitted into the owner's generated header.
+    for (const auto &OwnedMethod : Registry.methods()) {
+      const DispatchMethodDef &Method = *OwnedMethod;
+      if (!Method.Owner || !Method.Owner->DispatchEnabled)
+        continue;
+      DispatchGroup *Group = findDispatchGroup(
+          Groups, Method.Owner, Method.Owner->GeneratedHeader);
+      if (!Group)
+        continue;
+
+      SmallVector<DispatchMethodUse, 4> Uses;
+      for (const FoundMethodUsage &Found : MethodUsages) {
+        if (Found.Method != &Method)
+          continue;
+        bool Duplicate = false;
+        for (const DispatchMethodUse &Use : Uses)
+          if (Use.Key == Found.Key)
+            Duplicate = true;
+        if (Duplicate)
+          continue;
+        DispatchMethodUse Use;
+        Use.Key = Found.Key;
+        for (const std::string &Arg : Found.Args)
+          Use.Args.push_back(Arg);
+        Uses.push_back(std::move(Use));
+      }
+
+      for (const DispatchMethodUse &Use : Uses) {
+        for (const DispatchCase &Case : Group->Cases) {
+          FoundUsage ImplUsage;
+          ImplUsage.Template = &Method.Impl;
+          SmallVector<std::string, 4> FullArgs;
+          for (const std::string &Arg : Case.Args)
+            FullArgs.push_back(Arg);
+          for (const std::string &Arg : Use.Args)
+            FullArgs.push_back(Arg);
+          ImplUsage.TypeSpelling = joinExplicitArgs(FullArgs);
+          for (const std::string &Arg : FullArgs)
+            ImplUsage.Args.push_back(Arg);
+          generateInto(ImplUsage, Method.Impl.GeneratedHeader, CI, {}, {});
+        }
+      }
+
+      std::string Error;
+      Inst.ensureDispatchMethod(Method, Group->Cases, Uses, Dispatch,
+                                Group->Output, Error);
+      if (!Error.empty())
+        log(std::string("failed explicit method dispatch: ") + Error);
+    }
+
     for (const DispatchGroup &Group : Groups) {
+      if (Group.Template->HasDatatypeDispatch)
+        continue;
       TemplateDef DispatchTemplate = *Group.Template;
       SmallVector<std::string, 4> OwnedOps;
       llvm::StringSet<> SeenOps;

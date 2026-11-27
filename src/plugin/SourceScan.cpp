@@ -12,6 +12,7 @@ namespace c_autotmpl {
 static void scanUsagesImpl(llvm::StringRef Code,
                            const TemplateRegistry &Registry,
                            llvm::SmallVectorImpl<FoundUsage> &Out,
+                           llvm::SmallVectorImpl<FoundMethodUsage> *MethodOut,
                            bool ScanHeaders);
 
 namespace {
@@ -294,7 +295,7 @@ static void scanHeaderDeps(const TemplateDef &Template,
 
   std::string Source = substituteParams((*Buf)->getBuffer(), Template, Args);
   SmallVector<FoundUsage, 4> Header;
-  scanUsagesImpl(Source, Registry, Header, /*ScanHeaders=*/false);
+  scanUsagesImpl(Source, Registry, Header, nullptr, /*ScanHeaders=*/false);
 
   // The substituted header spells the instantiation itself, e.g.
   // `list_sum(int)(...)` or `User(Option, int)`. That is the usage we are
@@ -649,8 +650,54 @@ static std::string dispatchTypeArgsFromCall(StringRef Raw,
   return Out;
 }
 
+static void addDispatchMethodUse(const DispatchMethodDef &Method,
+                                 StringRef Raw,
+                                 const TemplateRegistry &Registry,
+                                 SmallVectorImpl<FoundUsage> &Out,
+                                 SmallVectorImpl<FoundMethodUsage> *MethodOut,
+                                 bool ScanHeaders) {
+  if (!MethodOut)
+    return;
+
+  TemplateDef Probe = Method.Impl;
+  Probe.Params.clear();
+  for (const std::string &Param : Method.ExplicitParams)
+    Probe.Params.push_back(Param);
+  SmallVector<std::string, 4> RawArgs;
+  if (!splitExplicitArgs(Raw, Probe, RawArgs) ||
+      RawArgs.size() != Method.ExplicitParams.size())
+    return;
+  for (const std::string &Arg : RawArgs)
+    if (isDeclaredParam(Method.Impl, Arg))
+      return;
+
+  SmallVector<FoundUsage, 4> Expanded;
+  SmallVector<std::string, 4> CanonArgs;
+  size_t Base = Method.Owner ? Method.Owner->Params.size() : 0;
+  for (size_t I = 0; I < RawArgs.size(); ++I)
+    CanonArgs.push_back(
+        canonicalizeArgument(RawArgs[I], Method.Impl, Base + I, Registry,
+                             Expanded));
+  if (ScanHeaders)
+    scanHeaderDeps(Method.Impl, CanonArgs, Registry, Expanded);
+
+  FoundMethodUsage Use;
+  Use.Method = &Method;
+  Use.Key = joinExplicitArgs(CanonArgs);
+  for (const FoundMethodUsage &Existing : *MethodOut)
+    if (Existing.Method == &Method && Existing.Key == Use.Key)
+      return;
+  for (const std::string &Arg : CanonArgs)
+    Use.Args.push_back(Arg);
+  for (FoundUsage &Dep : Expanded)
+    Dep.IsNested = true;
+  Out.append(Expanded.begin(), Expanded.end());
+  MethodOut->push_back(std::move(Use));
+}
+
 static void scanUsagesImpl(StringRef Code, const TemplateRegistry &Registry,
                            SmallVectorImpl<FoundUsage> &Out,
+                           SmallVectorImpl<FoundMethodUsage> *MethodOut,
                            bool ScanHeaders) {
   if (!Registry.mayContainUsage(Code))
     return;
@@ -714,6 +761,50 @@ static void scanUsagesImpl(StringRef Code, const TemplateRegistry &Registry,
             I = Close;
             continue;
           }
+        }
+      }
+    } else if (const DispatchMethodDef *Method =
+                   Registry.findDispatchMethod(Ident)) {
+      // Curried explicit method: map(float)(result, f). The inner call carries
+      // only the explicit args; T and U are recovered later from the owner's
+      // cases by the module's dispatch generation.
+      unsigned K = End;
+      while (K < S.size() && isSpace(S[K]))
+        ++K;
+      if (K < S.size() && S[K] == '(') {
+        unsigned Start = K + 1;
+        int Depth = 1;
+        unsigned Close = Start;
+        for (; Close < S.size() && Depth > 0; ++Close) {
+          if (S[Close] == '(')
+            ++Depth;
+          else if (S[Close] == ')')
+            --Depth;
+        }
+        if (Depth == 0 && Close > Start + 1) {
+          StringRef Raw = S.slice(Start, Close - 1).trim();
+          unsigned After = Close;
+          while (After < S.size() && isSpace(S[After]))
+            ++After;
+          if (After < S.size() && S[After] == '(') {
+            unsigned CallStart = After + 1;
+            int CallDepth = 1;
+            unsigned CallClose = CallStart;
+            for (; CallClose < S.size() && CallDepth > 0; ++CallClose) {
+              if (S[CallClose] == '(')
+                ++CallDepth;
+              else if (S[CallClose] == ')')
+                --CallDepth;
+            }
+            if (CallDepth == 0) {
+              addDispatchMethodUse(*Method, Raw, Registry, Out, MethodOut,
+                                   ScanHeaders);
+              I = CallClose;
+              continue;
+            }
+          }
+          I = Close;
+          continue;
         }
       }
     } else if (DispatchTruncate) {
@@ -805,8 +896,9 @@ static void scanUsagesImpl(StringRef Code, const TemplateRegistry &Registry,
 }
 
 void scanUsages(StringRef Code, const TemplateRegistry &Registry,
-                SmallVectorImpl<FoundUsage> &Out) {
-  scanUsagesImpl(Code, Registry, Out, /*ScanHeaders=*/true);
+                SmallVectorImpl<FoundUsage> &Out,
+                SmallVectorImpl<FoundMethodUsage> *MethodOut) {
+  scanUsagesImpl(Code, Registry, Out, MethodOut, /*ScanHeaders=*/true);
 }
 
 } // namespace c_autotmpl

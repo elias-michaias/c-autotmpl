@@ -31,6 +31,12 @@ struct DispatchCase {
   std::vector<std::string> Args;         // canonical individual arguments
 };
 
+/// One explicit type tuple seen at a curried method call such as map(float).
+struct DispatchMethodUse {
+  std::string Key;                       // joined args, for dedup
+  std::vector<std::string> Args;         // canonical explicit type args
+};
+
 /// Caches generated-header contents and append-only instantiation markers.
 /// Shared between AST worker threads; all mutations are serialized.
 class Instantiator {
@@ -54,6 +60,15 @@ public:
                       llvm::ArrayRef<llvm::StringRef> Ops,
                       const DispatchConfig &Config,
                       llvm::StringRef OutputHeader, std::string &Error);
+
+  /// Rewrites the marked section for an annotated curried method. A section
+  /// already present without the plugin marker is CLI-owned and left alone.
+  bool ensureDispatchMethod(const DispatchMethodDef &Method,
+                            llvm::ArrayRef<DispatchCase> Cases,
+                            llvm::ArrayRef<DispatchMethodUse> Uses,
+                            const DispatchConfig &Config,
+                            llvm::StringRef OutputHeader,
+                            std::string &Error);
 
   /// Removes generated blocks that are not in Keep. Returns true and fills
   /// Removed when the generated header changed.
@@ -117,6 +132,12 @@ std::string makeDispatchSection(const TemplateDef &Template,
                                 llvm::ArrayRef<DispatchCase> Cases,
                                 llvm::ArrayRef<llvm::StringRef> Ops,
                                 const DispatchConfig &Config);
+
+std::string makeDispatchMethodSection(const DispatchMethodDef &Method,
+                                      llvm::ArrayRef<DispatchCase> Cases,
+                                      llvm::ArrayRef<DispatchMethodUse> Uses,
+                                      const DispatchConfig &Config,
+                                      llvm::StringRef OutputHeader);
 
 /// Presence macro used by generated implementation sources. It deliberately
 /// uses a different prefix from public headers so the two block sets cannot

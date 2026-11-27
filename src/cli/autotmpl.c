@@ -1126,11 +1126,36 @@ typedef struct {
   char *macro; /* NULL means use the decorator parameter name */
 } ArgSpec;
 
+typedef struct TemplateDef TemplateDef;
+
+/* One explicit type tuple seen at a curried dispatch-method call site. */
+typedef struct {
+  char *key; /* joined canonical args, for dedup */
+  Vec args;  /* canonical explicit type args */
+} ExplicitMethodUse;
+
+/* A function-template section can declare itself as a method of a type
+ * template with extra explicit type args:
+ *
+ *   // -- template function map_impl(T, U, V)
+ *   // -- dispatch method Result.map explicit V
+ *
+ * T and U come from the owning type instantiation; V is supplied at the call
+ * site with `map(float)(result, f)`. */
+typedef struct {
+  char *owner_name;
+  char *op;
+  Vec explicit_params; /* char*, in function-template parameter order */
+  TemplateDef *impl;   /* registry-owned function template */
+  Vec uses;            /* ExplicitMethodUse* */
+} DispatchMethod;
+
 typedef struct {
   char *op;
   char *base;   /* stable function spelling, when the name does not vary */
   char *suffix; /* generated suffix appended to the concrete container */
   int append_args;
+  DispatchMethod *method; /* non-NULL for curried explicit methods */
 } DispatchTarget;
 
 /* A dispatch operation can be keyed on a template parameter instead of the
@@ -1140,7 +1165,7 @@ typedef struct {
   char *expr; /* e.g. T */
 } DispatchKey;
 
-typedef struct {
+struct TemplateDef {
   TemplateKind kind;
   char *name;
   char **params;
@@ -1161,8 +1186,9 @@ typedef struct {
   Set explicit_ops;       /* operation macros authored in the template header */
   Vec dispatch_targets;   /* DispatchTarget*, op-specific call name prefixes */
   Vec dispatch_keys;      /* DispatchKey*, op-specific _Generic key expressions */
+  Vec dispatch_methods;   /* DispatchMethod*, explicit-arg methods on this type */
   int dispatch_enabled;
-} TemplateDef;
+};
 
 typedef struct {
   Vec items; /* TemplateDef* */
@@ -1420,6 +1446,7 @@ static void set_dispatch_target(TemplateDef *tmpl, const char *op,
       target->base = base ? xstrdup(base) : NULL;
       target->suffix = suffix ? xstrdup(suffix) : NULL;
       target->append_args = append_args;
+      target->method = NULL;
       return;
     }
   }
@@ -1428,6 +1455,7 @@ static void set_dispatch_target(TemplateDef *tmpl, const char *op,
   target->base = base ? xstrdup(base) : NULL;
   target->suffix = suffix ? xstrdup(suffix) : NULL;
   target->append_args = append_args;
+  target->method = NULL;
   vec_push(&tmpl->dispatch_targets, target);
 }
 
@@ -2064,6 +2092,86 @@ static void apply_dispatch(Registry *reg, const DispatchConfig *cfg) {
     TemplateDef *def = (TemplateDef *)reg->items.items[i];
     def->dispatch_enabled = cfg->enabled && def->kind == TEMPLATE_TYPE &&
                             (!cfg->has_names || set_has(&cfg->names, def->name));
+  }
+}
+
+static DispatchMethod *find_dispatch_method(const TemplateDef *tmpl,
+                                            const char *op) {
+  if (!tmpl)
+    return NULL;
+  for (size_t i = 0; i < tmpl->dispatch_methods.len; ++i) {
+    DispatchMethod *m = (DispatchMethod *)tmpl->dispatch_methods.items[i];
+    if (m->op && !strcmp(m->op, op))
+      return m;
+  }
+  return NULL;
+}
+
+static void set_dispatch_method_target(TemplateDef *owner, DispatchMethod *m) {
+  set_dispatch_target(owner, m->op, m->op, NULL, 1);
+  for (size_t i = 0; i < owner->dispatch_targets.len; ++i) {
+    DispatchTarget *target =
+        (DispatchTarget *)owner->dispatch_targets.items[i];
+    if (!strcmp(target->op, m->op)) {
+      target->method = m;
+      return;
+    }
+  }
+}
+
+/* Resolve annotations after all sections are registered. The implementation's
+ * first owner->nparams parameters must be the owner's parameters; any remaining
+ * parameters are the explicit args supplied by the curried call. */
+static void resolve_dispatch_methods(Registry *reg) {
+  for (size_t i = 0; i < reg->items.len; ++i) {
+    TemplateDef *fn = (TemplateDef *)reg->items.items[i];
+    if (fn->kind != TEMPLATE_FUNCTION || !fn->dispatch_methods.len)
+      continue;
+
+    for (size_t j = 0; j < fn->dispatch_methods.len; ++j) {
+      DispatchMethod *m = (DispatchMethod *)fn->dispatch_methods.items[j];
+      TemplateDef *owner = registry_find(reg, m->owner_name);
+      if (!owner || owner->kind != TEMPLATE_TYPE) {
+        fprintf(stderr,
+                "warning: dispatch method %s.%s ignored: unknown type %s\n",
+                m->owner_name, m->op, m->owner_name);
+        continue;
+      }
+      size_t ebase = owner->nparams;
+      if (fn->nparams != ebase + m->explicit_params.len) {
+        fprintf(stderr,
+                "warning: dispatch method %s.%s ignored: %s has %zu params, expected %zu\n",
+                m->owner_name, m->op, fn->name, fn->nparams,
+                ebase + m->explicit_params.len);
+        continue;
+      }
+      int ok = 1;
+      for (size_t k = 0; ok && k < ebase; ++k)
+        if (strcmp(fn->params[k], owner->params[k]))
+          ok = 0;
+      for (size_t k = 0; ok && k < m->explicit_params.len; ++k)
+        if (strcmp(fn->params[ebase + k],
+                   (char *)m->explicit_params.items[k]))
+          ok = 0;
+      if (!ok) {
+        fprintf(stderr,
+                "warning: dispatch method %s.%s ignored: parameter names do not match %s\n",
+                m->owner_name, m->op, fn->name);
+        continue;
+      }
+      TemplateDef *previous = registry_find_op(reg, m->op);
+      if (previous && previous != owner && !find_dispatch_method(previous, m->op)) {
+        fprintf(stderr,
+                "warning: dispatch method %s.%s ignored: op already owned by %s\n",
+                m->owner_name, m->op, previous->name);
+        continue;
+      }
+
+      m->impl = fn;
+      set_add(&owner->dispatch_ops, m->op);
+      set_dispatch_method_target(owner, m);
+      vec_push(&owner->dispatch_methods, m);
+    }
   }
 }
 
@@ -3419,6 +3527,112 @@ static int parse_decorator(const char *line, TemplateDef *out) {
   return *s == ')';
 }
 
+static int read_ident_token(const char **p, char **out) {
+  while (is_space(**p))
+    ++*p;
+  if (!is_ident_start(**p))
+    return 0;
+  const char *start = *p;
+  while (is_ident_char(**p))
+    ++*p;
+  *out = xstrdup_n(start, (size_t)(*p - start));
+  return 1;
+}
+
+/* `// -- dispatch method Result.map explicit V` marks a function-template
+ * section as a curried method of the owning type template. The first
+ * owner->nparams parameters of the function must match the owner's parameters;
+ * the rest are explicit type args supplied by the caller. */
+static int parse_dispatch_method_annotation(const char *line,
+                                            DispatchMethod *out) {
+  const char *s = line;
+  while (is_space(*s))
+    ++s;
+  if (strncmp(s, "//", 2))
+    return 0;
+  s += 2;
+  while (is_space(*s))
+    ++s;
+  if (strncmp(s, "--", 2))
+    return 0;
+  s += 2;
+  while (is_space(*s))
+    ++s;
+
+  if (!is_word(s, 0, "dispatch"))
+    return 0;
+  s += strlen("dispatch");
+  while (is_space(*s))
+    ++s;
+  if (!is_word(s, 0, "method"))
+    return 0;
+  s += strlen("method");
+
+  char *owner = NULL;
+  char *op = NULL;
+  if (!read_ident_token(&s, &owner))
+    return 0;
+  while (is_space(*s))
+    ++s;
+  if (*s++ != '.') {
+    free(owner);
+    return 0;
+  }
+  if (!read_ident_token(&s, &op)) {
+    free(owner);
+    return 0;
+  }
+  while (is_space(*s))
+    ++s;
+  if (!is_word(s, 0, "explicit")) {
+    free(owner);
+    free(op);
+    return 0;
+  }
+  s += strlen("explicit");
+
+  Vec params;
+  params.items = NULL;
+  params.len = params.cap = 0;
+  for (;;) {
+    char *name = NULL;
+    if (!read_ident_token(&s, &name))
+      break;
+    int dup = 0;
+    for (size_t i = 0; i < params.len; ++i)
+      if (!strcmp((char *)params.items[i], name))
+        dup = 1;
+    if (dup)
+      free(name);
+    else
+      vec_push(&params, name);
+    while (is_space(*s))
+      ++s;
+    if (*s != ',')
+      break;
+    ++s;
+  }
+  while (is_space(*s))
+    ++s;
+
+  if (!params.len || *s) {
+    for (size_t i = 0; i < params.len; ++i)
+      free(params.items[i]);
+    free(params.items);
+    free(owner);
+    free(op);
+    return 0;
+  }
+
+  out->owner_name = owner;
+  out->op = op;
+  out->explicit_params = params;
+  out->impl = NULL;
+  out->uses.items = NULL;
+  out->uses.len = out->uses.cap = 0;
+  return 1;
+}
+
 static int is_header_ext(const char *ext) {
   return strcmp(ext, ".h") == 0 || strcmp(ext, ".hh") == 0 ||
          strcmp(ext, ".hpp") == 0 || strcmp(ext, ".hxx") == 0;
@@ -3543,6 +3757,18 @@ static int visit_template_file(const char *path, void *ctx) {
       def = candidate;
       have_section = 1;
       section_start = p;
+    } else if (have_section && def.kind == TEMPLATE_FUNCTION &&
+               !def.dispatch_methods.len) {
+      DispatchMethod ann;
+      memset(&ann, 0, sizeof(ann));
+      if (parse_dispatch_method_annotation(line, &ann)) {
+        DispatchMethod *owned =
+            (DispatchMethod *)xmalloc(sizeof(DispatchMethod));
+        *owned = ann;
+        /* Replaced with the registry copy during resolution. */
+        owned->impl = &def;
+        vec_push(&def.dispatch_methods, owned);
+      }
     }
     free(line);
     if (!newline)
@@ -4210,6 +4436,34 @@ done:
   free(raw_args.items);
 }
 
+static void add_explicit_method_use(DispatchMethod *m, Vec *canon_args,
+                                    Vec *deps, Vec *out) {
+  char *key = join_strings(canon_args, ", ");
+  for (size_t i = 0; i < m->uses.len; ++i) {
+    ExplicitMethodUse *u = (ExplicitMethodUse *)m->uses.items[i];
+    if (!strcmp(u->key, key)) {
+      free(key);
+      return;
+    }
+  }
+  ExplicitMethodUse *u =
+      (ExplicitMethodUse *)xmalloc(sizeof(ExplicitMethodUse));
+  u->key = key;
+  u->args.items = NULL;
+  u->args.len = u->args.cap = 0;
+  for (size_t i = 0; i < canon_args->len; ++i)
+    vec_push(&u->args, xstrdup((char *)canon_args->items[i]));
+  vec_push(&m->uses, u);
+
+  /* Nested generated types used as explicit args need their own blocks. */
+  for (size_t i = 0; i < deps->len; ++i) {
+    Usage *dep = (Usage *)deps->items[i];
+    dep->nested = 0;
+    vec_push(out, dep);
+  }
+  deps->len = 0;
+}
+
 static char *substitute_params(const char *code, const TemplateDef *tmpl,
                                Vec *args) {
   Str out;
@@ -4409,14 +4663,69 @@ static void scan_usages_impl(const char *code, Registry *reg, Vec *out,
           }
           if (depth == 0 && close > begin + 1) {
             char *raw = xstrdup_n(clean + begin, close - begin - 1);
-            char *type = dispatch_type_args_from_call(raw, reg);
-            if (type[0])
-              scan_template_usage(op_tmpl, type, reg, out, scan_headers);
-            free(type);
+            DispatchMethod *method = find_dispatch_method(op_tmpl, match_ident);
+            size_t after = close;
+            while (after < n && is_space(clean[after]))
+              ++after;
+
+            if (method) {
+              /* A curried explicit-method call: map(float)(result, f). */
+              size_t call_close = matching_paren(clean, after, n);
+              if (after < n && clean[after] == '(' && call_close < n) {
+                Vec raw_args, canon_args, expanded;
+                raw_args.items = NULL;
+                raw_args.len = raw_args.cap = 0;
+                canon_args.items = NULL;
+                canon_args.len = canon_args.cap = 0;
+                expanded.items = NULL;
+                expanded.len = expanded.cap = 0;
+                split_type_args(raw, &raw_args);
+                if (raw_args.len == method->explicit_params.len) {
+                  int ok = 1;
+                  for (size_t a = 0; ok && a < raw_args.len; ++a) {
+                    if (is_declared_param(method->impl,
+                                          (char *)raw_args.items[a])) {
+                      ok = 0;
+                      break;
+                    }
+                    char *canon = canonicalize_argument(
+                        (char *)raw_args.items[a], method->impl,
+                        op_tmpl->nparams + a, reg, &expanded);
+                    if (!canon[0])
+                      ok = 0;
+                    if (ok)
+                      vec_push(&canon_args, canon);
+                    else
+                      free(canon);
+                  }
+                  if (ok)
+                    add_explicit_method_use(method, &canon_args, &expanded,
+                                            out);
+                }
+                for (size_t a = 0; a < canon_args.len; ++a)
+                  free(canon_args.items[a]);
+                free(canon_args.items);
+                for (size_t a = 0; a < expanded.len; ++a)
+                  usage_free((Usage *)expanded.items[a]);
+                free(expanded.items);
+                for (size_t a = 0; a < raw_args.len; ++a)
+                  free(raw_args.items[a]);
+                free(raw_args.items);
+                i = call_close;
+              } else {
+                /* Incomplete `map(float)` is not a plain dispatch call. */
+                i = close;
+              }
+            } else {
+              char *type = dispatch_type_args_from_call(raw, reg);
+              if (type[0])
+                scan_template_usage(op_tmpl, type, reg, out, scan_headers);
+              free(type);
+              i = close;
+            }
             free(raw);
             free(match_ident);
             free(ident);
-            i = close;
             continue;
           }
         }
@@ -4968,6 +5277,41 @@ static char *dispatch_call_target(const TemplateDef *tmpl, const char *op,
   return str_take(&out);
 }
 
+/* Curried methods append owner args then the explicit call-site args:
+ * map(float) on Result(int, U) targets map_int_U_float. */
+static char *dispatch_explicit_method_target(const TemplateDef *tmpl,
+                                             const DispatchMethod *method,
+                                             const DispatchCase *c,
+                                             Vec *explicit_args) {
+  Str out;
+  str_init(&out);
+  for (size_t i = 0; i < tmpl->dispatch_targets.len; ++i) {
+    DispatchTarget *target =
+        (DispatchTarget *)tmpl->dispatch_targets.items[i];
+    if (strcmp(target->op, method->op))
+      continue;
+    if (target->base)
+      str_append(&out, target->base);
+    else {
+      str_append(&out, c->container);
+      str_append_char(&out, '_');
+      str_append(&out, method->op);
+    }
+    for (size_t j = 0; j < c->args.len; ++j) {
+      char *arg = trim_copy((char *)c->args.items[j]);
+      append_dispatch_arg(&out, arg);
+      free(arg);
+    }
+    for (size_t j = 0; j < explicit_args->len; ++j) {
+      char *arg = trim_copy((char *)explicit_args->items[j]);
+      append_dispatch_arg(&out, arg);
+      free(arg);
+    }
+    return str_take(&out);
+  }
+  return dispatch_call_target(tmpl, method->op, c);
+}
+
 /* Most operations are keyed by the concrete container type. Constructor-like
  * operations may instead declare a template parameter as their dispatch key. */
 static char *dispatch_key_container(const TemplateDef *tmpl, const char *op,
@@ -5119,7 +5463,7 @@ static char *make_dispatch_section(const TemplateDef *tmpl, Vec *cases,
 
   for (size_t i = 0; i < tmpl->dispatch_ops.len; ++i) {
     const char *op = tmpl->dispatch_ops.items[i];
-    if (set_has(&tmpl->explicit_ops, op))
+    if (set_has(&tmpl->explicit_ops, op) || find_dispatch_method(tmpl, op))
       continue;
     str_append(&out, "#ifndef C_AUTOTMPL_DISPATCH_");
     str_append(&out, tmpl->name);
@@ -5231,6 +5575,224 @@ static char *make_dispatch_section(const TemplateDef *tmpl, Vec *cases,
   }
   str_append(&out, "/* c-autotmpl dispatch end ");
   str_append(&out, tmpl->name);
+  str_append(&out, " */\n");
+  return str_take(&out);
+}
+
+static char *explicit_method_suffix(Vec *args) {
+  Str out;
+  str_init(&out);
+  for (size_t i = 0; i < args->len; ++i) {
+    char *arg = trim_copy((char *)args->items[i]);
+    append_dispatch_arg(&out, arg);
+    free(arg);
+  }
+  return str_take(&out);
+}
+
+/* `map(float)(value, f)` is two macro calls. The first expands to the
+ * per-explicit-arg selector macro, and the second performs ordinary dispatch
+ * on the value arguments so T and U stay inferred. */
+static char *make_explicit_method_section(const TemplateDef *tmpl,
+                                          const DispatchMethod *method,
+                                          Vec *cases, const DispatchConfig *cfg,
+                                          const char *output) {
+  if (!cfg->enabled || !tmpl->dispatch_enabled || !cases->len ||
+      !method->uses.len || set_has(&tmpl->explicit_ops, method->op))
+    return NULL;
+
+  Str out;
+  str_init(&out);
+  str_append(&out, "/* c-autotmpl dispatch begin ");
+  str_append(&out, tmpl->name);
+  str_append_char(&out, '.');
+  str_append(&out, method->op);
+  str_append(&out, " */\n");
+  str_append(&out, "#ifndef C_AUTOTMPL_DISPATCH_MISSING\n");
+  str_append(&out, "#define C_AUTOTMPL_DISPATCH_MISSING\n");
+  str_append(&out,
+             "static inline int c_autotmpl_dispatch_missing(void) "
+             "{ return 0; }\n");
+  str_append(&out, "#endif\n");
+
+  if (method->impl && method->impl->generated) {
+    char *dir = path_dirname(output);
+    char *inc = path_relative(dir, method->impl->generated);
+    str_append(&out, "#include \"");
+    str_append(&out, inc);
+    str_append(&out, "\"\n");
+    free(inc);
+    free(dir);
+  }
+
+  str_append(&out, "#ifndef C_AUTOTMPL_DISPATCH_CAT\n");
+  str_append(&out, "#define C_AUTOTMPL_DISPATCH_CAT_I(A, B) A##B\n");
+  str_append(&out,
+             "#define C_AUTOTMPL_DISPATCH_CAT(A, B) "
+             "C_AUTOTMPL_DISPATCH_CAT_I(A, B)\n");
+  str_append(&out, "#endif\n");
+
+  str_append(&out, "#ifndef C_AUTOTMPL_DISPATCH_");
+  str_append(&out, tmpl->name);
+  str_append_char(&out, '_');
+  str_append(&out, method->op);
+  str_append_char(&out, '\n');
+  str_append(&out, "#define C_AUTOTMPL_DISPATCH_");
+  str_append(&out, tmpl->name);
+  str_append_char(&out, '_');
+  str_append(&out, method->op);
+  str_append_char(&out, '\n');
+
+  Str expr;
+  str_init(&expr);
+  str_append(&expr, method->op);
+  str_append_char(&expr, '_');
+  str_append(&out, "#define ");
+  str_append(&out, method->op);
+  str_append(&out, "(");
+  for (size_t p = 0; p < method->explicit_params.len; ++p) {
+    if (p)
+      str_append(&out, ", ");
+    str_append(&out, "E");
+    append_size(&out, p + 1);
+    Str next;
+    str_init(&next);
+    str_append(&next, "C_AUTOTMPL_DISPATCH_CAT(");
+    str_append(&next, expr.data);
+    str_append_char(&next, ',');
+    str_append(&next, " E");
+    append_size(&next, p + 1);
+    str_append_char(&next, ')');
+    str_free(&expr);
+    expr = next;
+  }
+  str_append(&out, ") ");
+  str_append(&out, expr.data);
+  str_append_char(&out, '\n');
+  str_free(&expr);
+
+  for (size_t u = 0; u < method->uses.len; ++u) {
+    ExplicitMethodUse *use = (ExplicitMethodUse *)method->uses.items[u];
+    char *suffix = explicit_method_suffix(&use->args);
+    Str macro_name;
+    str_init(&macro_name);
+    str_append(&macro_name, method->op);
+    if (suffix)
+      str_append(&macro_name, suffix);
+
+    str_append(&out, "#ifndef C_AUTOTMPL_DISPATCH_");
+    str_append(&out, tmpl->name);
+    str_append_char(&out, '_');
+    str_append(&out, method->op);
+    str_append(&out, "_EXPLICIT");
+    if (suffix)
+      str_append(&out, suffix);
+    str_append_char(&out, '\n');
+    str_append(&out, "#define C_AUTOTMPL_DISPATCH_");
+    str_append(&out, tmpl->name);
+    str_append_char(&out, '_');
+    str_append(&out, method->op);
+    str_append(&out, "_EXPLICIT");
+    if (suffix)
+      str_append(&out, suffix);
+    str_append_char(&out, '\n');
+
+    for (size_t arity = 1; arity <= DISPATCH_MAX_ARGS; ++arity) {
+      Str base, params;
+      str_init(&base);
+      str_init(&params);
+      append_selector_name(&base, tmpl->name, macro_name.data, arity, 0);
+      append_params(&params, arity);
+      str_append(&out, "#define ");
+      str_append(&out, base.data);
+      str_append_char(&out, '(');
+      str_append(&out, params.data);
+      str_append(&out, ") c_autotmpl_dispatch_missing\n");
+
+      for (size_t j = 0; j < cases->len; ++j) {
+        DispatchCase *c = (DispatchCase *)cases->items[j];
+        char *presence = presence_macro(tmpl->name, c->type);
+        str_append(&out, "#ifdef ");
+        str_append(&out, presence);
+        str_append_char(&out, '\n');
+        char *target =
+            dispatch_explicit_method_target(tmpl, method, c, &use->args);
+        append_dispatch_case_selector(&out, cfg, tmpl->name, macro_name.data,
+                                      j + 1, arity, c->container, target);
+        free(target);
+        str_append(&out, "#else\n");
+        Str skip, previous;
+        str_init(&skip);
+        str_init(&previous);
+        append_selector_name(&skip, tmpl->name, macro_name.data, arity, j + 1);
+        append_selector_name(&previous, tmpl->name, macro_name.data, arity, j);
+        str_append(&out, "#define ");
+        str_append(&out, skip.data);
+        str_append_char(&out, '(');
+        str_append(&out, params.data);
+        str_append(&out, ") ");
+        str_append(&out, previous.data);
+        str_append_char(&out, '(');
+        str_append(&out, params.data);
+        str_append(&out, ")\n");
+        str_free(&skip);
+        str_free(&previous);
+        str_append(&out, "#endif\n");
+        free(presence);
+      }
+      str_free(&base);
+      str_free(&params);
+    }
+
+    str_append(&out, "#define C_AUTOTMPL_DISPATCH_PICK_");
+    str_append(&out, tmpl->name);
+    str_append_char(&out, '_');
+    str_append(&out, macro_name.data);
+    str_append(&out, "(");
+    for (size_t k = 1; k <= DISPATCH_MAX_ARGS + 1; ++k) {
+      if (k > 1)
+        str_append(&out, ", ");
+      str_append_char(&out, '_');
+      append_size(&out, k);
+    }
+    str_append(&out, ", ...) _");
+    append_size(&out, DISPATCH_MAX_ARGS + 1);
+    str_append(&out, "\n#define ");
+    str_append(&out, macro_name.data);
+    str_append(&out, "(...) C_AUTOTMPL_DISPATCH_PICK_");
+    str_append(&out, tmpl->name);
+    str_append_char(&out, '_');
+    str_append(&out, macro_name.data);
+    str_append(&out, "(__VA_ARGS__");
+    for (size_t k = DISPATCH_MAX_ARGS; k > 0; --k) {
+      str_append(&out, ", C_AUTOTMPL_DISPATCH_SEL_");
+      str_append(&out, tmpl->name);
+      str_append_char(&out, '_');
+      str_append(&out, macro_name.data);
+      str_append_char(&out, '_');
+      append_size(&out, k);
+      str_append_char(&out, '_');
+      append_size(&out, cases->len);
+    }
+    str_append(&out, ", C_AUTOTMPL_DISPATCH_SEL_");
+    str_append(&out, tmpl->name);
+    str_append_char(&out, '_');
+    str_append(&out, macro_name.data);
+    str_append_char(&out, '_');
+    append_size(&out, 1);
+    str_append_char(&out, '_');
+    append_size(&out, cases->len);
+    str_append(&out, ")(__VA_ARGS__)(__VA_ARGS__)\n");
+    str_append(&out, "#endif\n");
+
+    str_free(&macro_name);
+    free(suffix);
+  }
+  str_append(&out, "#endif\n");
+  str_append(&out, "/* c-autotmpl dispatch end ");
+  str_append(&out, tmpl->name);
+  str_append_char(&out, '.');
+  str_append(&out, method->op);
   str_append(&out, " */\n");
   return str_take(&out);
 }
@@ -5880,6 +6442,20 @@ static void add_wanted_usage(Usage *usage, Registry *reg, Set *wanted) {
   }
 }
 
+static void add_wanted_explicit_method_args(const Registry *reg, Set *wanted) {
+  for (size_t i = 0; i < reg->items.len; ++i) {
+    TemplateDef *owner = (TemplateDef *)reg->items.items[i];
+    for (size_t j = 0; j < owner->dispatch_methods.len; ++j) {
+      DispatchMethod *m = (DispatchMethod *)owner->dispatch_methods.items[j];
+      for (size_t k = 0; k < m->uses.len; ++k) {
+        ExplicitMethodUse *u = (ExplicitMethodUse *)m->uses.items[k];
+        for (size_t a = 0; a < u->args.len; ++a)
+          add_wanted_type((char *)u->args.items[a], (Registry *)reg, wanted);
+      }
+    }
+  }
+}
+
 /* -------------------------------- CLI ---------------------------------- */
 
 typedef struct {
@@ -6079,6 +6655,45 @@ static void add_dispatch_case(Vec *groups, const char *output,
   vec_push(&group->cases, c);
 }
 
+/* Cross every owner case with every explicit tuple seen at a curried call:
+ * Result(int, U) x map(float) -> map_impl(int, U, float). */
+static int emit_explicit_method_instantiations(Vec *groups, EmitCtx *ctx) {
+  for (size_t g = 0; g < groups->len; ++g) {
+    DispatchGroup *group = (DispatchGroup *)groups->items[g];
+    TemplateDef *owner = (TemplateDef *)group->tmpl;
+    if (!owner->dispatch_enabled)
+      continue;
+    for (size_t mi = 0; mi < owner->dispatch_methods.len; ++mi) {
+      DispatchMethod *m = (DispatchMethod *)owner->dispatch_methods.items[mi];
+      if (!m->impl || set_has(&owner->explicit_ops, m->op))
+        continue;
+      for (size_t ui = 0; ui < m->uses.len; ++ui) {
+        ExplicitMethodUse *use = (ExplicitMethodUse *)m->uses.items[ui];
+        for (size_t ci = 0; ci < group->cases.len; ++ci) {
+          DispatchCase *c = (DispatchCase *)group->cases.items[ci];
+          Vec full;
+          full.items = NULL;
+          full.len = full.cap = 0;
+          for (size_t k = 0; k < c->args.len; ++k)
+            vec_push(&full, xstrdup((char *)c->args.items[k]));
+          for (size_t k = 0; k < use->args.len; ++k)
+            vec_push(&full, xstrdup((char *)use->args.items[k]));
+          Usage *usage = usage_new_with_args(m->impl, &full);
+          scan_header_deps(m->impl, &full, ctx->reg, &usage->deps);
+          int rc = emit_usage(usage, m->impl->generated, ctx, NULL, 0, 0);
+          usage_free(usage);
+          for (size_t k = 0; k < full.len; ++k)
+            free(full.items[k]);
+          free(full.items);
+          if (rc != 0)
+            return -1;
+        }
+      }
+    }
+  }
+  return 0;
+}
+
 static ImplGroup *find_impl_group(Vec *groups, const TemplateDef *tmpl) {
   for (size_t i = 0; i < groups->len; ++i) {
     ImplGroup *group = (ImplGroup *)groups->items[i];
@@ -6214,6 +6829,7 @@ int main(int argc, char **argv) {
   registry_scan(&reg, root);
   apply_preset(&reg, preset, &preset_names, has_preset_names, stc_auto);
   apply_dispatch(&reg, &dispatch_cfg);
+  resolve_dispatch_methods(&reg);
   if (!reg.items.len) {
     if (opt.verbose)
       printf("no templates found under %s\n", root);
@@ -6293,6 +6909,7 @@ int main(int argc, char **argv) {
   }
   remove_preprocessor_stubs(&preprocess_stubs);
   free(inputs.items);
+  add_wanted_explicit_method_args(&reg, &wanted_names);
 
   TypeIndex idx;
   idx.guards.items = NULL;
@@ -6344,6 +6961,9 @@ int main(int argc, char **argv) {
     }
   }
 
+  if (emit_explicit_method_instantiations(&dispatch_groups, &emit) != 0)
+    return 1;
+
   for (size_t i = 0; i < dispatch_groups.len; ++i) {
     DispatchGroup *group = (DispatchGroup *)dispatch_groups.items[i];
     char *section = make_dispatch_section(group->tmpl, &group->cases,
@@ -6352,6 +6972,23 @@ int main(int argc, char **argv) {
                                &emit) != 0)
       return 1;
     free(section);
+
+    TemplateDef *owner = (TemplateDef *)group->tmpl;
+    for (size_t m = 0; m < owner->dispatch_methods.len; ++m) {
+      DispatchMethod *method = (DispatchMethod *)owner->dispatch_methods.items[m];
+      Str key;
+      str_init(&key);
+      str_append(&key, owner->name);
+      str_append_char(&key, '.');
+      str_append(&key, method->op);
+      char *section_key = str_take(&key);
+      char *extra = make_explicit_method_section(owner, method, &group->cases,
+                                                 &dispatch_cfg, group->output);
+      if (write_dispatch_section(group->output, section_key, extra, &emit) != 0)
+        return 1;
+      free(extra);
+      free(section_key);
+    }
   }
 
   Vec impl_groups;

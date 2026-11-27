@@ -995,6 +995,97 @@ int main(void) { return Make(int)(7).value == 7 ? 0 : 1; }
         shutil.rmtree(root, ignore_errors=True)
 
 
+def check_explicit_dispatch_method(cli):
+    root = tempfile.mkdtemp(prefix="c-autotmpl-explicit-method-")
+    try:
+        os.makedirs(os.path.join(root, "tmpl"))
+        os.makedirs(os.path.join(root, "gen"))
+        write(os.path.join(root, "tmpl", "result.h"), """\
+// -- template type Result(T, U)
+#define RC4_I(A, B, C, D) A##B##C##D
+#define RC4(A, B, C, D) RC4_I(A, B, C, D)
+#define Result(T, U) RC4(Result_, T, _, U)
+typedef struct { T ok; U err; } Result(T, U);
+""")
+        write(os.path.join(root, "tmpl", "map.h"), """\
+// -- template function map_impl(T, U, V)
+// -- dispatch method Result.map explicit V
+#define MC6_I(A, B, C, D, E, F) A##B##C##D##E##F
+#define MC6(A, B, C, D, E, F) MC6_I(A, B, C, D, E, F)
+#define map_impl(T, U, V) MC6(map_, T, _, U, _, V)
+static inline Result(T, V) map_impl(T, U, V)(Result(T, U) r, V (*f)(T)) {
+  Result(T, V) out;
+  out.ok = f(r.ok);
+  out.err = 0;
+  return out;
+}
+""")
+        source = os.path.join(root, "main.c")
+        write(source, """\
+#include "gen/result.h"
+static float from_int(int x) { return (float)x / 2.0f; }
+static float from_double(double x) { return (float)x / 2.0f; }
+int main(void) {
+  Result(int, float) a = {7, 0};
+  Result(double, float) b = {8, 0};
+  Result(int, float) x = map(float)(a, from_int);
+  Result(double, float) y = map(float)(b, from_double);
+  return (int)x.ok == 3 && (int)y.ok == 4 ? 0 : 1;
+}
+""")
+        write(os.path.join(root, "autotmpl.conf"), """\
+dispatch=1
+dispatch_truncate=1
+""")
+        args = [cli, "--root", root, "--verbose", source]
+        proc = subprocess.run(args, cwd=root, capture_output=True, text=True,
+                              env=env_with())
+        output = proc.stdout + proc.stderr
+        require(proc.returncode == 0, "explicit method run exited with error",
+                output)
+        for needle in ("generated map_impl(int, float, float)",
+                       "generated map_impl(double, float, float)"):
+            require(needle in output, "explicit method was not synthesized",
+                    output)
+
+        with open(os.path.join(root, "gen", "result.h")) as f:
+            dispatch = f.read()
+        require("#define map(E1) C_AUTOTMPL_DISPATCH_CAT(map_, E1)" in dispatch,
+                "curried method macro was not emitted", dispatch)
+        require("C_AUTOTMPL_DISPATCH_Result_map_EXPLICIT_float" in dispatch,
+                "explicit method selector guard was not emitted", dispatch)
+        require("Result_int_float: map_int_float_float" in dispatch,
+                "explicit method targeted the wrong function", dispatch)
+        with open(os.path.join(root, "gen", "map_impl.h")) as f:
+            impl = f.read()
+        require("/* c-autotmpl: map_impl(int, float, float) */" in impl,
+                "explicit method implementation was not generated", impl)
+
+        compiler = os.environ.get("CC") or next(
+            (name for name in ("cc", "gcc", "clang") if shutil.which(name)),
+            None,
+        )
+        if compiler:
+            built = subprocess.run(
+                [compiler, "-std=c11", "-Wall", "-Wextra", "-Werror",
+                 "main.c", "-o", "method-demo"],
+                cwd=root, capture_output=True, text=True,
+            )
+            require(built.returncode == 0, "explicit method output did not "
+                    "compile", built.stdout + built.stderr)
+            ran = subprocess.run([os.path.join(root, "method-demo")],
+                                 cwd=root)
+            require(ran.returncode == 0, "explicit method output did not run")
+
+        rerun = subprocess.run(args, cwd=root, capture_output=True, text=True,
+                               env=env_with())
+        output = rerun.stdout + rerun.stderr
+        require(rerun.returncode == 0 and "added=0" in output,
+                "explicit method generation was not idempotent", output)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def check_preprocess(cli):
     compiler = os.environ.get("CC") or next(
         (name for name in ("cc", "gcc", "clang") if shutil.which(name)),
@@ -1375,6 +1466,7 @@ def main():
     check_stc_auto(cli)
     check_dispatch(cli)
     check_explicit_constructor_alias(cli)
+    check_explicit_dispatch_method(cli)
     check_dispatch_truncate(cli)
     check_value_generics(cli)
     check_preprocess(cli)
