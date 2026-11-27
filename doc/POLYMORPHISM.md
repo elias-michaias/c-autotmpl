@@ -1,39 +1,19 @@
-<p align="center">
-  <h1 align="center">Polymorphism with template headers</h1>
-  <p align="center">Checked constraints, generated functions, ad-hoc overloading, static dispatch, and trait impls from one C header.</p>
-</p>
+# Polymorphism with template headers
 
-<p align="center">
-  <a href="../LICENSE.md"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
-  <a href="https://github.com/elias-michaias/c-autotmpl/actions/workflows/cli-build.yml"><img src="https://github.com/elias-michaias/c-autotmpl/actions/workflows/cli-build.yml/badge.svg" alt="CI status"></a>
-</p>
+A template header is included once per type. c-autotmpl writes the `#define` and
+`#include` block, so one header can check its parameters, generate helpers,
+contribute a generic-call case, or define a trait impl.
 
-<p align="center">
-  <a href="../README.md">Home</a> &bull;
-  <a href="USAGE.md">Usage</a> &bull;
-  <a href="BUILD.md">Build</a> &bull;
-  <a href="#checked-constraints-and-generated-functions">Constraints</a> &bull;
-  <a href="#function-templates">Function templates</a> &bull;
-  <a href="#extendible-generic-calls">Generic calls</a> &bull;
-  <a href="#ad-hoc-overloading-and-explicit-method-types">Ad-hoc overloading</a> &bull;
-  <a href="#c-trait-generic-impls">Traits</a>
-</p>
-
----
-
-A template header is included once per type. c-autotmpl writes the
-`#define T` and `#include` block, so the header can generate more than a type.
-It can check `T`, write helper functions that take `T`, or register a generic
-call and trait impl for that type.
-
-Every example below is complete. Build the CLI from this repo, put it on your
-`PATH`, then run the commands shown with each example.
+Most examples below are complete. Build the CLI from this repo, put it on your
+`PATH`, and run the commands shown. The ad-hoc overloading example links to the
+full fixture in the usage guide.
 
 - [Checked constraints and generated functions](#checked-constraints-and-generated-functions)
 - [Function templates](#function-templates)
-- [Extendible generic calls](#extendible-generic-calls)
-- [c-trait generic impls](#c-trait-generic-impls)
+- [Ad-hoc overloading and explicit method types](#ad-hoc-overloading-and-explicit-method-types)
+- [c-trait impls](#c-trait-generic-impls)
 - [Tagged unions with generated payloads](#tagged-unions-with-generated-payloads)
+- [Extendible `_Generic` with CC.h](#extendible-generic-calls)
 
 ## Checked constraints and generated functions
 
@@ -156,6 +136,16 @@ int main(void) {
 }
 ```
 
+```sh
+autotmpl --root . src/main.c
+cc -std=c11 -I. src/main.c -o demo && ./demo
+# right=(10,20) sum=33
+# ints=10,14 floats=2.0,3.0
+```
+
+Two negative checks show the constraints. Run them last, because they add
+`Pair(Big)` and `Ops(Point)` to the same generated headers:
+
 ```c
 /* src/bad_xy.c */
 #include "big.h"
@@ -177,11 +167,6 @@ int main(void) { return (int)ops_add(Point)(bad.value, bad.value); }
 ```
 
 ```sh
-autotmpl --root . src/main.c
-cc -std=c11 -I. src/main.c -o demo && ./demo
-# right=(10,20) sum=33
-# ints=10,14 floats=2.0,3.0
-
 autotmpl --root . src/bad_xy.c
 cc -std=c11 -I. -fsyntax-only src/bad_xy.c
 # error: static assertion failed: "Pair(T): T must fit in a pointer"
@@ -191,18 +176,14 @@ cc -std=c11 -I. -fsyntax-only src/bad_ops.c
 # error: invalid operands to binary + (have 'Point' and 'Point')
 ```
 
-Run the two failing checks last. They add `Pair(Big)` and `Ops(Point)` to the
-same generated headers.
-
-The generated names are plain C names with `T` pasted in:
+Generated names are plain C names with `T` pasted in:
 
 | Source name | `T = Point` | `T = int` |
 | --- | --- | --- |
-| `Pair(T)` | `Pair_Point` | not used here |
-| `pair_set_right(T)` | `pair_set_right_Point` | not used here |
-| `pair_xy_sum(T)` | `pair_xy_sum_Point` | not used here |
-| `Ops(T)` | fails the operator check | `Ops_int` |
-| `ops_add(T)` | fails the operator check | `ops_add_int` |
+| `Pair(T)` | `Pair_Point` | `Pair_int` |
+| `pair_set_right(T)` | `pair_set_right_Point` | `pair_set_right_int` |
+| `pair_xy_sum(T)` | `pair_xy_sum_Point` | `pair_xy_sum_int` |
+| `Ops(T)` / `ops_add(T)` | fails the operator check | `Ops_int` / `ops_add_int` |
 
 The call site still names `T` in `pair_xy_sum(Point)` or `ops_add(int)`. These
 functions are generic by generation, not by call-site selection.
@@ -217,148 +198,288 @@ c-autotmpl writes one block with `#define From float`, `#define To int`, and
 and there is no AST deduction. [USAGE.md](USAGE.md#function-templates) has the
 full header and generated-block rules.
 
-When the caller should not care which concrete function it calls, the next step
-is a generic call. This is ad-hoc polymorphism: a single call spelling selects
-one of several separately generated implementations by argument type, rather
-than requiring one generic shape that every type must satisfy. The following
-section uses extendible `_Generic`. The one after that uses c-trait to generate
-the impl and the dispatcher together.
-c-autotmpl generates the same kind of selector from template headers: with
-`dispatch=1` calls carry a configurable affix, and with `dispatch_truncate=1`
-they are bare operation names. The canonical declaration is `<op>_impl(T, U)`,
-which generates `<op>` targeting `<op>_<args>`; older paste declarations and
-concrete-only functions remain accepted fallbacks. The selector tables and the
-single public `<op>` macro live in `gen/dispatch.h`, after the generated
-instantiation headers and before call sites. Same-name operations from different
-templates share that public macro through chained owner tables.
-
-### Ad-hoc overloading and explicit method types
-
+## Ad-hoc overloading and explicit method types
 With `dispatch=1` and `dispatch_truncate=1`, one public spelling can select
 separately generated implementations. Concrete C names are pasted from template
-arguments, so owners with the same argument list would otherwise collide.
-`// -- +owner` (or `// -- mangle +owner`) opts a template section into
-owner-qualified concrete targets by appending the owning template name as the
-final paste component. It is independent of `explicit` and is opt-in.
+arguments, so owners with the same argument list would collide. `// -- +owner`
+(or `// -- mangle +owner`) appends the owning template name as the final paste
+component. It is opt-in and independent of `explicit`. List the owners in
+`dispatch_templates` so they contribute to the shared dispatch header.
 
-For ordinary operations, no extra implementation parameter is needed. Both
-owners below take one argument, yet `get(&o)` resolves to distinct functions:
-
-```text
-# autotmpl.conf
-dispatch=1
-dispatch_truncate=1
-dispatch_templates=Box,Container,Option,Result
-```
+For ordinary operations, the implementation gains no public parameter; the
+generated block defines `Owner` while expanding the section. This abbreviated
+`Box(T)` header uses `GET3` as its paste macro:
 
 ```c
 /* tmpl/box.h */
 // -- template type Box(T)
 // -- +owner
-#define BOX_CAT2_I(a, b) a##b
-#define BOX_CAT2(a, b) BOX_CAT2_I(a, b)
-#define BOX_CAT3_I(a, b, c) a##_##b##_##c
-#define BOX_CAT3(a, b, c) BOX_CAT3_I(a, b, c)
-#define Box(T) BOX_CAT2(Box_, T)
-#define get_impl(T, Owner) BOX_CAT3(get, T, Owner)
-typedef struct { T value; } Box(T);
-static inline T get_impl(T, Owner)(Box(T) *b) { return b->value; }
-#undef get_impl
+#define get_impl(T, Owner) GET3(get, T, Owner)
+static inline T get_impl(T, Owner)(Box(T) *b);
 ```
 
-`get(&box)` targets `get_int_Box`. A `Container(float)` section using
-`// -- mangle +owner` targets `get_float_Container` for the same bare `get`
-spelling.
-
-For a curried method, the implementation template and its paste macro gain one
-trailing synthetic `Owner` parameter. The generator supplies it; callers do not:
+A `Container(float)` section using `// -- mangle +owner` has the same shape.
+Both calls stay distinct even though each owner takes one argument:
 
 ```c
-/* tmpl/option.h */
-// -- template type Option(T)
-#define OPTION_CAT2_I(a, b) a##b
-#define OPTION_CAT2(a, b) OPTION_CAT2_I(a, b)
-#define Option(T) OPTION_CAT2(Option_, T)
-typedef struct { int has; T value; } Option(T);
+int x = get(&b);    /* get_int_Box */
+float y = get(&c);  /* get_float_Container */
+```
 
+For a
+[curried method with explicit type arguments](USAGE.md#curried-methods-with-explicit-type-arguments),
+the implementation declaration gains a trailing synthetic `Owner` parameter:
+
+```c
 // -- template function option_map_impl(T, U, Owner)
 // -- dispatch method Option.map explicit U
 // -- +owner
-#define OPTION_MAP4_I(a, b, c, d) a##_##b##_##c##_##d
-#define OPTION_MAP4(a, b, c, d) OPTION_MAP4_I(a, b, c, d)
-#define option_map_impl(T, U, Owner) OPTION_MAP4(map, T, U, Owner)
-static inline Option(U) option_map_impl(T, U, Owner)(Option(T) value,
-                                                     U (*f)(T)) {
-  Option(U) out = {0};
-  if (value.has) { out.has = 1; out.value = f(value.value); }
-  return out;
-}
+#define option_map_impl(T, U, Owner) MAP4(map, T, U, Owner)
 ```
 
-```c
-/* tmpl/result.h */
-// -- template type Result(T, U)
-#define RESULT_CAT3_I(a, b, c) a##_##b##_##c
-#define RESULT_CAT3(a, b, c) RESULT_CAT3_I(a, b, c)
-#define Result(T, U) RESULT_CAT3(Result, T, U)
-typedef struct { int ok; T value; U error; } Result(T, U);
+Callers still write `map(float)(o, f)`; the generator supplies `Owner`. The
+concrete target is `<op>_<owner args>_<explicit args>_<Owner>`. The full
+`Box`/`Container`/`Option`/`Result` fixture and generated dispatch tables are in
+[Owner-qualified targets](USAGE.md#owner-qualified-targets).
 
-// -- template function result_map_impl(T, U, V, Owner)
-// -- dispatch method Result.map explicit V
-// -- mangle +owner
-#define RESULT_MAP5_I(a, b, c, d, e) a##_##b##_##c##_##d##_##e
-#define RESULT_MAP5(a, b, c, d, e) RESULT_MAP5_I(a, b, c, d, e)
-#define result_map_impl(T, U, V, Owner) RESULT_MAP5(map, T, U, V, Owner)
-static inline Result(V, U) result_map_impl(T, U, V, Owner)(Result(T, U) value,
-                                                          V (*f)(T)) {
-  Result(V, U) out = {0};
-  if (value.ok) { out.ok = 1; out.value = f(value.value); }
-  else { out.error = value.error; }
-  return out;
-}
+<a id="c-trait-generic-impls"></a>
+
+## c-trait impls from one header
+
+[c-trait](https://github.com/elias-michaias/c-trait) uses `_Generic` to turn a
+trait call into a direct call to the concrete implementation. Its associated
+type pattern lets one trait keep a single method signature across generated
+types. That matches a template header well: generate the struct and the trait
+impl from the same `T`.
+
+Copy `trait.h` from c-trait into the project root. No `dynamic(Self)` marker is
+used, so dispatch is static and there is no vtable.
+
+> **Compiler support:** c-trait's ISO C23 mode is fully standard and works with
+> GCC, Clang, Intel C Compiler, and other conforming C23 compilers. Its GNU99
+> and GNU11 modes use GNU extensions and work with GCC and Clang, plus compilers
+> such as Intel C Compiler when they accept those GNU extensions. Use
+> `-std=c23` for ISO C23 or `-std=gnu99` for GNU99. With a strict compiler that
+> rejects `$` as an identifier, define `TraitCustomDispatch` and alias
+> `trait_dispatch_call` to a plain name. See
+> [c-trait compatibility](https://github.com/elias-michaias/c-trait#compatibility).
+
+Use the guarded `point.h` from the first example.
+
+```c
+/* tmpl/list.h */
+// -- template List(T)
+
+#include "../trait.h"
+
+#ifndef T
+typedef int T;
+#endif
+
+#ifndef LIST_TRAIT_DEFINED
+#define LIST_TRAIT_DEFINED
+#define ListSignature(Self)                        \
+  required(Self, void, push, List_Item)            \
+  required(Self, List_Item, get, int)
+#define Trait List
+#include "../trait.h"
+#endif
+
+#define LIST_CAT_I(a, b) a##b
+#define LIST_CAT(a, b) LIST_CAT_I(a, b)
+#define List(T) LIST_CAT(List_, T)
+
+typedef struct { T data[8]; int len; } List(T);
+
+#define For List(T)
+#define Impl List
+#define List_Item T
+  void def(push, T value) { self->data[self->len++] = value; }
+  T def(get, int index) { return self->data[index]; }
+#include "../trait.h"
+#undef List_Item
+#undef Impl
+#undef For
+
+#undef T
 ```
 
-```c
-/* main.c */
-#include "gen/box.h"
-#include "gen/container.h"
-#include "gen/option.h"
-#include "gen/result.h"
-#include "gen/dispatch.h"
+A function template can call the generated trait overloads directly. Passing
+the item type is enough: the function head spells out `List(Item)`, so
+c-autotmpl lexes `List(int)` and `List(float)` out of the header and emits those
+blocks first.
 
-static int twice(int x) { return 2 * x; }
-static float half(int x) { return (float)x / 2.0f; }
-static float scale(float x) { return 2.0f * x; }
+```c
+/* tmpl/list_sum.h */
+// -- template function list_sum(Item)
+
+#include "../trait.h"
+
+#ifndef Item
+typedef int Item;
+#endif
+
+#define LIST_SUM_CAT_I(a, b) a##b
+#define LIST_SUM_CAT(a, b) LIST_SUM_CAT_I(a, b)
+#define list_sum(Item) LIST_SUM_CAT(list_sum_, Item)
+
+static inline Item list_sum(Item)(List(Item) *xs) {
+  return $(List.get, xs, 0) + $(List.get, xs, 1);
+}
+
+#undef Item
+```
+
+No dummy wrapper type or extra trait impl is needed just to reach the overload.
+The dependency blocks are flattened into `gen/list_sum.h` ahead of the
+functions, so no manual `GEN_LIST_H` guard is needed.
+
+```c
+/* src/main.c */
+#include "point.h"
+#include "gen/list.h"
+#include "gen/list_sum.h"
+#include <stdio.h>
 
 int main(void) {
-  Box(int) b = {7};
-  Container(float) c = {2.5f};
-  Option(int) some_int = {1, 7};
-  Option(float) some_float = {1, 2.5f};
-  Result(int, float) ok_int = {1, 7, 0.0f};
+  List(int) xs = {0};
+  List(float) fs = {0};
+  List(Point) ps = {0};
 
-  int x = get(&b);                                      /* get_int_Box */
-  float y = get(&c);                                    /* get_float_Container */
-  Option(int) oi = map(int)(some_int, twice);           /* map_int_int_Option */
-  Option(float) widened = map(float)(some_int, half);   /* map_int_float_Option */
-  Option(float) of = map(float)(some_float, scale);     /* map_float_float_Option */
-  Result(int, float) ri = map(int)(ok_int, twice);      /* map_int_float_int_Result */
-  Result(float, float) rf = map(float)(ok_int, half);   /* map_int_float_float_Result */
-  return x == 7 && y == 2.5f && oi.value == 14 && widened.value == 3.5f &&
-                 of.value == 5.0f && ri.value == 14 && rf.value == 3.5f
-             ? 0 : 1;
+  int new_x = 7;
+  float new_f = 3.5f;
+  Point new_p = { 4, 5 };
+
+  $(List.push, &xs, new_x);
+  $(List.push, &xs, 9);
+  $(List.push, &fs, new_f);
+  $(List.push, &ps, new_p);
+
+  printf("xs=%d,%d fs=%.1f pt=(%d,%d) sums=%d,%.1f\n",
+         $(List.get, &xs, 0), $(List.get, &xs, 1),
+         $(List.get, &fs, 0),
+         $(List.get, &ps, 0).x, $(List.get, &ps, 0).y,
+         list_sum(int)(&xs),
+         list_sum(float)(&fs));
+  return 0;
 }
 ```
 
-All six calls use one public spelling per operation. The curried argument
-supplies the output payload (`U` or `V`); `_Generic` on the first value argument
-selects the owner and its concrete input arguments. The concrete target is
-`<op>_<owner args>_<explicit args>_<Owner>`. Owner tables stay independent and
-are chained in `gen/dispatch.h`; see
-[Curried methods with explicit type arguments](USAGE.md#curried-methods-with-explicit-type-arguments)
-for the full rules.
+`point.h` comes first because `List(Point)` needs `Point` and its `POINT_H`
+guard. The function's own `List(int)` and `List(float)` dependencies are already
+inside `gen/list_sum.h`.
 
-## Extendible generic calls
+```sh
+cp /path/to/c-trait/trait.h .
+autotmpl --root . src/main.c
+cc -std=gnu11 -I. src/main.c -o demo && ./demo
+# xs=7,9 fs=3.5 pt=(4,5) sums=16,3.5
+```
+
+`List_Item` is set to `T` inside each generated block. The trait signature has
+one `push` method, while the generated impl uses the right argument type for
+`List(int)`, `List(float)`, and `List(Point)`. The `$()` call site stays the
+same for all three:
+
+```c
+$(List.push, &xs, new_x);
+```
+
+Add a trait impl by adding a `List(T)` usage. c-autotmpl writes the generated
+block, and the template writes the associated type and impl for that `T`.
+
+`list_sum(int)` and `list_sum(float)` add free functions that call
+`$(List.get, ...)` on the concrete list. The overload stays inside the generated
+function, so the call site only names the item type.
+
+See the [c-trait API reference](https://github.com/elias-michaias/c-trait/blob/main/docs/API.md)
+for defaults, dynamic dispatch, and supertraits.
+
+## Tagged unions with generated payloads
+
+A template can generate the tag enum, payload struct, and constructors together.
+Each instantiation gets its own tag constants and helpers, so `Maybe(int)` and
+`Maybe(Point)` are distinct types with distinct operations.
+
+```c
+/* tmpl/maybe.h */
+// -- template Maybe(T)
+
+#ifndef T
+typedef int T;
+#endif
+
+#define MAYBE_CAT_I(a, b) a##b
+#define MAYBE_CAT(a, b) MAYBE_CAT_I(a, b)
+#define Maybe(T) MAYBE_CAT(Maybe_, T)
+#define Maybe_tag(T) MAYBE_CAT(Maybe_tag_, T)
+#define maybe_some(T) MAYBE_CAT(maybe_some_, T)
+#define maybe_none(T) MAYBE_CAT(maybe_none_, T)
+#define maybe_has(T) MAYBE_CAT(maybe_has_, T)
+#define maybe_value(T) MAYBE_CAT(maybe_value_, T)
+
+typedef enum {
+  MAYBE_CAT(Maybe_has_value_, T),
+  MAYBE_CAT(Maybe_is_empty_, T)
+} Maybe_tag(T);
+
+typedef struct { Maybe_tag(T) tag; T value; } Maybe(T);
+
+static inline Maybe(T) maybe_some(T)(T value) {
+  Maybe(T) r = { MAYBE_CAT(Maybe_has_value_, T), value };
+  return r;
+}
+
+static inline Maybe(T) maybe_none(T)(void) {
+  Maybe(T) r = {0};
+  r.tag = MAYBE_CAT(Maybe_is_empty_, T);
+  return r;
+}
+
+static inline int maybe_has(T)(const Maybe(T) *o) {
+  return o->tag == MAYBE_CAT(Maybe_has_value_, T);
+}
+
+static inline T maybe_value(T)(const Maybe(T) *o) {
+  return o->value;
+}
+
+#undef T
+```
+
+Use the guarded `point.h` from the first example.
+
+```c
+/* src/main.c */
+#include "point.h"
+#include "gen/maybe.h"
+#include <stdio.h>
+
+int main(void) {
+  Maybe(int) oi = maybe_some(int)(7);
+  Maybe(Point) op = maybe_some(Point)((Point){2, 3});
+  Maybe(int) empty = maybe_none(int)();
+
+  printf("int=%d,%d point=%d,(%d,%d) empty=%d\n",
+         maybe_has(int)(&oi), maybe_value(int)(&oi),
+         maybe_has(Point)(&op), maybe_value(Point)(&op).x,
+         maybe_value(Point)(&op).y, maybe_has(int)(&empty));
+  return 0;
+}
+```
+
+```sh
+autotmpl --root . src/main.c
+cc -std=c11 -I. src/main.c -o demo && ./demo
+# int=1,7 point=1,(2,3) empty=0
+```
+
+This is a tagged union with type-mangled constructors. The payload type changes,
+but the generated API shape stays the same.
+
+<a id="extendible-generic-calls"></a>
+
+## Extendible `_Generic` with CC.h
 
 C11 `_Generic` gives static dispatch, but its association list is fixed where
 the macro is defined. Jackson Allan's CC.h article describes a way to leave
@@ -495,253 +616,6 @@ counter version grows this to 511 slots without listing them by hand.
 Include `hash.h` and define the hash functions before `gen/register.h`. The
 generated registrations are preprocessor state for the current translation
 unit, so this example uses one source file.
-
-## c-trait generic impls
-
-[c-trait](https://github.com/elias-michaias/c-trait) uses `_Generic` to turn a
-trait call into a direct call to the concrete implementation. Its associated
-type pattern lets one trait keep a single method signature across generated
-types. That matches a template header well: generate the struct and the trait
-impl from the same `T`.
-
-Copy `trait.h` from c-trait into the project root. No `dynamic(Self)` marker is
-used, so dispatch is static and there is no vtable.
-
-> **Compiler support:** c-trait's ISO C23 mode is fully standard and works with
-> GCC, Clang, Intel C Compiler, and other conforming C23 compilers. Its GNU99
-> and GNU11 modes use GNU extensions and work with GCC and Clang, plus compilers
-> such as Intel C Compiler when they accept those GNU extensions. Use
-> `-std=c23` for ISO C23 or `-std=gnu99` for GNU99. With a strict compiler that
-> rejects `$` as an identifier, define `TraitCustomDispatch` and alias
-> `trait_dispatch_call` to a plain name. See
-> [c-trait compatibility](https://github.com/elias-michaias/c-trait#compatibility).
-
-```c
-/* point.h */
-#ifndef POINT_H
-#define POINT_H
-typedef struct { int x; int y; } Point;
-#endif
-```
-
-```c
-/* tmpl/list.h */
-// -- template List(T)
-
-#include "../trait.h"
-
-#ifndef T
-typedef int T;
-#endif
-
-#ifndef LIST_TRAIT_DEFINED
-#define LIST_TRAIT_DEFINED
-#define ListSignature(Self)                        \
-  required(Self, void, push, List_Item)            \
-  required(Self, List_Item, get, int)
-#define Trait List
-#include "../trait.h"
-#endif
-
-#define LIST_CAT_I(a, b) a##b
-#define LIST_CAT(a, b) LIST_CAT_I(a, b)
-#define List(T) LIST_CAT(List_, T)
-
-typedef struct { T data[8]; int len; } List(T);
-
-#define For List(T)
-#define Impl List
-#define List_Item T
-  void def(push, T value) { self->data[self->len++] = value; }
-  T def(get, int index) { return self->data[index]; }
-#include "../trait.h"
-#undef List_Item
-#undef Impl
-#undef For
-
-#undef T
-```
-
-A function template can call the generated trait overloads directly. Passing
-the item type is enough: the function head spells out `List(Item)`, so
-c-autotmpl lexes `List(int)` and `List(float)` out of the header and emits those
-blocks first.
-
-```c
-/* tmpl/list_sum.h */
-// -- template function list_sum(Item)
-
-#include "../trait.h"
-
-#ifndef Item
-typedef int Item;
-#endif
-
-#define LIST_SUM_CAT_I(a, b) a##b
-#define LIST_SUM_CAT(a, b) LIST_SUM_CAT_I(a, b)
-#define list_sum(Item) LIST_SUM_CAT(list_sum_, Item)
-
-static inline Item list_sum(Item)(List(Item) *xs) {
-  return $(List.get, xs, 0) + $(List.get, xs, 1);
-}
-
-#undef Item
-```
-
-No dummy wrapper type or extra trait impl is needed just to reach the overload.
-The dependency blocks are flattened into `gen/list_sum.h` ahead of the
-functions, so no manual `GEN_LIST_H` guard is needed.
-
-```c
-/* src/main.c */
-#include "point.h"
-#include "gen/list.h"
-#include "gen/list_sum.h"
-#include <stdio.h>
-
-int main(void) {
-  List(int) xs = {0};
-  List(float) fs = {0};
-  List(Point) ps = {0};
-
-  int new_x = 7;
-  float new_f = 3.5f;
-  Point new_p = { 4, 5 };
-
-  $(List.push, &xs, new_x);
-  $(List.push, &xs, 9);
-  $(List.push, &fs, new_f);
-  $(List.push, &ps, new_p);
-
-  printf("xs=%d,%d fs=%.1f pt=(%d,%d) sums=%d,%.1f\n",
-         $(List.get, &xs, 0), $(List.get, &xs, 1),
-         $(List.get, &fs, 0),
-         $(List.get, &ps, 0).x, $(List.get, &ps, 0).y,
-         list_sum(int)(&xs),
-         list_sum(float)(&fs));
-  return 0;
-}
-```
-
-`point.h` comes first because `List(Point)` needs `Point` and its `POINT_H`
-guard. The function's own `List(int)` and `List(float)` dependencies are already
-inside `gen/list_sum.h`.
-
-```sh
-cp /path/to/c-trait/trait.h .
-autotmpl --root . src/main.c
-cc -std=gnu11 -I. src/main.c -o demo && ./demo
-# xs=7,9 fs=3.5 pt=(4,5) sums=16,3.5
-```
-
-`List_Item` is set to `T` inside each generated block. The trait signature has
-one `push` method, while the generated impl uses the right argument type for
-`List(int)`, `List(float)`, and `List(Point)`. The `$()` call site stays the
-same for all three:
-
-```c
-$(List.push, &xs, new_x);
-```
-
-Add a trait impl by adding a `List(T)` usage. c-autotmpl writes the generated
-block, and the template writes the associated type and impl for that `T`.
-
-`list_sum(int)` and `list_sum(float)` add free functions that call
-`$(List.get, ...)` on the concrete list. The overload stays inside the generated
-function, so the call site only names the item type.
-
-See the [c-trait API reference](https://github.com/elias-michaias/c-trait/blob/main/docs/API.md)
-for defaults, dynamic dispatch, and supertraits.
-
-## Tagged unions with generated payloads
-
-A template can generate the tag enum, payload struct, and constructors together.
-Each instantiation gets its own tag constants and helpers, so `Option(int)` and
-`Option(Point)` are distinct types with distinct operations.
-
-```c
-/* tmpl/option.h */
-// -- template Option(T)
-
-#ifndef T
-typedef int T;
-#endif
-
-#define OPTION_CAT_I(a, b) a##b
-#define OPTION_CAT(a, b) OPTION_CAT_I(a, b)
-#define Option(T) OPTION_CAT(Option_, T)
-#define Option_tag(T) OPTION_CAT(Option_tag_, T)
-#define option_some(T) OPTION_CAT(option_some_, T)
-#define option_none(T) OPTION_CAT(option_none_, T)
-#define option_has(T) OPTION_CAT(option_has_, T)
-#define option_value(T) OPTION_CAT(option_value_, T)
-
-typedef enum {
-  OPTION_CAT(Option_has_value_, T),
-  OPTION_CAT(Option_is_empty_, T)
-} Option_tag(T);
-
-typedef struct { Option_tag(T) tag; T value; } Option(T);
-
-static inline Option(T) option_some(T)(T value) {
-  Option(T) r = { OPTION_CAT(Option_has_value_, T), value };
-  return r;
-}
-
-static inline Option(T) option_none(T)(void) {
-  Option(T) r = {0};
-  r.tag = OPTION_CAT(Option_is_empty_, T);
-  return r;
-}
-
-static inline int option_has(T)(const Option(T) *o) {
-  return o->tag == OPTION_CAT(Option_has_value_, T);
-}
-
-static inline T option_value(T)(const Option(T) *o) {
-  return o->value;
-}
-
-#undef T
-```
-
-```c
-/* point.h */
-#ifndef POINT_H
-#define POINT_H
-
-typedef struct { int x; int y; } Point;
-
-#endif
-```
-
-```c
-/* src/main.c */
-#include "point.h"
-#include "gen/option.h"
-#include <stdio.h>
-
-int main(void) {
-  Option(int) oi = option_some(int)(7);
-  Option(Point) op = option_some(Point)((Point){2, 3});
-  Option(int) empty = option_none(int)();
-
-  printf("int=%d,%d point=%d,(%d,%d) empty=%d\n",
-         option_has(int)(&oi), option_value(int)(&oi),
-         option_has(Point)(&op), option_value(Point)(&op).x,
-         option_value(Point)(&op).y, option_has(int)(&empty));
-  return 0;
-}
-```
-
-```sh
-autotmpl --root . src/main.c
-cc -std=c11 -I. src/main.c -o demo && ./demo
-# int=1,7 point=1,(2,3) empty=0
-```
-
-This is a sum type with type-mangled constructors. The payload type changes,
-but the generated API shape stays the same.
 
 ---
 

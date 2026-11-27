@@ -3,8 +3,8 @@
 c-autotmpl is designed to stay out of the way of a C build. The standalone CLI
 is a single portable C99 executable: on the benchmark workload it adds roughly
 20 ms to a one-second syntax check, and the clangd plugin spends about 2 ms per
-edit. This page explains what is measured, how to reproduce it, and how the
-configuration knobs change the cost.
+edit. The numbers below show what is measured and how the configuration knobs
+change the cost.
 
 ## Run the benchmark
 
@@ -56,9 +56,9 @@ benchmark exercises dispatch generation as well as plain type instantiation.
 The STC template exercises `profile`/`stc_auto` configuration. The macro-only
 file exercises both preprocessing backends without changing the default raw-text
 workload: the `full` backend expands all 82 sources in one batched compiler
-invocation, while `local` expands wrapper macros inside the CLI. Dispatch
-selectors are written to the central `gen/dispatch.h`; rerun `make bench` after
-changing that layout before comparing timings.
+invocation, while `local` expands wrapper macros inside the CLI. See
+[Generic calls](USAGE.md#generic-calls) for the dispatch selectors written to
+`gen/dispatch.h`.
 
 ## Methodology
 
@@ -154,7 +154,7 @@ creates and removes empty `gen/*.h` stubs, which is negligible next to the
 single batched preprocessor invocation. The `local` backend needs no stubs and
 adds only about 5 ms over cold raw generation here.
 
-### Clangd plugin
+### clangd plugin
 
 Time to first diagnostics:
 
@@ -202,5 +202,9 @@ latency.
   the scanner would otherwise inspect. Measure your own project.
 - The plugin's first-open cost is mostly workspace discovery. Later edits only
   rescan the open buffer and regenerate changed blocks.
-- Use `--files`, `--headers`, and `--reps` to model your project. Add more
-  samples before trusting sub-millisecond differences.
+- Use the [benchmark options](#run-the-benchmark) to model your project. Add
+  more samples before trusting sub-millisecond differences.
+
+---
+
+[README](../README.md) &bull; [Build](BUILD.md) &bull; [Usage](USAGE.md) &bull; [Troubleshooting](TROUBLESHOOTING.md)

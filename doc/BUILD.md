@@ -5,8 +5,9 @@ There are two separate builds.
 The CLI is one C99 source file. It needs no LLVM, libclang, clang headers, C++
 runtime, or compile database.
 
-The clangd module is a C++ shared library built from clangd internal headers. It
-must match the clangd binary that loads it, so the build takes more setup.
+The clangd plugin is a C++ shared library built from clangd internal headers.
+clangd calls this kind of library a *feature module*. It must match the clangd
+binary that loads it, so the build takes more setup.
 
 ## CLI
 
@@ -44,10 +45,19 @@ file to a GitHub release. The workflow is `.github/workflows/cli-build.yml`.
 
 > **Upstream note.** clangd's feature module interface is now in LLVM. When
 > distributions expose that interface in their normal clangd development
-> packages, this module should be buildable against the system clangd instead of
+> packages, this plugin should be buildable against the system clangd instead of
 > a private source tree. It still uses clangd internals today, so the headers
 > must match your clangd binary. That packaging gap is the main thing likely to
 > improve.
+
+### What you need today
+
+- The LLVM source tree used to build your clangd. Only `llvm`, `clang`, and
+  `clang-tools-extra` matter here.
+- The configured LLVM build tree that generated clangd's headers.
+- `llvm-config` from that build tree.
+- Git, CMake, Ninja, and a C++17 compiler compatible with clangd.
+- Python 3 if you want to run the integration checks.
 
 Check which clangd you actually run:
 
@@ -70,15 +80,6 @@ If both are present and match your clangd version, point `LLVM_SRC`,
 `LLVM_BUILD`, `CLANGD_SRC`, and `LLVM_CONFIG` at that installation. The Makefile
 expects a source-tree layout, so you may need to adjust `INCLUDES`. If the
 headers are missing, use the shallow clone below.
-
-### What you need today
-
-- The LLVM source tree used to build your clangd. Only `llvm`, `clang`, and
-  `clang-tools-extra` matter here.
-- The configured LLVM build tree that generated clangd's headers.
-- `llvm-config` from that build tree.
-- Git, CMake, Ninja, and a C++17 compiler compatible with clangd.
-- Python 3 if you want to run the integration checks.
 
 ### Get a matching LLVM tree
 
@@ -113,10 +114,6 @@ cmake -S llvm -B build -G Ninja \
 
 cmake --build build --target clangd llvm-config
 ```
-
-You still build clangd today because the generated headers must match the
-binary you load the module into. Once system packages ship those headers, this
-step should go away.
 
 This gives the layout the Makefile expects:
 
@@ -166,18 +163,8 @@ make -j4 \
   build/libc-autotmpl.so
 ```
 
-The plugin sources are:
-
-```text
-src/plugin/AutotmplModule.cpp   registration, LSP wrapping, AST listener
-src/plugin/SourceScan.cpp       usage finding, nested canonicalization
-src/plugin/TemplateRegistry.cpp decorators, paths, include guards
-src/plugin/TypeIndex.cpp        guarded type lookup
-src/plugin/Instantiator.cpp     block writing, marker parsing, pruning
-```
-
-They compile as C++17 with `-fPIC` and the clangd include paths above. The link
-step is only:
+Sources live in `src/plugin/`. They compile as C++17 with `-fPIC` and the clangd
+include paths above. The link step is only:
 
 ```sh
 $(CXX) -shared -o build/libc-autotmpl.so build/plugin/*.o
@@ -264,22 +251,18 @@ plugin overhead. Use `make bench-quick` for a shorter smoke run. See
 4. Run `make selftest` and `make lsp-check`.
 5. Restart the editor.
 
-Once distributions ship the clangd module headers, steps 1 and 2 should go away.
-You should only need the system clangd development package and a rebuild of this
-small module.
-
 ### Build errors
 
 | Error | Fix |
 | --- | --- |
 | `FeatureModule.h` not found | Point `LLVM_SRC` and `LLVM_BUILD` at the tree that built clangd. |
-| Undefined symbol at startup | Rebuild with the matching clangd revision, ABI, compiler, and flags. |
+| Undefined symbol at load time | Rebuild with the matching clangd revision, ABI, compiler, and flags. |
 | `clang++` ABI errors | Check how clangd was built and set `LLVM_ABI` accordingly. |
-| Wrong architecture on macOS | Build with the same arch as clangd. |
-| Plugin loads but logs nothing | Use an absolute `--load` path and restart clangd. |
+| Wrong architecture on macOS | Build with the same architecture as clangd. |
 
-More runtime problems are covered in [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+For runtime symptoms such as a plugin that loads but logs nothing, see
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
 ---
 
-[README](../README.md) &bull; [Build](BUILD.md) &bull; [Usage](USAGE.md) &bull; [Troubleshooting](TROUBLESHOOTING.md)
+[README](../README.md) &bull; [Usage](USAGE.md) &bull; [Troubleshooting](TROUBLESHOOTING.md)

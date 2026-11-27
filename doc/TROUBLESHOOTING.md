@@ -1,5 +1,7 @@
 # Troubleshooting
 
+## Start here
+
 For plugin problems, start with the verbose log:
 
 ```sh
@@ -10,40 +12,57 @@ On startup you should see a `scanning ... found N template(s)` line. A little
 later, `workspace scan complete` should appear. Pruning waits for that second
 line.
 
+## Plugin loading and matching
+
 | Symptom | Fix |
 | --- | --- |
-| No `[c-autotmpl]` lines | The `--load` path is wrong or clangd was already running. Use an absolute path and restart the editor. |
-| `undefined symbol` at startup | The module does not match the clangd that loaded it. Rebuild with the same LLVM revision and ABI. See [BUILD.md](BUILD.md). |
-| `FeatureModule.h` not found | `LLVM_SRC` or `LLVM_BUILD` points at the wrong tree. |
-| `found 0 template(s)` | Check the decorator spelling: `// -- template Name(T)`, `// -- template type Name(T)`, or `// -- template function Name(P1, P2)`. |
-| Wrong project root | The plugin checks `tmpl/` or `templates/`, then `.clangd`, `compile_commands.json`, and `.git`. Set `C_AUTOTMPL_ROOT` to force one. Put `autotmpl.conf` at that root. |
+| No `[c-autotmpl]` lines | Use an absolute `--load` path and restart clangd after replacing the plugin. |
+| `undefined symbol` at startup | The plugin does not match the clangd that loaded it. Rebuild with the same LLVM revision and ABI. See [BUILD.md](BUILD.md). |
+| `FeatureModule.h` not found | Point `LLVM_SRC` and `LLVM_BUILD` at the tree that built clangd. See [BUILD.md](BUILD.md). |
+| Wrong project root | The plugin checks `tmpl/` or `templates/`, then `.clangd`, `compile_commands.json`, and `.git`. Set `C_AUTOTMPL_ROOT` to force one and put `autotmpl.conf` at that root. |
 | CLI finds no templates | Pass `--root .` explicitly. The inferred common ancestor may be wrong. |
+| MSVC reports `_stat` or `_access` undeclared | Use a current source tree. The Windows shim includes `<io.h>` and `<sys/stat.h>`. |
+
+## Generation and guards
+
+| Symptom | Fix |
+| --- | --- |
+| `found 0 template(s)` | Check the decorator spelling: `// -- template Name(T)`, `// -- template type Name(T)`, or `// -- template function Name(P1, P2)`. |
 | `skipping Name(Foo): no traditional include guard` | Give `Foo` an `#ifndef FOO_H / #define FOO_H` guard. `#pragma once` is not supported. |
-| `skipping stc_vec(Foo): no traditional include guard` | `Foo` needs a traditional `FOO_H` guard, even in STC mode. STC-owned types such as `cstr` are exempt. |
-| STC roles were not applied | Enable `--stc`, `profile=stc` in `autotmpl.conf`, or `C_AUTOTMPL_PROFILE`. The name must start with `stc_`, appear in `--stc-template`, `stc_templates`, or `C_AUTOTMPL_STC_TEMPLATES`, or be found by `--stc-auto`, `stc_auto`, or `C_AUTOTMPL_STC_AUTO`. |
-| Unprefixed STC adapter is undefined | Add a call such as `vec_push(int)(...)` and regenerate. Adapters come from the current call sites, not from a fixed operation list. The template must be selected by name or auto-detection. |
-| Derived STC name does not match the call site | Keep the wrapper paste macro in step with the template name, such as `stc_vec(T)` pasting to `stc_vec_##T`. Identifier-like type arguments are supported. |
-| Adapter call creates a `Name(Fn)` warning | Update to the current build. Call-like identifiers such as `vec_push(int)` are scanned as adapter uses only when a second call parenthesis follows the type arguments. |
 | Function template generated nothing | Spell every argument at the call site, e.g. `convert(int, float)(x)`. Wrong arity and helper names such as `convert_impl(x)` are ignored. |
 | Function template block is skipped at compile time | Each user-defined argument needs a guard. Include its type header before the generated header. Header-discovered type dependencies are emitted into the same header for you. |
 | HKT argument is treated as a type | The argument must be a bare registered template name, such as `Option`. The generated parameter is a macro name and has no include guard. |
 | Usage produced only by a macro expansion | Enable `preprocess=1` in `autotmpl.conf` for the CLI. Start with `preprocess_backend=local` for local wrapper macros; switch to `full` for compiler-exact expansion with `preprocess_cc` and `preprocess_flags`. The plugin has an AST diagnostic fallback, or you can spell the usage directly. |
-| Two identical blocks in a generated header | The hand-written block used a different macro parameter name, or its `C_AUTOTMPL_...` macro was removed. |
-| Split template produces no object file | Include `gen/impl/c-autotmpl.mk` and link `C_AUTOTMPL_IMPL_SRCS`. Both the CLI and plugin write that fragment when a split template has usages. |
-| Generic call was not generated | Set `dispatch=1` in `autotmpl.conf` and restart clangd after config changes. Include the generated instantiation headers before `gen/dispatch.h`, and include `gen/dispatch.h` before the call. The operation must be declared in a type-template header, and its parameter list must mention the template call form, a template parameter, or a decorator parameter such as `vec(int)`, `T`, or `i_type`. Function names are not matched against the template name; declarations after `#ifndef TMPL_HEADER` are skipped. |
-| Bare generic call was not generated | Set `dispatch_truncate=1` as well. In this mode there is no affix; declare `<op>_impl(T, U)` in the template header so the dispatcher exposes `<op>` from `gen/dispatch.h` and targets `<op>_<args>`. `dispatch_affix` is ignored, and older paste declarations or concrete-only functions are still accepted. |
-| Go to definition lands on the generated macro | Reload clangd after enabling generic calls. With the plugin loaded, a recognized generic call (including a shared method such as `map(float)`) resolves to the operation declaration in the template header, not the generated `#define`. |
-| Completion removes the `$` prefix | Reload with the current plugin. It escapes the configured affix in snippet completions so editors keep `$` as literal text; no editor setting change is needed. |
-| A section says `generated-by=plugin` but the CLI did not change it | Expected. Sections are owned: the CLI preserves plugin sections and the plugin preserves CLI sections. Change the owning generator or remove the section manually before the other generator takes over. |
-| Editor generation creates no `gen/impl/` | The template needs a lexical `#ifndef TMPL_HEADER` and a scanned usage. Open a source that uses it, then check the `[c-autotmpl]` log for `generated implementation`. |
+| Two identical blocks in a generated header | The hand-written block used a different macro parameter name, or its `C_AUTOTMPL_...` marker was removed. |
+| Split template produces no object file | Add the lexical `#ifndef TMPL_HEADER` guard and open a source that uses the template. Include `gen/impl/c-autotmpl.mk` and link `C_AUTOTMPL_IMPL_SRCS`; both generators write that fragment when a split template has usages. |
 | Duplicate types in an implementation source | Put public declarations in the `#else` branch. Keep only implementation code under `#ifndef TMPL_HEADER`. |
 | Nested block exists but is inactive | Include the outermost generated header. Its flattened chain defines the inner blocks first. |
-| `GEN_BOX_H` is undefined | Harmless when using the flattened chain. It still guards copies emitted into `gen/box.h`. |
-| Unused blocks are not removed | Wait for `workspace scan complete` for the plugin. The CLI prunes stale sections on its next run while preserving sections owned by the plugin. |
-| External edit came back | The plugin caches by mtime and size. Edit or touch the file again. |
-| MSVC reports `_stat` or `_access` undeclared | Rebuild with the current source. The Windows shim includes `<io.h>` and `<sys/stat.h>`. |
+| `GEN_BOX_H` is undefined | Harmless when using the flattened chain. The guard still controls copies emitted into `gen/box.h`. |
+| Unused blocks are not removed | Wait for `workspace scan complete` with the plugin. The CLI prunes stale sections on its next run while preserving sections owned by the plugin. |
+| External edit came back | The plugin caches by modification time and size. Edit or touch the file again. |
+| A section says `generated-by=plugin` but the CLI did not change it | Expected. Sections are owned: the CLI preserves plugin sections and the plugin preserves CLI sections. Change the owning generator or remove the section manually before the other generator takes over. |
 
-### Editor diagnostics in template headers
+## Generic calls and dispatch
+
+| Symptom | Fix |
+| --- | --- |
+| Generic call was not generated | Set `dispatch=1` in `autotmpl.conf` and restart clangd after config changes. Include the generated instantiation headers before `gen/dispatch.h`, and include `gen/dispatch.h` before the call. The operation must be declared in a type-template header, and its parameter list must mention the template call form, a template parameter, or a decorator parameter such as `vec(int)`, `T`, or `i_type`. Function names are not matched against the template name; declarations after `#ifndef TMPL_HEADER` are skipped. See [Generic calls](USAGE.md#generic-calls). |
+| Bare generic call was not generated | Set `dispatch_truncate=1` as well. In this mode there is no affix; declare `<op>_impl(T, U)` in the template header so the dispatcher exposes `<op>` from `gen/dispatch.h` and targets `<op>_<args>`. `dispatch_affix` is ignored, and older paste declarations or concrete-only functions are still accepted. See [Bare generic calls](USAGE.md#bare-generic-calls). |
+| Same-name targets collide | Add `// -- +owner` or `// -- mangle +owner` to the owning template section. For a curried method, add a trailing `Owner` parameter to the implementation declaration and paste macro. See [Curried methods with explicit type arguments](USAGE.md#curried-methods-with-explicit-type-arguments). |
+| Go to definition lands on the generated macro | Reload clangd after enabling generic calls. With the plugin loaded, a recognized generic call (including a shared method such as `map(float)`) resolves to the operation declaration in the template header, not the generated `#define`. |
+| Completion removes the `$` prefix | Reload with the current plugin. It escapes the configured affix in snippet completions so editors keep `$` as literal text; no editor setting change is needed. |
+
+## STC
+
+| Symptom | Fix |
+| --- | --- |
+| `skipping stc_vec(Foo): no traditional include guard` | `Foo` needs a traditional `FOO_H` guard, even in STC mode. STC-owned types such as `cstr` are exempt. |
+| STC roles were not applied | Enable `--stc`, `profile=stc` in `autotmpl.conf`, or `C_AUTOTMPL_PROFILE`. The name must start with `stc_`, appear in `--stc-template`, `stc_templates`, or `C_AUTOTMPL_STC_TEMPLATES`, or be found by `--stc-auto`, `stc_auto`, or `C_AUTOTMPL_STC_AUTO`. |
+| Unprefixed STC adapter is undefined | Add a call such as `vec_push(int)(...)` and regenerate. Adapters come from current call sites, not a fixed operation list. The template must be selected by name or auto-detection. |
+| Derived STC name does not match the call site | Keep the wrapper paste macro in step with the template name, such as `stc_vec(T)` pasting to `stc_vec_##T`. Identifier-like type arguments are supported. |
+| Adapter call creates a `Name(Fn)` warning | Upgrade to a current build. Call-like identifiers such as `vec_push(int)` are scanned as adapter uses only when a second call parenthesis follows the type arguments. |
+
+## Editor diagnostics in template headers
 
 clangd also parses `tmpl/*.h` files as ordinary translation units, where the
 generated parameter macros are absent. Give the header a local fallback for
@@ -63,10 +82,12 @@ Here `Item` becomes `int`, and including `list.h` with `T` as `int` supplies the
 themselves, so the fallback is skipped there. Point the fallback at the
 concrete dependency your header actually names.
 
-Run `make selftest`, `make lsp-check`, and `make standalone-check` to separate
-core generation problems from clangd integration problems. Add
-`C_AUTOTMPL_TEST_VERBOSE=1` to see plugin logs from `lsp-check`.
+## Verify with tests
+
+Run `make test` to separate core generation problems from clangd integration
+problems. Add `C_AUTOTMPL_TEST_VERBOSE=1` to see plugin logs from `lsp-check`.
+See [BUILD.md](BUILD.md#tests) for the individual targets.
 
 ---
 
-[README](../README.md) &bull; [Build](BUILD.md) &bull; [Usage](USAGE.md) &bull; [Troubleshooting](TROUBLESHOOTING.md)
+[README](../README.md) &bull; [Build](BUILD.md) &bull; [Usage](USAGE.md)

@@ -1,153 +1,14 @@
 # Usage
 
-Use the CLI for build scripts and reproducible generation. Use the clangd module
-for generation from unsaved buffers, type lookup through the AST, and pruning.
-Both write the same public headers, the central `gen/dispatch.h`, implementation
+Use the CLI for build scripts and reproducible generation. Use the clangd plugin
+for generation from unsaved buffers and type lookup through the AST. Both write
+the same generated instantiation headers, dispatch header, implementation
 sources, and makefile fragment for split templates. Build instructions are in
 [BUILD.md](BUILD.md).
 
-## CLI
-
-```sh
-cc -std=c99 -O2 src/cli/autotmpl.c -o autotmpl
-autotmpl --root . --verbose src/ include/
-autotmpl --root . --dry-run --verbose src/main.c
-```
-
-Options:
-
-```text
---root DIR, -r DIR   root for template and type discovery
---dry-run, -n        report changes without writing
---verbose, -v        print generated blocks and counters
---profile NAME, -p   opt-in preset, such as stc, stc-shared, or none
---stc                shorthand for --profile stc
---stc-template NAME  treat NAME as an STC template; repeat for more names
---stc-auto           detect STC wrappers from template-header contents
---                   treat the rest as file names
---help, -h           show usage
-```
-
-Inputs can be files or directories. Pass `--root .` in scripts; without it the
-CLI uses the common ancestor of the inputs.
-
-A simple build rule:
-
-```make
-.PHONY: gen
-gen:
-	autotmpl --root . src include
-
--include gen/impl/c-autotmpl.mk
-```
-
-The fragment appends generated implementation sources to
-`C_AUTOTMPL_IMPL_SRCS`. Add that variable to the link step when you use split
-templates. A second run reports `added=0`; the CLI is additive and idempotent,
-and it does not remove unused blocks.
-
-## Configuration
-
-Profiles and generic calls are opt-in. Put project settings in `autotmpl.conf`
-at the workspace root:
-
-```text
-# autotmpl.conf
-profile=stc
-stc_auto=1
-dispatch=1
-dispatch_templates=vec,pair
-```
-
-The CLI and clangd plugin both read this file. No Makefile export or `lsp.sh`
-wrapper is needed. CLI flags take precedence over `autotmpl.conf`, the file takes
-precedence over environment variables, and environment variables take precedence
-over defaults. Restart clangd after changing configuration.
-
-| Setting | Config key | Environment variable | Effect |
-| --- | --- | --- | --- |
-| Profile | `profile` | `C_AUTOTMPL_PROFILE` | Select an opt-in profile, such as `stc`. |
-| STC templates | `stc_templates` | `C_AUTOTMPL_STC_TEMPLATES` | Comma-separated names, such as `vec,hashmap`. |
-| STC auto | `stc_auto` | `C_AUTOTMPL_STC_AUTO` | Detect STC wrappers from template-header contents. |
-| Generic calls | `dispatch` | `C_AUTOTMPL_DISPATCH` | Enable compile-time generic calls such as `$vec_push`. |
-| Call backend | `dispatch_backend` | `C_AUTOTMPL_DISPATCH_BACKEND` | Select `generic` (`_Generic`, default) or `builtin` (GCC/Clang builtins). |
-| Call style | `dispatch_style` | `C_AUTOTMPL_DISPATCH_STYLE` | Place the affix before the name (`prefix`, default) or after it (`postfix`). |
-| Call affix | `dispatch_affix` | `C_AUTOTMPL_DISPATCH_AFFIX` | Set the generic-call affix, default `$`. |
-| Bare generic calls | `dispatch_truncate` | `C_AUTOTMPL_DISPATCH_TRUNCATE` | Use bare operation macros and direct `<op>_<args>` targets; ignore the affix. |
-| Call templates | `dispatch_templates` | `C_AUTOTMPL_DISPATCH_TEMPLATES` | Comma-separated templates that get generic calls, such as `vec,list`. |
-| Template header preprocess for dispatch | `dispatch_preprocess_headers` | n/a | Expand template headers while discovering generic calls; `1` means all, otherwise a comma-separated template list. This is unrelated to the central `gen/dispatch.h` output. |
-| Preprocess | `preprocess` | `C_AUTOTMPL_PREPROCESS` | CLI only: scan expanded source so macro-generated usages are visible. Off by default. |
-| Preprocess backend | `preprocess_backend` | `C_AUTOTMPL_PREPROCESS_BACKEND` | `local` (internal expander) or `full` (batched `cc -E -P`, default). |
-| Preprocessor | `preprocess_cc` | `C_AUTOTMPL_PREPROCESS_CC` | Command used by the `full` backend; default `cc`. |
-| Preprocessor flags | `preprocess_flags` | `C_AUTOTMPL_PREPROCESS_FLAGS` | Extra flags such as `-Iinclude -DFEATURE=1`. |
-| Plugin root | n/a | `C_AUTOTMPL_ROOT` | Force the clangd plugin workspace root. |
-| Plugin timing | n/a | `C_AUTOTMPL_TIMING` | Log plugin phase timings. |
-
-`--profile none` wins over every STC opt-in. The config file accepts comments
-starting with `#`, optional spaces around `=`, and quoted values. STC
-auto-detection and explicit template lists are explained in the
-[STC quick start](#stc-quick-start).
-
-### Macro-generated usages
-
-The CLI scans raw source text by default. Enable preprocessing when a usage is
-spelled only through local macros:
-
-```text
-# autotmpl.conf
-preprocess=1
-preprocess_backend=local
-```
-
-Two backends are available:
-
-| Backend | Command | Cost | Fidelity |
-| --- | --- | --- | --- |
-| `local` | internal expander, no subprocess | ~2× raw scan | common local wrapper macros |
-| `full` | batched `cc -E -P` | ~20× raw scan | compiler-exact for the selected flags |
-
-`full` is the default so existing `preprocess=1` configurations keep their
-behavior. It passes all input sources to batched preprocessor invocations,
-capped at 128 files and by command-line length so Windows paths cannot overflow
-`cmd.exe` limits:
-
-```text
-cc -E -P -I <workspace-root> <preprocess_flags> <source>...
-```
-
-Each source is still a separate translation unit, so macros do not leak between
-files. Missing `gen/*.h` files are temporarily created empty so preprocessing
-can succeed before any instantiation exists; those stubs are removed before
-generated blocks are written.
-
-`local` expands macros inside the CLI. It follows local `#include` directives
-under the workspace root, honors `#define`/`#undef`, supports nested wrappers,
-object-like macros, `##` token pasting, and `__VA_ARGS__`, and keeps macro state
-separate per input file. It does not evaluate `#if`, system headers, built-in
-target macros, or command-line function-like `-D` definitions; simple
-`-DNAME=Box(int)` object macros are supported. Use `full` when a usage depends
-on those features.
-
-Both backends feed expanded text to the normal usage scanner. Operation calls
-such as `box_alloc(int)()` are mapped back to their owning type template from
-the header signature. Leave preprocessing off when usages are already spelled
-directly.
-
-Generic-call discovery can also expand a template header itself. Add
-`// -- preprocess` to that header, or set `dispatch_preprocess_headers=1` (all
-templates) or `dispatch_preprocess_headers=Option,Result` (named templates).
-This is useful when operations are hidden behind macro-generated declarations.
-A shared header may contain several `// -- template ...` sections; the generator
-emits the preamble and each section inline, avoiding duplicate whole-header
-re-includes.
-
-The clangd plugin keeps its fast unsaved-buffer scan and does not invoke an
-external preprocessor. It can recover many macro-generated type usages through
-clang diagnostics after parsing.
-
 ## What the pattern does
 
-A template-style header is an ordinary C header included once per type. The
+A template header is an ordinary C header included once per type. The
 generated block defines `T`, includes the header, then undefines `T`. The header
 pastes `T` into identifiers, so one header can produce `Stack_int` and
 `Stack_float`. This is preprocessor metaprogramming, not C++ templates.
@@ -217,7 +78,161 @@ near the top of the header. `#pragma once` has no macro that generated code can
 test, so it is skipped. The plugin can also find a declaring header through the
 clang AST; the CLI uses a text index.
 
-## Nested types
+## Generated files
+
+Generated headers are ordinary C headers in `gen/`. Generic-call selectors and
+public macros live in the dispatch header: owner sections are keyed by
+template and operation (for example `vec` or `Result.map`), and shared public
+sections are keyed by operation (for example `shared.push` or `shared.map`).
+Every section carries a `generated-by=cli` or `generated-by=plugin` marker, and
+the two generators preserve each other's sections. Split templates also get a grouped
+source in `gen/impl/` and a shared `gen/impl/c-autotmpl.mk` fragment. You can
+commit generated files or regenerate them. Keep the `/* c-autotmpl: ... */`
+markers if you want plugin pruning to work.
+
+## CLI
+
+```sh
+cc -std=c99 -O2 src/cli/autotmpl.c -o autotmpl
+autotmpl --root . --verbose src/ include/
+autotmpl --root . --dry-run --verbose src/main.c
+```
+
+Options:
+
+```text
+--root DIR, -r DIR   root for template and type discovery
+--dry-run, -n        report changes without writing
+--verbose, -v        print generated blocks and counters
+--profile NAME, -p   opt-in preset, such as stc, stc-shared, or none
+--stc                shorthand for --profile stc
+--stc-template NAME  treat NAME as an STC template; repeat for more names
+--stc-auto           detect STC wrappers from template-header contents
+--                   treat the rest as file names
+--help, -h           show usage
+```
+
+Inputs can be files or directories. Pass `--root .` in scripts; without it the
+CLI uses the common ancestor of the inputs.
+
+A simple build rule:
+
+```make
+.PHONY: gen
+gen:
+	autotmpl --root . src include
+
+-include gen/impl/c-autotmpl.mk
+```
+
+The fragment appends generated implementation sources to
+`C_AUTOTMPL_IMPL_SRCS`. Add that variable to the link step when you use split
+templates. A second run reports `added=0`; the CLI is additive and idempotent. It leaves
+unused instantiation blocks alone, but prunes stale sections in the dispatch
+header.
+
+## Configuration
+
+Profiles and generic calls are opt-in. Put project settings in `autotmpl.conf`
+at the workspace root:
+
+```text
+# autotmpl.conf
+profile=stc
+stc_auto=1
+dispatch=1
+dispatch_templates=vec,pair
+```
+
+The CLI and clangd plugin both read this file. No Makefile export or `lsp.sh`
+wrapper is needed. CLI flags take precedence over `autotmpl.conf`, the file takes
+precedence over environment variables, and environment variables take precedence
+over defaults. Restart clangd after changing configuration.
+
+| Setting | Config key | Environment variable | Effect |
+| --- | --- | --- | --- |
+| Profile | `profile` | `C_AUTOTMPL_PROFILE` | Select an opt-in profile, such as `stc`. |
+| STC templates | `stc_templates` | `C_AUTOTMPL_STC_TEMPLATES` | Comma-separated names, such as `vec,hashmap`. |
+| STC auto | `stc_auto` | `C_AUTOTMPL_STC_AUTO` | Detect STC wrappers from template-header contents. |
+| Generic calls | `dispatch` | `C_AUTOTMPL_DISPATCH` | Enable compile-time generic calls such as `$vec_push`. |
+| Call backend | `dispatch_backend` | `C_AUTOTMPL_DISPATCH_BACKEND` | Select `generic` (`_Generic`, default) or `builtin` (GCC/Clang builtins). |
+| Call style | `dispatch_style` | `C_AUTOTMPL_DISPATCH_STYLE` | Place the affix before the name (`prefix`, default) or after it (`postfix`). |
+| Call affix | `dispatch_affix` | `C_AUTOTMPL_DISPATCH_AFFIX` | Set the generic-call affix, default `$`. |
+| Bare generic calls | `dispatch_truncate` | `C_AUTOTMPL_DISPATCH_TRUNCATE` | Use bare operation macros and direct `<op>_<args>` targets; ignore the affix. |
+| Call templates | `dispatch_templates` | `C_AUTOTMPL_DISPATCH_TEMPLATES` | Comma-separated templates that get generic calls, such as `vec,list`. |
+| Template header preprocess for dispatch | `dispatch_preprocess_headers` | n/a | Expand template headers while discovering generic calls; `1` means all, otherwise a comma-separated template list. This is unrelated to the dispatch header output. |
+| Preprocess | `preprocess` | `C_AUTOTMPL_PREPROCESS` | CLI only: scan expanded source so macro-generated usages are visible. Off by default. |
+| Preprocess backend | `preprocess_backend` | `C_AUTOTMPL_PREPROCESS_BACKEND` | `local` (internal expander) or `full` (batched `cc -E -P`, default). |
+| Preprocessor | `preprocess_cc` | `C_AUTOTMPL_PREPROCESS_CC` | Command used by the `full` backend; default `cc`. |
+| Preprocessor flags | `preprocess_flags` | `C_AUTOTMPL_PREPROCESS_FLAGS` | Extra flags such as `-Iinclude -DFEATURE=1`. |
+| Plugin root | n/a | `C_AUTOTMPL_ROOT` | Force the clangd plugin workspace root. |
+| Plugin timing | n/a | `C_AUTOTMPL_TIMING` | Log plugin phase timings. |
+
+`--profile none` wins over every STC opt-in. The config file accepts comments
+starting with `#`, optional spaces around `=`, and quoted values. STC
+auto-detection and explicit template lists are explained in the
+[STC quick start](#stc-quick-start).
+
+<a id="macro-generated-usages"></a>
+
+### Source preprocessing
+
+The CLI scans raw source text by default. Enable preprocessing when a usage is
+spelled only through local macros:
+
+```text
+# autotmpl.conf
+preprocess=1
+preprocess_backend=local
+```
+
+Two backends are available:
+
+| Backend | Command | Cost | Fidelity |
+| --- | --- | --- | --- |
+| `local` | internal expander, no subprocess | ~2× raw scan | common local wrapper macros |
+| `full` | batched `cc -E -P` | ~20× raw scan | compiler-exact for the selected flags |
+
+`full` is the default so existing `preprocess=1` configurations keep their
+behavior. It passes all input sources to batched preprocessor invocations,
+capped at 128 files and by command-line length so Windows paths cannot overflow
+`cmd.exe` limits:
+
+```text
+cc -E -P -I <workspace-root> <preprocess_flags> <source>...
+```
+
+Each source is still a separate translation unit, so macros do not leak between
+files. Missing `gen/*.h` files are temporarily created empty so preprocessing
+can succeed before any instantiation exists; those stubs are removed before
+generated blocks are written.
+
+`local` expands macros inside the CLI. It follows local `#include` directives
+under the workspace root, honors `#define`/`#undef`, supports nested wrappers,
+object-like macros, `##` token pasting, and `__VA_ARGS__`, and keeps macro state
+separate per input file. It does not evaluate `#if`, system headers, built-in
+target macros, or command-line function-like `-D` definitions; simple
+`-DNAME=Box(int)` object macros are supported. Use `full` when a usage depends
+on those features.
+
+Both backends feed expanded text to the normal usage scanner. Operation calls
+such as `box_alloc(int)()` are mapped back to their owning type template from
+the header signature. Leave preprocessing off when usages are already spelled
+directly.
+
+### Template-header preprocessing for dispatch
+
+Generic-call discovery can also expand a template header itself. Add
+`// -- preprocess` to that header, or set `dispatch_preprocess_headers=1` (all
+templates) or `dispatch_preprocess_headers=Option,Result` (named templates).
+This is useful when operations are hidden behind macro-generated declarations.
+A shared header may contain several `// -- template ...` sections; the generator
+emits the preamble and each section inline, avoiding duplicate whole-header
+re-includes.
+
+## Template authoring
+
+### Nested types
 
 Nested applications expand inside out:
 
@@ -230,7 +245,7 @@ into the outermost generated header in dependency order, and inner blocks are
 mirrored into their own headers so direct use still works. No call-site alias
 macros are generated; write `List(Box(int))` or `List(Box_int)` directly.
 
-## Split implementations
+### Split implementations
 
 A template can put implementation code in the `#ifndef TMPL_HEADER` branch and
 public declarations in the `#else` branch. The first branch is active when the
@@ -260,7 +275,7 @@ under `gen/impl/`. The build rule above adds that source to
 `C_AUTOTMPL_IMPL_SRCS`. Headers without `#ifndef TMPL_HEADER` keep the original
 single-file behavior.
 
-## Function templates
+### Function templates
 
 A function template has a `function` decorator. The names in parentheses are
 parameters for the generated block, not fixed types:
@@ -303,7 +318,7 @@ header. The template header is lexed after substitution, so a function head such
 as `sum(Item)(List(Item) *xs)` adds `List(int)` as a dependency when the call is
 `sum(int)(xs)`.
 
-## Value generics
+### Value generics
 
 A type template can take a value parameter as well as a type parameter. Paste a
 literal constant into the generated type name; c-autotmpl recognizes numeric
@@ -340,7 +355,7 @@ defines `T` and `N` before re-including `tmpl/array.h`, so `N` stays a literal i
 name. Named constants still work and need their usual include guard; plain
 numbers do not.
 
-## Lexical HKTs
+### Lexical HKTs
 
 A bare registered type-template name is a constructor argument passed as a macro
 name, not as a concrete type, so it needs no include guard:
@@ -383,16 +398,19 @@ application needs an explicit wrapper template.
 
 ## Generic calls
 
-Set `dispatch=1` in `autotmpl.conf` to write method-like calls such as
+Set `dispatch=1` in `autotmpl.conf` to write method-style calls such as
 `$Vec_push(&xs, 7)`. All generated selectors and public operation macros live in
 one `gen/dispatch.h`. Include every generated instantiation header first, then
 `gen/dispatch.h`, then the call sites. Owner sections such as `Vec` and
 `Vec.push` are guarded by concrete type presence macros, and shared sections
 such as `shared.push` define each public spelling exactly once. If two templates
 declare the same operation name, their owner tables are chained behind that one
-public spelling; the argument type chooses the owner. CLI-owned sections are
-marked `generated-by=cli`, plugin-owned sections are marked
-`generated-by=plugin`, and neither generator overwrites the other's sections.
+public spelling; the argument type chooses the owner. The owner template is the
+type template that supplies a target. `Owner` is a synthetic, generator-supplied
+parameter used only for owner-qualified targets; it never appears at call sites.
+CLI-owned sections are marked `generated-by=cli`, plugin-owned sections are
+marked `generated-by=plugin`, and neither generator overwrites the other's
+sections.
 
 The generated selector chooses the concrete operation at compile time from the
 argument types. An operation is eligible when a
@@ -524,6 +542,8 @@ and is not a new call-site argument. Explicit arguments are pasted into generate
 names, so use single-token types such as `float`, `int`, or a typedef name. Both
 the CLI and the clangd plugin understand the annotation; no source-file markers
 are needed.
+
+### Owner-qualified targets
 
 Two owners can share the same public spelling. Concrete functions are pasted
 from their template arguments, so two owners that paste the same argument list
@@ -665,6 +685,8 @@ next when its instantiation is absent, so the two templates remain independent
 and may be included in either order. The `Owner` suffix is generated only where
 the decorator is present.
 
+### Paste declarations and tracked cases
+
 The rule covers direct declarations and paste-macro declarations, including
 two-argument templates such as `pair(Key, Value)`:
 
@@ -712,6 +734,8 @@ autotmpl --root . src
 cc -I. -std=c11 -Wall -Wextra -Werror src/main.c -o demo
 ```
 
+### Backends and editor behavior
+
 With the clangd plugin, go to definition on a generic call opens the operation
 declaration in the template header instead of the generated `#define`. No
 annotation is needed in source files. When snippet completions are enabled, the
@@ -746,11 +770,6 @@ an STC header is detected in `tmpl/` or `templates/`; no name list is needed.
 #define VEC_CAT(A, B) VEC_CAT_I(A, B)
 #define vec(T) VEC_CAT(vec_, T)
 #include <stc/vec.h>
-```
-
-```text
-# autotmpl.conf
-stc_auto=1
 ```
 
 ```c
@@ -828,7 +847,7 @@ autotmpl --root . src
 
 An explicit list opts in unprefixed names even when the wrapper has no STC
 include. Without a list or auto-detection, only `stc_*` templates receive STC
-roles when an STC profile is active. Both paths select the static `stc` profile
+roles when an STC profile is active. Both paths select the STC profile
 automatically.
 
 ### Roles and traits
@@ -888,33 +907,22 @@ depend on presence macros such as `C_AUTOTMPL_vec_int`; a header never names a
 specialization that was not included. The same rule covers two-argument
 wrappers, so `hashmap_insert$` selects from a tracked `hashmap(int, int)` case.
 
-## Generated files
+<a id="clangd-module"></a>
 
-Generated headers are ordinary C headers in `gen/`. Generic-call selectors and
-public macros live in the single `gen/dispatch.h`: owner sections are keyed by
-template and operation (for example `vec` or `Result.map`), and shared public
-sections are keyed by operation (for example `shared.push` or `shared.map`).
-Every section carries a `generated-by=cli` or `generated-by=plugin` marker, and
-the two generators preserve each other's sections. Split templates also get a grouped
-source in `gen/impl/` and a shared `gen/impl/c-autotmpl.mk` fragment. You can
-commit generated files or regenerate them. Keep the `/* c-autotmpl: ... */`
-markers if you want plugin pruning to work.
+## clangd plugin
 
-If something goes wrong, start with [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
-
-## clangd module
-
-Build the module as described in [BUILD.md](BUILD.md), then pass it to clangd:
+Build the plugin as described in [BUILD.md](BUILD.md), then pass it to clangd:
 
 ```sh
 clangd --load=/absolute/path/to/libc-autotmpl.so
 ```
 
-On `didOpen` and `didChange`, the module scans the unsaved text and writes missing
+On `didOpen` and `didChange`, the plugin scans the unsaved text and writes missing
 headers, implementation sources, and makefile fragments before clangd parses the
 file. It prunes unused blocks after its background workspace scan finishes and
 can find a type's declaring header through the AST when the text index has no
-answer.
+answer. It does not invoke an external preprocessor, but clang diagnostics can
+recover many macro-generated type usages after parsing.
 
 The plugin reads the same `autotmpl.conf` file as the CLI. Restart clangd after
 changing configuration. A compile database is not needed for generation, but
@@ -925,6 +933,8 @@ template function declaration rather than the generated macro. It wraps
 `textDocument/completion` responses to escape the configured affix in snippet
 text, which keeps a `$` prefix intact in editors that parse completion snippets.
 
+If something goes wrong, start with [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+
 ---
 
-[README](../README.md) &bull; [Build](BUILD.md) &bull; [Usage](USAGE.md) &bull; [Troubleshooting](TROUBLESHOOTING.md)
+[README](../README.md) &bull; [Build](BUILD.md) &bull; [Troubleshooting](TROUBLESHOOTING.md)

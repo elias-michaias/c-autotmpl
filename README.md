@@ -1,6 +1,6 @@
 <p align="center">
   <h1 align="center">c-autotmpl</h1>
-  <p align="center">C template-style generic headers, generated from your editor or your build. Parametric polymorphism, ad-hoc overloading, and static dispatch that just works in C.</p>
+  <p align="center">C template-style generic headers, generated from your editor or your build. Parametric polymorphism, ad-hoc overloading, and compile-time generic calls in plain C.</p>
 </p>
 
 <p align="center">
@@ -15,7 +15,7 @@
   <a href="#ad-hoc-overloading-and-explicit-method-types">Ad-hoc overloading</a> &bull;
   <a href="#configuration">Configuration</a> &bull;
   <a href="doc/USAGE.md">Usage</a> &bull;
-  <a href="doc/USAGE.md#stc-quick-start">STC guide</a>
+  <a href="doc/USAGE.md#stc-quick-start">STC quick start</a>
 </p>
 
 ---
@@ -25,8 +25,8 @@
 </p>
 
 c-autotmpl writes the generated headers behind C template-style code such as
-`List(int)` or `Box(Point)`. It runs as a single-file ISO C99 CLI for builds, or
-as a clangd plugin that keeps headers current while you type. Both read the same
+`List(int)` or `Box(Point)`. It runs as a single-file ISO C99 CLI for builds or as
+a clangd plugin that keeps headers current while you type. Both read the same
 [project configuration](#configuration).
 
 ## What you get
@@ -35,20 +35,43 @@ as a clangd plugin that keeps headers current while you type. Both read the same
   `List(Box(int))`, or deeper chains without hand-written macro blocks.
 - **Generic calls.** `$vec_push(&xs, 7)` selects the concrete operation from its
   arguments at compile time, with one spelling for every instantiation.
-- **Ad-hoc overloading.** Different generated types can contribute implementations
-  for the same operation name; `map` can dispatch to both `Option.map` and
-  `Result.map` without a hand-written union type.
-- **Methods with explicit type arguments.** `map(float)(r, f)` supplies the result
-  payload type at the call site while the owner types are inferred from `r`.
-- **Editor-aware generation.** The clangd plugin writes from unsaved buffers,
-  prunes stale blocks, follows generic calls to their template declarations, and
-  preserves the `$` prefix in completions.
-- **Builds without toolchain baggage.** The CLI is one portable C99 source with
-  no LLVM, libclang, C++ runtime, or compile database dependency.
-- **STC adapters.** Use [STC](https://github.com/stclib/STC) containers as
-  `vec(int)` with call sites such as `vec_push(int)(&nums, 7)` or `$vec_push(&nums, 7)`.
+- **Ad-hoc overloading.** Unrelated templates can own the same operation name;
+  `map` can dispatch to both `Option.map` and `Result.map`.
+- **Explicit type arguments.** `map(float)(r, f)` supplies an output type at the
+  call site while the owner template is inferred from `r`.
+- **Two generators, one configuration.** The portable CLI drives builds; the
+  clangd plugin generates from unsaved buffers and improves editor navigation.
+- **[STC](https://github.com/stclib/STC) adapters.** Write `vec(int)` and call
+  `vec_push(int)(&nums, 7)` or `$vec_push(&nums, 7)`.
 
-## At a glance
+## Use it
+
+### CLI
+
+```sh
+cc -std=c99 -O2 src/cli/autotmpl.c -o autotmpl
+./autotmpl --root . --dry-run --verbose src/main.c
+```
+
+Copy `src/cli/autotmpl.c` anywhere and compile it. Prebuilt binaries are
+published by GitHub Actions. See [BUILD.md](doc/BUILD.md) for the Makefile and
+Windows builds.
+
+### clangd plugin
+
+```sh
+make LLVM_SRC=/path/to/llvm-project LLVM_BUILD=/path/to/llvm-project/build
+clangd --load=/absolute/path/to/build/libc-autotmpl.so
+```
+
+For most editors, `--load` is the only setup. The plugin writes missing headers
+before clangd parses a file, prunes unused blocks after its workspace scan, and
+routes generic calls to their template declarations. See
+[BUILD.md](doc/BUILD.md) for the matching LLVM tree and plugin details.
+
+<a id="at-a-glance"></a>
+
+### One-minute example
 
 ```c
 #include "gen/box.h"
@@ -62,53 +85,73 @@ $box_free(&box);      /* calls box_free_int */
 $vec_push(&xs, 7);    /* calls vec_int_push */
 ```
 
-c-autotmpl finds the template headers, writes the instantiations into a sibling
-`gen/` directory, and collects the compile-time selectors into a single
-`gen/dispatch.h`. Include generated instantiation headers first, then
-`gen/dispatch.h`, then call sites. This is ad-hoc polymorphism in C: concrete
-implementations stay separate, while one call spelling resolves to the right one
-at compile time. When several templates expose the same public operation (for
-example `Option.map` and `Result.map`), their guarded selector tables share one
-public spelling. A method can also request an extra explicit type argument, as in
-`map(float)(r, f)`. A template header is just a decorator plus the usual
-preprocessor pattern; see
-[what the pattern does](doc/USAGE.md#what-the-pattern-does).
+Generated instantiation headers come first, then the dispatch header, then call
+sites. Concrete implementations stay separate while one call spelling resolves
+at compile time. A template header is a decorator plus the usual preprocessor
+pattern; see [what the pattern does](doc/USAGE.md#what-the-pattern-does).
 
-## Use it
+## Configuration
 
-### CLI
+Project settings live in `autotmpl.conf` at the workspace root. CLI flags
+override the file, the file overrides environment variables, and environment
+variables override defaults. Restart clangd after changing the file.
 
-```sh
-cc -std=c99 -O2 src/cli/autotmpl.c -o autotmpl
-./autotmpl --root . --verbose src/ include/
-./autotmpl --root . --dry-run --verbose src/main.c
+```text
+# autotmpl.conf
+dispatch=1
+dispatch_templates=vec,pair
+# dispatch_truncate=1
 ```
 
-Copy `src/cli/autotmpl.c` anywhere and compile it. Prebuilt binaries are
-published by GitHub Actions.
+Common keys:
 
-### clangd plugin
+| Config key | Environment variable | Effect |
+| --- | --- | --- |
+| `dispatch` | `C_AUTOTMPL_DISPATCH` | Enable compile-time generic calls. |
+| `dispatch_templates` | `C_AUTOTMPL_DISPATCH_TEMPLATES` | Comma-separated templates that get generic calls. |
+| `dispatch_truncate` | `C_AUTOTMPL_DISPATCH_TRUNCATE` | Use bare operation macros and direct targets; ignore the affix. |
+| `preprocess` | `C_AUTOTMPL_PREPROCESS` | CLI only: scan expanded source so macro-generated usages are visible. |
+| `preprocess_backend` | `C_AUTOTMPL_PREPROCESS_BACKEND` | `local` internal expander or `full` batched `cc -E -P`. |
+| n/a | `C_AUTOTMPL_ROOT` | Force the clangd plugin workspace root. |
 
-```sh
-make LLVM_SRC=/path/to/llvm-project LLVM_BUILD=/path/to/llvm-project/build
-clangd --load=/absolute/path/to/build/libc-autotmpl.so
+The full key list, profiles, and preprocessing backends are in
+[Configuration](doc/USAGE.md#configuration).
+
+## How generation works
+
+A template header carries a decorator:
+
+```c
+// -- template List(T)
+#define List_IMPL(T) List_##T
+#define List(T) List_IMPL(T)
+/* ... */
 ```
 
-For most editors, the `--load` flag is the only setup. Rebuild the module when
-clangd changes; see [BUILD.md](doc/BUILD.md). The plugin writes missing headers
-before clangd parses a file, prunes unused blocks after its workspace scan, and
-makes the editor experience match the generated code: go to definition on a
-generic call opens the template function declaration, not the generated macro,
-and completion keeps a `$` prefix literal instead of treating it as snippet
-syntax.
+For a use of `List(float)`, c-autotmpl appends a marked, guarded re-include block
+that defines `T`, includes the template header, and undefines `T`. The marker
+drives idempotency and pruning; the presence macro prevents duplicate definitions
+across generated headers. User-defined types need a traditional include guard
+such as `FOO_H`; builtin and fixed-width scalars are emitted bare.
 
-Both paths use the same project options; see [Configuration](#configuration).
+Generic-call discovery can also expand a template header itself with
+`// -- preprocess` or `dispatch_preprocess_headers`. A shared header may carry
+several decorators; each marked section is emitted inline with its preamble.
+Generated dispatch is consolidated the same way: owner sections contribute
+guarded selector tables to `gen/dispatch.h`, and shared sections define one
+public spelling even when several templates own the operation.
+
+Authoring details: [nested types](doc/USAGE.md#nested-types),
+[split implementations](doc/USAGE.md#split-implementations),
+[function templates](doc/USAGE.md#function-templates),
+[value generics](doc/USAGE.md#value-generics), and
+[lexical HKTs](doc/USAGE.md#lexical-hkts).
 
 ## Generic calls
 
-Enable generic calls in [Configuration](#configuration) to give generated
-operations one method-like spelling for every instantiation. Include
-`gen/dispatch.h` after the generated instantiation headers and before the calls:
+With `dispatch=1`, generated operations get one method-style spelling for every
+instantiation. Include the generated instantiation headers first, then
+`gen/dispatch.h`, then the calls:
 
 ```c
 vec(int) xs = {0};
@@ -117,102 +160,36 @@ vec(float) ys = {0};
 $vec_push(&xs, 7);      /* vec_int_push */
 $vec_push(&ys, 2.5f);   /* vec_float_push */
 $vec_at(2, xs);         /* vec_int_at, value as the second argument */
-$box_free(&box);        /* box_free_int, any helper spelling */
 ```
 
 A type-template header contributes an operation when a function declaration's
-parameter list mentions the template call form (`vec(int)`, `Box(T)`,
+parameter list mentions its template call form (`vec(int)`, `Box(T)`,
 `pair(Key, Value)`) or a template parameter/decorator (`T`, `U`, `i_type`). The
 function name is not compared with the template name, and declarations after
-`#ifndef TMPL_HEADER` stay private. The public name is the function spelling
-plus the configured affix, so `box_alloc(T)` becomes `$box_alloc` and selects
-`box_alloc_<Type>`.
+`#ifndef TMPL_HEADER` stay private.
 
-Set `dispatch_truncate=1` for bare calls such as `box_set(&box, 7)`. Declare the
-operation as `box_set_impl(T)` in the template header; the dispatcher strips
-`_impl` and targets `box_set_<Type>` directly. Two-argument operations use
-`<op>_impl(T, U)` and target `<op>_<T>_<U>`. `dispatch_affix` is ignored in this
-mode.
+Set `dispatch_truncate=1` for **bare generic calls** such as
+`box_set(&box, 7)`. Declare the operation as `box_set_impl(T)` in the template
+header; the dispatcher exposes `box_set` and targets `box_set_<Type>`.
+`dispatch_affix` is ignored in this mode. See
+[Bare generic calls](doc/USAGE.md#bare-generic-calls) for a complete example.
 
-When another backend owns a constructor, expose it as an explicit alias in the
-header preamble, for example `#define Some(T) ADT_CAT(Some, T)`. Calls use
-`Some(int)(7)`; the operation stays visible to the usage scanner but gets no
-payload-dispatched `_Generic` macro, so the public name is not redefined.
-
-#### Bare call example
-
-```text
-# autotmpl.conf
-dispatch=1
-dispatch_truncate=1
-```
-
-```c
-/* tmpl/pair.h */
-// -- template type pair(T, U)
-#define PAIR_CAT4_I(A, B, C, D) A##B##C##D
-#define PAIR_CAT4(A, B, C, D) PAIR_CAT4_I(A, B, C, D)
-#define PAIR_CAT5_I(A, B, C, D, E) A##B##C##D##E
-#define PAIR_CAT5(A, B, C, D, E) PAIR_CAT5_I(A, B, C, D, E)
-#define pair(T, U) PAIR_CAT4(pair_, T, _, U)
-#define pair_set_impl(T, U) PAIR_CAT5(pair_set, _, T, _, U)
-typedef struct { T first; U second; } pair(T, U);
-static inline void pair_set_impl(T, U)(pair(T, U) *p, T a, U b) {
-  p->first = a;
-  p->second = b;
-}
-```
-
-```c
-/* main.c */
-#include "gen/pair.h"
-#include "gen/dispatch.h"
-
-int main(void) {
-  pair(int, float) p = {0};
-  pair(float, int) q = {0};
-
-  pair_set(&p, 3, 4.5f); /* selects pair_set_int_float */
-  pair_set(&q, 1.5f, 8); /* selects pair_set_float_int */
-
-  return p.first == 3 && p.second == 4.5f &&
-                 q.first == 1.5f && q.second == 8 ? 0 : 1;
-}
-```
-
-```sh
-autotmpl --root . main.c
-cc -I. -std=c11 -Wall -Wextra -Werror main.c -o demo
-```
-
-The public macro lives in `gen/dispatch.h`; each case is guarded by the presence
-macro of an instantiation that actually exists in a generated header, and the
-macro forwards arguments unchanged. Same-name operations from several templates
-share one public spelling through chained owner tables. Selection uses C11
-`_Generic` by default, with a GCC/Clang builtin option for C99. The affix can
-lead (`$vec_push`) or trail (`vec_push_method`); all keys and defaults are in
-[Configuration](#configuration).
+The default backend is C11 `_Generic`; `dispatch_backend=builtin` uses compiler
+builtins for C99. `dispatch_style=prefix|postfix` and `dispatch_affix` control the
+public spelling. See [Generic calls](doc/USAGE.md#generic-calls) for selection,
+naming, forwarding, and ownership rules.
 
 ## Ad-hoc overloading and explicit method types
 
 With `dispatch=1` and `dispatch_truncate=1`, one generated function name can
-serve unrelated templates. Concrete C functions are pasted from their template
-arguments, so two owners that produce the same argument list would collide.
-`// -- +owner` (or `// -- mangle +owner`) opts a template section into
-owner-qualified concrete targets: the owning template name becomes the final
-paste component. It works for ordinary operations and composes with
-`// -- dispatch method ... explicit ...`. `Owner` is a synthetic implementation
-parameter; it never appears at the call site.
+serve unrelated templates. Concrete names are pasted from template arguments, so
+two owners with the same argument list would collide. `// -- +owner` (or
+`// -- mangle +owner`) opts a template section into owner-qualified targets: the
+owning template name becomes the final paste component. It is opt-in, and public
+call spelling is unchanged. List the owners in `dispatch_templates` so they
+contribute to the shared dispatch header.
 
-For example, `Box(int)` and `Container(float)` both expose `get(&o)` even though
-both templates take exactly one argument:
-
-```text
-# autotmpl.conf
-dispatch=1
-dispatch_truncate=1
-dispatch_templates=Box,Container,Option,Result
-```
+For ordinary operations, no extra implementation parameter is needed:
 
 ```c
 /* tmpl/box.h */
@@ -229,215 +206,97 @@ static inline T get_impl(T, Owner)(Box(T) *b) { return b->value; }
 #undef get_impl
 ```
 
+A `Container(float)` section using `// -- mangle +owner` has the same shape.
+Even though both templates take one argument, the calls stay distinct:
+
 ```c
-/* tmpl/container.h */
-// -- template type Container(T)
-// -- mangle +owner
-#define CONTAINER_CAT2_I(a, b) a##b
-#define CONTAINER_CAT2(a, b) CONTAINER_CAT2_I(a, b)
-#define CONTAINER_CAT3_I(a, b, c) a##_##b##_##c
-#define CONTAINER_CAT3(a, b, c) CONTAINER_CAT3_I(a, b, c)
-#define Container(T) CONTAINER_CAT2(Container_, T)
-#define get_impl(T, Owner) CONTAINER_CAT3(get, T, Owner)
-typedef struct { T value; } Container(T);
-static inline T get_impl(T, Owner)(Container(T) *c) { return c->value; }
-#undef get_impl
+Box(int) b = {7};
+Container(float) c = {2.5f};
+
+int x = get(&b);    /* get_int_Box */
+float y = get(&c);  /* get_float_Container */
 ```
 
-The same decorator composes with methods that have explicit type arguments.
-`Option(T)` and `Result(T, U)` have unrelated layouts but both expose `map(V)`;
-the curried type supplies the output payload because it cannot be inferred from
-the input:
+The decorator also composes with a curried method that has explicit type
+arguments. Add a trailing synthetic `Owner` parameter to the implementation
+declaration and paste macro; callers do not supply it:
 
 ```c
 /* tmpl/option.h */
 // -- template type Option(T)
-#define OPTION_CAT2_I(a, b) a##b
-#define OPTION_CAT2(a, b) OPTION_CAT2_I(a, b)
-#define Option(T) OPTION_CAT2(Option_, T)
-typedef struct { int has; T value; } Option(T);
-
 // -- template function option_map_impl(T, U, Owner)
 // -- dispatch method Option.map explicit U
 // -- +owner
-#define OPTION_MAP4_I(a, b, c, d) a##_##b##_##c##_##d
-#define OPTION_MAP4(a, b, c, d) OPTION_MAP4_I(a, b, c, d)
-#define option_map_impl(T, U, Owner) OPTION_MAP4(map, T, U, Owner)
+#define OPTION_CAT2_I(a, b) a##b
+#define OPTION_CAT2(a, b) OPTION_CAT2_I(a, b)
+#define OPTION_CAT4_I(a, b, c, d) a##_##b##_##c##_##d
+#define OPTION_CAT4(a, b, c, d) OPTION_CAT4_I(a, b, c, d)
+#define Option(T) OPTION_CAT2(Option_, T)
+#define option_map_impl(T, U, Owner) OPTION_CAT4(map, T, U, Owner)
+typedef struct { int has; T value; } Option(T);
 static inline Option(U) option_map_impl(T, U, Owner)(Option(T) value,
                                                      U (*f)(T)) {
   Option(U) out = {0};
   if (value.has) { out.has = 1; out.value = f(value.value); }
   return out;
 }
+#undef option_map_impl
 ```
 
 ```c
-/* tmpl/result.h */
-// -- template type Result(T, U)
-#define RESULT_CAT3_I(a, b, c) a##_##b##_##c
-#define RESULT_CAT3(a, b, c) RESULT_CAT3_I(a, b, c)
-#define Result(T, U) RESULT_CAT3(Result, T, U)
-typedef struct { int ok; T value; U error; } Result(T, U);
-
-// -- template function result_map_impl(T, U, V, Owner)
-// -- dispatch method Result.map explicit V
-// -- mangle +owner
-#define RESULT_MAP5_I(a, b, c, d, e) a##_##b##_##c##_##d##_##e
-#define RESULT_MAP5(a, b, c, d, e) RESULT_MAP5_I(a, b, c, d, e)
-#define result_map_impl(T, U, V, Owner) RESULT_MAP5(map, T, U, V, Owner)
-static inline Result(V, U) result_map_impl(T, U, V, Owner)(Result(T, U) value,
-                                                          V (*f)(T)) {
-  Result(V, U) out = {0};
-  if (value.ok) { out.ok = 1; out.value = f(value.value); }
-  else { out.error = value.error; }
-  return out;
-}
-```
-
-```c
-/* main.c: one public spelling for two ordinary and four method targets */
+/* main.c */
 #include "gen/box.h"
 #include "gen/container.h"
 #include "gen/option.h"
-#include "gen/result.h"
 #include "gen/dispatch.h"
 
 static int twice(int x) { return 2 * x; }
-static float half(int x) { return (float)x / 2.0f; }
-static float scale(float x) { return 2.0f * x; }
 
 int main(void) {
   Box(int) b = {7};
   Container(float) c = {2.5f};
-  Option(int) some_int = {1, 7};
-  Option(float) some_float = {1, 2.5f};
-  Result(int, float) ok_int = {1, 7, 0.0f};
+  Option(int) o = {1, 7};
 
-  int x = get(&b);                                      /* get_int_Box */
-  float y = get(&c);                                    /* get_float_Container */
-  Option(int) oi = map(int)(some_int, twice);           /* map_int_int_Option */
-  Option(float) of = map(float)(some_float, scale);     /* map_float_float_Option */
-  Result(int, float) ri = map(int)(ok_int, twice);      /* map_int_float_int_Result */
-  Result(float, float) rf = map(float)(ok_int, half);   /* map_int_float_float_Result */
-  return x == 7 && y == 2.5f && oi.value == 14 && of.value == 5.0f &&
-                 ri.value == 14 && rf.value == 3.5f ? 0 : 1;
+  int x = get(&b);                            /* get_int_Box */
+  float y = get(&c);                          /* get_float_Container */
+  Option(int) oi = map(int)(o, twice);        /* map_int_int_Option */
+  return x == 7 && y == 2.5f && oi.value == 14 ? 0 : 1;
 }
 ```
 
-The curried type supplies the output payload; `_Generic` on the first value
-argument selects the owner and its concrete types from the generated tables.
-`gen/dispatch.h` gives each owner a guarded selector table and chains both into
-one public `map` macro. The `Owner` suffix is generated only from the decorator;
-public call spelling and method macro arity are unchanged. See
+The concrete target is `<op>_<owner args>_<explicit args>_<Owner>`. The curried
+argument supplies the output type; `_Generic` on the first value argument selects
+the owner. See
 [Curried methods with explicit type arguments](doc/USAGE.md#curried-methods-with-explicit-type-arguments)
-for the full rules.
-
-See [Generic calls](doc/USAGE.md#generic-calls) for the association rule and
-header pattern.
+for the full rules and a two-owner `Option`/`Result` example.
 
 ## STC with thin adapters
 
 STC support is opt-in. A wrapper needs one decorator and one paste macro; the
-generated header adds configuration and thin adapters so call sites read like
-parametric C:
+generated header adds configuration and thin adapters from the operations used
+in your sources:
 
 ```c
 vec(int) nums = {0};
 vec_push(int)(&nums, 7);
 ```
 
-STC can be enabled by auto-detection or an explicit template list; see
-[Configuration](#configuration). Both paths select the STC profile. Adapters come
-from the current call sites, so a new operation works without a generator
-update. See the [STC quick start](doc/USAGE.md#stc-quick-start).
-
-## How generation works
-
-A template header carries a decorator:
-
-```c
-// -- template List(T)
-#define List_IMPL(T) List_##T
-#define List(T) List_IMPL(T)
-/* ... */
-```
-
-For a use of `List(float)`, c-autotmpl appends a marked, guarded re-include
-block that defines `T`, includes the template header, and undefines `T`. The
-marker drives idempotency and pruning; the presence macro prevents duplicate
-definitions across generated headers. User-defined types need a traditional
-include guard such as `FOO_H`; builtin and fixed-width scalars are emitted bare.
-
-For generic-call discovery, a template header can opt into local expansion with
-`// -- preprocess`, or via `dispatch_preprocess_headers`. A shared header may
-carry several decorators; each marked section is emitted inline with its
-preamble, so related templates do not re-include the whole file. Generated
-dispatch is similarly consolidated: owner sections contribute guarded selector
-tables to `gen/dispatch.h`, and shared sections define the public call spelling
-once even when several templates own the same operation.
-
-Advanced generation lives in the usage guide:
-[nested types](doc/USAGE.md#nested-types),
-[split implementations](doc/USAGE.md#split-implementations),
-[function templates](doc/USAGE.md#function-templates),
-[value generics](doc/USAGE.md#value-generics), and
-[lexical HKTs](doc/USAGE.md#lexical-hkts).
+STC can be selected by auto-detection or an explicit template list; see
+[Configuration](#configuration). Adapters come from current call sites, so a new
+operation works without a generator update. Start with the
+[STC quick start](doc/USAGE.md#stc-quick-start).
 
 ## Documentation
 
 | Document | Description |
 | --- | --- |
-| [**Usage guide**](doc/USAGE.md) | CLI, configuration, template authoring, guards, and generated files. |
-| [**Generic calls**](doc/USAGE.md#generic-calls) | Compile-time operation selection, naming, forwarding, and configuration. |
+| [**Usage guide**](doc/USAGE.md) | CLI, configuration, template authoring, guards, generated files, generic calls, STC, and plugin behavior. |
+| [**Generic calls**](doc/USAGE.md#generic-calls) | Compile-time operation selection, naming, forwarding, and ownership. |
 | [**STC quick start**](doc/USAGE.md#stc-quick-start) | Thin adapters, auto-detection, explicit template lists, and traits. |
-| [**Polymorphism**](doc/POLYMORPHISM.md) | Generated functions, function templates, ad-hoc overloading, static dispatch, and direct trait calls. |
+| [**Polymorphism**](doc/POLYMORPHISM.md) | Constraints, function templates, ad-hoc overloading, tagged unions, and trait impls. |
 | [**Build guide**](doc/BUILD.md) | CLI build, clangd plugin build, loading, tests, and build errors. |
 | [**Performance**](doc/PERFORMANCE.md) | Benchmark methodology, configuration costs, and sample results. |
 | [**Troubleshooting**](doc/TROUBLESHOOTING.md) | Common failures and fixes. |
-
-## Configuration
-
-Project options live in `autotmpl.conf` at the workspace root. The CLI and
-clangd read the same file. CLI flags override the file, the file overrides
-environment variables, and environment variables override defaults. Restart
-clangd after changing the file.
-
-```text
-# autotmpl.conf
-profile=stc
-stc_auto=1
-dispatch=1
-dispatch_templates=vec,pair
-# dispatch_truncate=1
-```
-
-| Area | Config key | Environment variable | Effect |
-| --- | --- | --- | --- |
-| Profile | `profile` | `C_AUTOTMPL_PROFILE` | `stc`, `stc-shared`, or `none`. |
-| STC templates | `stc_templates` | `C_AUTOTMPL_STC_TEMPLATES` | Comma-separated wrapper names, such as `vec,hashmap`. |
-| STC auto | `stc_auto` | `C_AUTOTMPL_STC_AUTO` | Detect wrappers from template-header contents. |
-| Generic calls | `dispatch` | `C_AUTOTMPL_DISPATCH` | Enable compile-time generic calls. |
-| Call backend | `dispatch_backend` | `C_AUTOTMPL_DISPATCH_BACKEND` | `generic` (`_Generic`, default) or `builtin`. |
-| Call style | `dispatch_style` | `C_AUTOTMPL_DISPATCH_STYLE` | `prefix` (default) or `postfix` affix placement. |
-| Call affix | `dispatch_affix` | `C_AUTOTMPL_DISPATCH_AFFIX` | Affix text; default `$`. |
-| Bare generic calls | `dispatch_truncate` | `C_AUTOTMPL_DISPATCH_TRUNCATE` | Use bare operation macros and directly mangled targets; ignore the affix. |
-| Call templates | `dispatch_templates` | `C_AUTOTMPL_DISPATCH_TEMPLATES` | Comma-separated templates that get generic calls. |
-| Template header preprocess for dispatch | `dispatch_preprocess_headers` | n/a | Expand selected template headers before discovering generic-call operations; `1` means all, otherwise a comma-separated template list. This is unrelated to the central `gen/dispatch.h` output. |
-| Preprocess | `preprocess` | `C_AUTOTMPL_PREPROCESS` | CLI only: scan expanded source so macro-generated usages are visible. Off by default. |
-| Preprocess backend | `preprocess_backend` | `C_AUTOTMPL_PREPROCESS_BACKEND` | `local` internal expander (fast) or `full` batched `cc -E -P` (default, exact). |
-| Preprocessor | `preprocess_cc` | `C_AUTOTMPL_PREPROCESS_CC` | Preprocessor command for the `full` backend; default `cc`. |
-| Preprocessor flags | `preprocess_flags` | `C_AUTOTMPL_PREPROCESS_FLAGS` | Extra flags such as `-Iinclude -DFEATURE=1`. |
-| Plugin root | n/a | `C_AUTOTMPL_ROOT` | Force the clangd workspace root. |
-
-Use `dispatch_style` and `dispatch_affix` for custom call spellings. With
-`dispatch_truncate=1`, the affix is ignored and `<op>_impl(T, U)` declarations
-produce bare `<op>` calls. Preprocessing is opt-in. The `local` backend expands
-common wrapper macros inside the CLI with no external process; the `full` backend
-passes sources to
-batched compiler invocations and treats missing generated headers as empty
-files while bootstrapping. See
-[configuration in the usage guide](doc/USAGE.md#configuration) for CLI flags,
-macro-generated usages, and template-authoring details.
 
 ## Build and test
 
@@ -451,24 +310,29 @@ make bench
 The plugin build needs a matching LLVM source and build tree; the CLI does not.
 `make install` puts the CLI at `~/.local/bin/autotmpl` and the plugin at
 `~/.local/lib/c-autotmpl/libc-autotmpl.so`. Restart clangd after replacing the
-module.
+plugin. See [BUILD.md](doc/BUILD.md) for details.
 
 ## Performance
 
-It's really fast. On the benchmark workload the C99 CLI adds roughly 20 ms to
-a one-second syntax check, plugin edits stay around 2 ms, and even macro-only
-usages can be expanded internally in about 39 ms with `preprocess=1` and
-`preprocess_backend=local`. See [PERFORMANCE.md](doc/PERFORMANCE.md) for
-methodology, configuration comparisons, and `make bench` results.
+On the benchmark workload the C99 CLI adds roughly 20 ms to a one-second syntax
+check, plugin edits stay around 2 ms, and `preprocess=1` with the `local` backend
+adds about 39 ms. See [PERFORMANCE.md](doc/PERFORMANCE.md) for methodology,
+configuration comparisons, and `make bench` results.
 
 ## Limitations
 
 - Generated headers always live in a sibling `gen/` directory.
-- `#pragma once` headers cannot provide a testable guard.
-- The CLI uses raw text by default; enable `preprocess=1` to see macro-generated usages.
+- User-defined types need a traditional `#ifndef` include guard; `#pragma once`
+  has no testable macro.
+- The CLI uses raw text by default; enable `preprocess=1` to see macro-generated
+  usages.
 - Function templates need explicit type arguments; there is no deduction.
-- Nested blocks depend on include order in the source file; dispatch calls also require generated instantiation headers before `gen/dispatch.h`, which must precede the call sites.
-- The clangd module must be rebuilt against a matching clangd version.
+- Dispatch calls require generated instantiation headers before
+  `gen/dispatch.h`, which must precede the call sites.
+- The clangd plugin must be rebuilt against a matching clangd version.
+
+For failures not covered here, see
+[TROUBLESHOOTING.md](doc/TROUBLESHOOTING.md).
 
 ---
 
