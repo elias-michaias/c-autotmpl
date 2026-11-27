@@ -77,6 +77,7 @@ struct TemplateDef {
   std::string GeneratedImplSource;             // absolute gen/impl/list.c
   std::string IncludeFromImplDir;              // "../../tmpl/list.h"
   bool HasTmplHeaderGuard = false;             // has `#ifndef TMPL_HEADER`
+  bool HasDatatypeDispatch = false;            // datatype(...) owns dispatch
   TemplatePreset Preset = TemplatePreset::None;
   llvm::SmallVector<ArgSpec, 2> ArgSpecs;      // empty means legacy behavior
   llvm::StringSet<> DispatchOps;                // method-like operation names

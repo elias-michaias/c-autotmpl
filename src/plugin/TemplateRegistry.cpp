@@ -825,7 +825,13 @@ void TemplateRegistry::scanTree(StringRef Dir) {
     }
     if (!Found)
       continue;
-    collectDispatchOps(Full, *Def);
+    // A datatype(...) declaration describes its variants in the header itself,
+    // and the CLI generator turns those into payload-aware dispatch selectors.
+    // The plugin's function-declaration heuristic would invent unrelated ops
+    // from calls in helper bodies and overwrite that dispatch section.
+    Def->HasDatatypeDispatch = Full.contains("datatype(");
+    if (!Def->HasDatatypeDispatch)
+      collectDispatchOps(Full, *Def);
 
     Def->Header = makeAbsolute(It->path());
     Def->GeneratedHeader = genHeaderPath(Def->Header, Def->Name);

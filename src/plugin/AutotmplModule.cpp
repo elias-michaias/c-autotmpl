@@ -946,7 +946,8 @@ struct SharedState {
   void addDispatchCase(llvm::SmallVectorImpl<DispatchGroup> &Groups,
                        StringRef Output, const FoundUsage &Usage) {
     const TemplateDef *Template = Usage.Template;
-    if (!Template || Template->Kind != TemplateKind::Type)
+    if (!Template || Template->Kind != TemplateKind::Type ||
+        Template->HasDatatypeDispatch)
       return;
     DispatchGroup *Group = findDispatchGroup(Groups, Template, Output);
     if (!Group) {
@@ -971,8 +972,16 @@ struct SharedState {
     llvm::SmallVector<DispatchGroup, 4> Groups;
     for (const auto &Owned : Registry.templates()) {
       const TemplateDef *Template = Owned.get();
-      if (Template->Kind == TemplateKind::Type)
-        Groups.push_back({Template, Template->GeneratedHeader, {}});
+      if (Template->Kind != TemplateKind::Type)
+        continue;
+      // CLI-generated datatype headers already contain dispatch selectors
+      // derived from their variant list. Rewriting them here would replace
+      // payload-dispatched constructors with container-only selectors.
+      if (Template->HasDatatypeDispatch) {
+        log("keeping CLI dispatch for " + Template->Name);
+        continue;
+      }
+      Groups.push_back({Template, Template->GeneratedHeader, {}});
     }
     for (const FoundUsage &Usage : Usages)
       addDispatchCase(Groups, Usage.Template->GeneratedHeader, Usage);
@@ -1503,9 +1512,15 @@ private:
       return false;
     std::string Rel =
         computeRelativePath(sys::path::parent_path(MainFile), GenPath);
+    // Sources in a subdirectory normally include generated headers spelling
+    // the path from the project root, e.g. "gen/box.h" rather than
+    // "../gen/box.h". Accept that spelling too, or we add a duplicate include
+    // at offset 0 and reorder the user's include block on every diagnostic.
+    std::string FromRoot = computeRelativePath(State->Root, GenPath);
     bool Invalid = false;
     StringRef Buffer = SM.getBufferData(SM.getMainFileID(), &Invalid);
-    return !Invalid && (Buffer.contains(Rel) || Buffer.contains(GenPath));
+    return !Invalid && (Buffer.contains(Rel) || Buffer.contains(FromRoot) ||
+                        Buffer.contains(GenPath));
   }
 
   void addIncludeFix(const clang::SourceManager &SM, StringRef TemplateName,

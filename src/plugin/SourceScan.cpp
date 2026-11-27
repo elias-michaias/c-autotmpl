@@ -491,13 +491,20 @@ void scanTemplateUsage(const TemplateDef &Template, StringRef RawType,
     return;
 
   // The template header spells its own parameters, e.g. List(T) or
-  // User(F, Payload). Those are not instantiations.
+  // User(F, Payload). Those are not instantiations. When scanning a
+  // substituted shared header, a partially substituted call such as
+  // Result(int, U) is not an instantiation either: U still belongs to a
+  // different section of that header.
   bool Placeholders = !Template.Params.empty();
   for (const std::string &Arg : RawArgs)
     if (!isDeclaredParam(Template, Arg))
       Placeholders = false;
   if (Placeholders)
     return;
+  if (!ScanHeaders)
+    for (const std::string &Arg : RawArgs)
+      if (isDeclaredParam(Template, Arg))
+        return;
 
   SmallVector<std::string, 4> CanonArgs;
   for (size_t I = 0; I < RawArgs.size(); ++I)
@@ -517,13 +524,18 @@ static void scanFunctionUsage(const TemplateDef &Template, StringRef RawType,
     return;
 
   // The definition inside a template header spells its own macro parameters,
-  // e.g. `select(T, U)(T a, U b)`. Those are not instantiations.
+  // e.g. `select(T, U)(T a, U b)`. Those are not instantiations. A partially
+  // substituted call from a shared header is not an instantiation either.
   bool Placeholders = !Template.Params.empty();
   for (const std::string &Arg : RawArgs)
     if (!isDeclaredParam(Template, Arg))
       Placeholders = false;
   if (Placeholders)
     return;
+  if (!ScanHeaders)
+    for (const std::string &Arg : RawArgs)
+      if (isDeclaredParam(Template, Arg))
+        return;
 
   SmallVector<FoundUsage, 4> Expanded;
   SmallVector<std::string, 4> CanonArgs;
