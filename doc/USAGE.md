@@ -74,6 +74,7 @@ over defaults. Restart clangd after changing configuration.
 | Call affix | `dispatch_affix` | `C_AUTOTMPL_DISPATCH_AFFIX` | Set the generic-call affix, default `$`. |
 | Bare generic calls | `dispatch_truncate` | `C_AUTOTMPL_DISPATCH_TRUNCATE` | Use bare operation macros and direct `<op>_<args>` targets; ignore the affix. |
 | Call templates | `dispatch_templates` | `C_AUTOTMPL_DISPATCH_TEMPLATES` | Comma-separated templates that get generic calls, such as `vec,list`. |
+| Dispatch header preprocess | `dispatch_preprocess_headers` | n/a | Expand template headers while discovering generic calls; `1` means all, otherwise a comma-separated template list. |
 | Preprocess | `preprocess` | `C_AUTOTMPL_PREPROCESS` | CLI only: scan expanded source so macro-generated usages are visible. Off by default. |
 | Preprocess backend | `preprocess_backend` | `C_AUTOTMPL_PREPROCESS_BACKEND` | `local` (internal expander) or `full` (batched `cc -E -P`, default). |
 | Preprocessor | `preprocess_cc` | `C_AUTOTMPL_PREPROCESS_CC` | Command used by the `full` backend; default `cc`. |
@@ -130,6 +131,14 @@ Both backends feed expanded text to the normal usage scanner. Operation calls
 such as `box_alloc(int)()` are mapped back to their owning type template from
 the header signature. Leave preprocessing off when usages are already spelled
 directly.
+
+Generic-call discovery can also expand a template header itself. Add
+`// -- preprocess` to that header, or set `dispatch_preprocess_headers=1` (all
+templates) or `dispatch_preprocess_headers=Option,Result` (named templates).
+This is useful when operations are hidden behind macro-generated declarations.
+A shared header may contain several `// -- template ...` sections; the generator
+emits the preamble and each section inline, avoiding duplicate whole-header
+re-includes.
 
 The clangd plugin keeps its fast unsaved-buffer scan and does not invoke an
 external preprocessor. It can recover many macro-generated type usages through

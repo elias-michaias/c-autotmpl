@@ -1038,6 +1038,42 @@ static int has_tmpl_header_guard(const char *buffer) {
   return found;
 }
 
+/* Header-local opt-in for dispatch discovery. `// -- preprocess` asks the
+ * scanner to expand this template header locally before looking for dispatch
+ * operations, without needing a config list. */
+static int has_preprocess_annotation(const char *buffer) {
+  const char *rest = buffer;
+  while (*rest) {
+    const char *end = strchr(rest, '\n');
+    size_t n = end ? (size_t)(end - rest) : strlen(rest);
+    char *line = xstrdup_n(rest, n);
+    const char *s = line;
+    int found = 0;
+    while (is_space(*s))
+      ++s;
+    if (!strncmp(s, "//", 2)) {
+      s += 2;
+      while (is_space(*s))
+        ++s;
+      if (!strncmp(s, "--", 2)) {
+        s += 2;
+        while (is_space(*s))
+          ++s;
+        if (!strncmp(s, "preprocess", 10) &&
+            (!s[10] || is_space(s[10])))
+          found = 1;
+      }
+    }
+    free(line);
+    if (found)
+      return 1;
+    if (!end)
+      break;
+    rest = end + 1;
+  }
+  return 0;
+}
+
 static char *upper_macro(const char *a, const char *b) {
   Str out;
   str_init(&out);
@@ -1097,6 +1133,13 @@ typedef struct {
   int append_args;
 } DispatchTarget;
 
+/* A dispatch operation can be keyed on a template parameter instead of the
+ * container type. This lets `Some(9)` infer Option(int) from the payload. */
+typedef struct {
+  char *op;
+  char *expr; /* e.g. T */
+} DispatchKey;
+
 typedef struct {
   TemplateKind kind;
   char *name;
@@ -1107,6 +1150,8 @@ typedef struct {
   char *include;
   char *impl;             /* grouped implementation TU, when split */
   char *impl_include;     /* template header relative to impl TU */
+  char *preamble;         /* shared text before the first decorator */
+  char *section;          /* this template's decorator-to-decorator section */
   int has_tmpl_header;
   PresetKind preset;
   ArgSpec *specs;         /* NULL means legacy behavior */
@@ -1114,6 +1159,7 @@ typedef struct {
   Set adapter_ops;        /* STC operation names seen at call sites */
   Set dispatch_ops;       /* method-like operations for generated dispatch */
   Vec dispatch_targets;   /* DispatchTarget*, op-specific call name prefixes */
+  Vec dispatch_keys;      /* DispatchKey*, op-specific _Generic key expressions */
   int dispatch_enabled;
 } TemplateDef;
 
@@ -1338,6 +1384,13 @@ static int is_word(const char *s, size_t i, const char *word) {
 
 static int g_dispatch_truncate = 0;
 
+/* Opt-in: discover dispatch ops from locally expanded template headers.
+ * A name list limits expansion to the datatype templates that need it. */
+static int g_dispatch_preprocess_headers = 0;
+static int g_dispatch_preprocess_all = 0;
+static Set g_dispatch_preprocess_names;
+static PreprocessConfig g_dispatch_header_pre_cfg;
+
 /* In truncate mode `<op>_impl(T, U)` is the canonical generic-method spelling.
  * The suffix marks the declaration macro; the public operation is the part
  * before it, and the concrete target is `<op>_<args>`. */
@@ -1375,6 +1428,24 @@ static void set_dispatch_target(TemplateDef *tmpl, const char *op,
   target->suffix = suffix ? xstrdup(suffix) : NULL;
   target->append_args = append_args;
   vec_push(&tmpl->dispatch_targets, target);
+}
+
+static void set_dispatch_key(TemplateDef *tmpl, const char *op,
+                             const char *expr) {
+  if (!tmpl || !op || !op[0] || !expr || !expr[0])
+    return;
+  for (size_t i = 0; i < tmpl->dispatch_keys.len; ++i) {
+    DispatchKey *key = (DispatchKey *)tmpl->dispatch_keys.items[i];
+    if (!strcmp(key->op, op)) {
+      free(key->expr);
+      key->expr = xstrdup(expr);
+      return;
+    }
+  }
+  DispatchKey *key = (DispatchKey *)xmalloc(sizeof(DispatchKey));
+  key->op = xstrdup(op);
+  key->expr = xstrdup(expr);
+  vec_push(&tmpl->dispatch_keys, key);
 }
 
 static size_t declaration_begin(const char *s, size_t ident) {
@@ -1683,6 +1754,100 @@ static char *truncated_op_name(const char *ident, const char *s, size_t begin,
   return NULL;
 }
 
+/* Returns the template parameter used as the first parameter type, so a
+ * constructor can be dispatched on its payload instead of its container. */
+static char *truncate_ident_template_suffix(const char *ident,
+                                            const TemplateDef *tmpl) {
+  size_t n = strlen(ident);
+  for (size_t i = 0; i < tmpl->nparams; ++i) {
+    size_t plen = strlen(tmpl->params[i]);
+    if (n <= plen + 1 || ident[n - plen - 1] != '_' ||
+        strcmp(ident + n - plen, tmpl->params[i]))
+      continue;
+    return xstrdup_n(ident, n - plen - 1);
+  }
+  return NULL;
+}
+
+static char *first_param_template_key(const char *s, size_t begin, size_t end,
+                                      const TemplateDef *tmpl) {
+  size_t stop = end;
+  int depth = 0;
+  for (size_t i = begin; i < end; ++i) {
+    char c = s[i];
+    if (c == '(' || c == '[')
+      ++depth;
+    else if (c == ')' || c == ']')
+      --depth;
+    else if (c == ',' && depth == 0) {
+      stop = i;
+      break;
+    }
+  }
+  char *param = trim_copy_n(s + begin, stop - begin);
+  if (!param || !param[0]) {
+    free(param);
+    return NULL;
+  }
+
+  for (size_t i = 0; i < tmpl->nparams; ++i)
+    if (!strcmp(param, tmpl->params[i]))
+      return param;
+
+  size_t len = strlen(param);
+  size_t last = len;
+  while (last && !is_ident_char(param[last - 1]))
+    --last;
+  size_t first = last;
+  while (first && is_ident_char(param[first - 1]))
+    --first;
+  if (last > first && first > 0) {
+    char *name = xstrdup_n(param + first, last - first);
+    int is_template_param = 0;
+    for (size_t i = 0; i < tmpl->nparams; ++i)
+      if (!strcmp(name, tmpl->params[i]))
+        is_template_param = 1;
+    free(name);
+    if (!is_template_param) {
+      size_t type_end = first;
+      while (type_end && is_space(param[type_end - 1]))
+        --type_end;
+      while (type_end && param[type_end - 1] == '*') {
+        --type_end;
+        while (type_end && is_space(param[type_end - 1]))
+          --type_end;
+      }
+      if (type_end) {
+        char *type = trim_copy_n(param, type_end);
+        free(param);
+        for (size_t i = 0; i < tmpl->nparams; ++i)
+          if (!strcmp(type, tmpl->params[i]))
+            return type;
+        free(type);
+        return NULL;
+      }
+    }
+  }
+  free(param);
+  return NULL;
+}
+
+static int declaration_returns_container(const char *s, size_t begin,
+                                         size_t end,
+                                         const TemplateDef *tmpl) {
+  size_t n = strlen(tmpl->name);
+  for (size_t i = begin; i + n <= end; ++i) {
+    if (strncmp(s + i, tmpl->name, n) || !is_word(s, i, tmpl->name))
+      continue;
+    size_t j = i + n;
+    while (j < end && is_space(s[j]))
+      ++j;
+    if (j < end && (s[j] == '(' || s[j] == '_'))
+      return 1;
+  }
+  return 0;
+}
+
 /* Finds functions generated by a type-template header. Eligibility depends
  * only on the parameter list; function names are never compared with the
  * template name. A paste-macro declaration such as VEC_FN(i_type, _push)(...)
@@ -1821,12 +1986,23 @@ static void collect_dispatch_ops_from_header(const char *content,
                    params_declare_argument(clean, after + 1, close)) {
           if (g_dispatch_truncate) {
             char *op = truncated_op_name(ident, clean, after + 1, close, tmpl);
+            if (!op)
+              op = truncate_ident_template_suffix(ident, tmpl);
+            const char *public_op = op && op[0] ? op : ident;
             if (op && op[0]) {
               set_add(ops, op);
               set_dispatch_target(tmpl, op, op, NULL, 1);
             } else {
               set_add(ops, ident);
-              set_dispatch_target(tmpl, ident, ident, NULL, 0);
+              set_dispatch_target(
+                  tmpl, ident, ident, NULL,
+                  declaration_returns_container(clean, decl_begin, i, tmpl));
+            }
+            char *key =
+                first_param_template_key(clean, after + 1, close, tmpl);
+            if (key) {
+              set_dispatch_key(tmpl, public_op, key);
+              free(key);
             }
             free(op);
           } else {
@@ -3209,8 +3385,83 @@ static int is_header_ext(const char *ext) {
 
 typedef struct {
   Registry *reg;
+  const char *root;
   int found;
 } TemplateScan;
+
+/* Register one decorator-defined section from a possibly shared header. The
+ * scanner keeps the preamble and section text verbatim; the generator emits the
+ * same text instead of re-including the whole shared file. */
+static void register_template_section(TemplateScan *scan, const char *path,
+                                      TemplateDef *def,
+                                      const char *preamble,
+                                      const char *section_start,
+                                      const char *section_end,
+                                      int file_preprocess) {
+  if (!def->name[0]) {
+    free(def->name);
+    free(def->params);
+    return;
+  }
+
+  def->preamble = xstrdup(preamble ? preamble : "");
+  def->section = xstrdup_n(section_start, (size_t)(section_end - section_start));
+  def->has_tmpl_header = has_tmpl_header_guard(def->section);
+
+  /* Prefer declarations that are already visible in the section. Only expand
+   * when the raw text exposes no operations; expanding a paste-macro forward
+   * declaration would collapse it to a concrete name and lose the public op. */
+  collect_dispatch_ops_from_header(def->section, def);
+  char *expanded = NULL;
+  int preprocess =
+      file_preprocess ||
+      (g_dispatch_preprocess_headers &&
+       (g_dispatch_preprocess_all ||
+        set_has(&g_dispatch_preprocess_names, def->name)));
+  if (preprocess && def->kind == TEMPLATE_TYPE && !def->dispatch_ops.len) {
+    char *dir = path_dirname(path);
+    char *tmp = path_join(dir, ".autotmpl_section.h");
+    Str full;
+    str_init(&full);
+    str_append(&full, def->preamble);
+    str_append(&full, def->section);
+    if (write_file(tmp, full.data ? full.data : "", full.len) == 0) {
+      Vec one;
+      one.items = NULL;
+      one.len = one.cap = 0;
+      vec_push(&one, (void *)tmp);
+      expanded = expand_sources_locally(&one, scan->root, scan->reg, NULL,
+                                        g_dispatch_header_pre_cfg.flags, 0);
+      free(one.items);
+    }
+    str_free(&full);
+    autotmpl_unlink(tmp);
+    free(tmp);
+    free(dir);
+    if (expanded)
+      collect_dispatch_ops_from_header(expanded, def);
+    free(expanded);
+  }
+
+  def->header = path_absolute(path);
+  def->generated = generated_header_path(def->header, def->name);
+  def->impl = def->has_tmpl_header
+                  ? generated_impl_path(def->header, def->name)
+                  : NULL;
+  char *gen_dir = path_dirname(def->generated);
+  def->include = path_relative(gen_dir, def->header);
+  free(gen_dir);
+  if (def->impl) {
+    char *impl_dir = path_dirname(def->impl);
+    def->impl_include = path_relative(impl_dir, def->header);
+    free(impl_dir);
+  }
+
+  TemplateDef *owned = (TemplateDef *)xmalloc(sizeof(TemplateDef));
+  *owned = *def;
+  vec_push(&scan->reg->items, owned);
+  scan->found = 1;
+}
 
 static int visit_template_file(const char *path, void *ctx) {
   TemplateScan *scan = (TemplateScan *)ctx;
@@ -3223,51 +3474,43 @@ static int visit_template_file(const char *path, void *ctx) {
   char *content = read_file(path, NULL);
   if (!content)
     return 0;
+
+  int file_preprocess = has_preprocess_annotation(content);
   TemplateDef def;
   memset(&def, 0, sizeof(def));
-  const char *rest = content;
-  int ok = 0;
-  while (*rest) {
-    const char *end = strchr(rest, '\n');
-    size_t n = end ? (size_t)(end - rest) : strlen(rest);
-    char *line = xstrdup_n(rest, n);
-    if (parse_decorator(line, &def)) {
-      ok = 1;
-      free(line);
-      break;
+  int have_section = 0;
+  char *preamble = NULL;
+  const char *section_start = NULL;
+  const char *p = content;
+
+  while (*p) {
+    const char *newline = strchr(p, '\n');
+    const char *line_end = newline ? newline : p + strlen(p);
+    char *line = xstrdup_n(p, (size_t)(line_end - p));
+
+    TemplateDef candidate;
+    memset(&candidate, 0, sizeof(candidate));
+    if (parse_decorator(line, &candidate)) {
+      if (have_section)
+        register_template_section(scan, path, &def, preamble, section_start, p,
+                                  file_preprocess);
+      if (!have_section)
+        preamble = xstrdup_n(content, (size_t)(p - content));
+      def = candidate;
+      have_section = 1;
+      section_start = p;
     }
     free(line);
-    if (!end)
+    if (!newline)
       break;
-    rest = end + 1;
+    p = newline + 1;
   }
-  def.has_tmpl_header = has_tmpl_header_guard(content);
-  collect_dispatch_ops_from_header(content, &def);
+
+  if (have_section)
+    register_template_section(scan, path, &def, preamble, section_start, p,
+                              file_preprocess);
+  free(preamble);
   free(content);
-  if (!ok || !def.name[0]) {
-    free(def.name);
-    free(def.params);
-    return 0;
-  }
-
-  def.header = path_absolute(path);
-  def.generated = generated_header_path(def.header, def.name);
-  def.impl = def.has_tmpl_header
-                 ? generated_impl_path(def.header, def.name)
-                 : NULL;
-  char *gen_dir = path_dirname(def.generated);
-  def.include = path_relative(gen_dir, def.header);
-  free(gen_dir);
-  if (def.impl) {
-    char *impl_dir = path_dirname(def.impl);
-    def.impl_include = path_relative(impl_dir, def.header);
-    free(impl_dir);
-  }
-
-  TemplateDef *owned = (TemplateDef *)xmalloc(sizeof(TemplateDef));
-  *owned = def;
-  vec_push(&scan->reg->items, owned);
-  scan->found = 1;
   return 0;
 }
 
@@ -3278,7 +3521,7 @@ static void registry_scan(Registry *reg, const char *root) {
   for (size_t i = 0; i < 2; ++i) {
     char *dir = path_join(root, dirs[i]);
     if (path_is_dir(dir)) {
-      TemplateScan scan = {reg, 0};
+      TemplateScan scan = {reg, root, 0};
       walk_dir(dir, visit_template_file, &scan);
       free(dir);
       if (reg->items.len)
@@ -3287,7 +3530,7 @@ static void registry_scan(Registry *reg, const char *root) {
     }
     free(dir);
   }
-  TemplateScan scan = {reg, 0};
+  TemplateScan scan = {reg, root, 0};
   walk_dir(root, visit_template_file, &scan);
 }
 
@@ -3956,7 +4199,11 @@ static void scan_header_deps(const TemplateDef *tmpl, Vec *args, Registry *reg,
                              Vec *out) {
   if (!tmpl->header || !args->len)
     return;
-  char *code = read_file(tmpl->header, NULL);
+  /* For a shared header, each decorator owns only its own section. Scanning
+   * the whole file would attribute sibling templates to this instantiation
+   * and leave their parameters unsubstituted. */
+  char *code = tmpl->section && tmpl->section[0] ? xstrdup(tmpl->section)
+                                                 : read_file(tmpl->header, NULL);
   if (!code)
     return;
   char *substituted = substitute_params(code, tmpl, args);
@@ -4677,6 +4924,22 @@ static char *dispatch_call_target(const TemplateDef *tmpl, const char *op,
   return str_take(&out);
 }
 
+/* Most operations are keyed by the concrete container type. Constructor-like
+ * operations may instead declare a template parameter as their dispatch key. */
+static char *dispatch_key_container(const TemplateDef *tmpl, const char *op,
+                                    const DispatchCase *c) {
+  for (size_t i = 0; i < tmpl->dispatch_keys.len; ++i) {
+    DispatchKey *key = (DispatchKey *)tmpl->dispatch_keys.items[i];
+    if (strcmp(key->op, op))
+      continue;
+    for (size_t j = 0; j < tmpl->nparams; ++j)
+      if (!strcmp(key->expr, tmpl->params[j]) && j < c->args.len)
+        return trim_copy((char *)c->args.items[j]);
+    return xstrdup(key->expr);
+  }
+  return xstrdup(c->container);
+}
+
 #define DISPATCH_MAX_ARGS 8
 
 static void append_size(Str *out, size_t value) {
@@ -4831,8 +5094,10 @@ static char *make_dispatch_section(const TemplateDef *tmpl, Vec *cases,
         str_append(&out, presence);
         str_append_char(&out, '\n');
         char *target = dispatch_call_target(tmpl, op, c);
+        char *key_container = dispatch_key_container(tmpl, op, c);
         append_dispatch_case_selector(&out, cfg, tmpl->name, op, j + 1,
-                                      arity, c->container, target);
+                                      arity, key_container, target);
+        free(key_container);
         free(target);
         str_append(&out, "#else\n");
         Str skip, previous;
@@ -4943,10 +5208,21 @@ static char *make_block(Usage *usage, Set *guards) {
     str_append(&out, "#define TMPL_HEADER 1\n");
     str_append(&out, "#define i_header 1\n");
   }
-  str_append(&out, "#include \"");
-  str_append(&out, tmpl->include);
-  str_append_char(&out, '"');
-  str_append_char(&out, '\n');
+  if (tmpl->section && tmpl->section[0]) {
+    if (tmpl->preamble && tmpl->preamble[0]) {
+      str_append(&out, tmpl->preamble);
+      if (tmpl->preamble[strlen(tmpl->preamble) - 1] != '\n')
+        str_append_char(&out, '\n');
+    }
+    str_append(&out, tmpl->section);
+    if (tmpl->section[strlen(tmpl->section) - 1] != '\n')
+      str_append_char(&out, '\n');
+  } else {
+    str_append(&out, "#include \"");
+    str_append(&out, tmpl->include);
+    str_append_char(&out, '"');
+    str_append_char(&out, '\n');
+  }
   if (shared_stc)
     str_append(&out, "#undef i_header\n");
   if ((tmpl->has_tmpl_header && !is_stc_preset(tmpl)) || shared_stc)
@@ -5854,6 +6130,25 @@ int main(int argc, char **argv) {
       printf("dispatch truncate=1\n");
     if (dispatch_cfg.has_names)
       printf("dispatch templates=%zu\n", dispatch_cfg.names.len);
+  }
+
+  g_dispatch_header_pre_cfg = pre_cfg;
+  g_dispatch_preprocess_names.items = NULL;
+  g_dispatch_preprocess_names.len = g_dispatch_preprocess_names.cap = 0;
+  const char *pre_headers = config_value("dispatch_preprocess_headers");
+  int pre_headers_bool = parse_bool_text(pre_headers);
+  if (pre_headers_bool == 1) {
+    g_dispatch_preprocess_headers = 1;
+    g_dispatch_preprocess_all = 1;
+  } else if (pre_headers_bool == -1 && pre_headers && pre_headers[0]) {
+    g_dispatch_preprocess_headers = 1;
+    add_name_list(&g_dispatch_preprocess_names, pre_headers);
+  }
+  if (opt.verbose && g_dispatch_preprocess_headers) {
+    printf("dispatch preprocess headers=local");
+    if (!g_dispatch_preprocess_all)
+      printf(" templates=%zu", g_dispatch_preprocess_names.len);
+    printf("\n");
   }
 
   Registry reg;

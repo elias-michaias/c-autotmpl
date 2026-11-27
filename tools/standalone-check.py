@@ -556,7 +556,8 @@ dispatch=1
                        "#define $vec_pick(...)"):
             require(needle in content, "missing dispatch text: " + needle,
                     content)
-        require("helper" not in content,
+        require("$helper" not in content and
+                "C_AUTOTMPL_DISPATCH_vec_vec_helper" not in content,
                 "ordinary helper was treated as a dispatch operation",
                 content)
         with open(generated_pair) as f:
@@ -587,8 +588,8 @@ dispatch=1
         require("$_Alignas(...)" not in box_content,
                 "struct alignment attribute was treated as a function",
                 box_content)
-        require("box_secret" not in box_content and
-                "$box_secret(...)" not in box_content,
+        require("$box_secret(...)" not in box_content and
+                "C_AUTOTMPL_DISPATCH_Box_box_secret" not in box_content,
                 "implementation-only helper was treated as a dispatch op",
                 box_content)
 
@@ -1574,7 +1575,8 @@ int raw(void) {
             require(needle in select_content,
                     "missing generated select text: " + needle,
                     select_content)
-        for needle in ("select(impl", "select(First, Second)"):
+        for needle in ("/* c-autotmpl: select(impl",
+                       "/* c-autotmpl: select(First, Second)"):
             require(needle not in select_content,
                     "helper or placeholder was emitted as a function instantiation",
                     select_content)
@@ -1589,7 +1591,7 @@ int raw(void) {
                        "#undef T"):
             require(needle in apply_content,
                     "missing generated apply text: " + needle, apply_content)
-        require("apply(T)" not in apply_content,
+        require("/* c-autotmpl: apply(T) */" not in apply_content,
                 "placeholder was emitted as a function instantiation",
                 apply_content)
 

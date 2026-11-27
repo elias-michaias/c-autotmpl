@@ -206,6 +206,11 @@ marker drives idempotency and pruning; the presence macro prevents duplicate
 definitions across generated headers. User-defined types need a traditional
 include guard such as `FOO_H`; builtin and fixed-width scalars are emitted bare.
 
+For generic-call discovery, a template header can opt into local expansion with
+`// -- preprocess`, or via `dispatch_preprocess_headers`. A shared header may
+carry several decorators; each marked section is emitted inline with its
+preamble, so related templates do not re-include the whole file.
+
 Advanced generation lives in the usage guide:
 [nested types](doc/USAGE.md#nested-types),
 [split implementations](doc/USAGE.md#split-implementations),
@@ -252,6 +257,7 @@ dispatch_templates=vec,pair
 | Call affix | `dispatch_affix` | `C_AUTOTMPL_DISPATCH_AFFIX` | Affix text; default `$`. |
 | Bare generic calls | `dispatch_truncate` | `C_AUTOTMPL_DISPATCH_TRUNCATE` | Use bare operation macros and directly mangled targets; ignore the affix. |
 | Call templates | `dispatch_templates` | `C_AUTOTMPL_DISPATCH_TEMPLATES` | Comma-separated templates that get generic calls. |
+| Dispatch header preprocess | `dispatch_preprocess_headers` | n/a | Expand selected template headers before discovering generic-call operations; `1` means all, otherwise a comma-separated template list. |
 | Preprocess | `preprocess` | `C_AUTOTMPL_PREPROCESS` | CLI only: scan expanded source so macro-generated usages are visible. Off by default. |
 | Preprocess backend | `preprocess_backend` | `C_AUTOTMPL_PREPROCESS_BACKEND` | `local` internal expander (fast) or `full` batched `cc -E -P` (default, exact). |
 | Preprocessor | `preprocess_cc` | `C_AUTOTMPL_PREPROCESS_CC` | Preprocessor command for the `full` backend; default `cc`. |
