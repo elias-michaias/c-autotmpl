@@ -3796,6 +3796,87 @@ static char *dispatch_type_args_from_call(const char *raw, Registry *reg) {
   return out;
 }
 
+/* A payload-dispatched constructor such as Some(2.5f) carries a value rather
+ * than a type argument. With local type inference (`let x = Some(2.5f)`) no
+ * explicit `Option(float)` spelling remains for the usage scanner, so infer
+ * the concrete type from a literal payload. This keeps the constructor and its
+ * _Generic dispatch case available even without an explicit type annotation. */
+static char *literal_type_from_expr(const char *expr) {
+  const char *s = expr;
+  while (is_space(*s))
+    ++s;
+  size_t n = strlen(s);
+  while (n && is_space(s[n - 1]))
+    --n;
+  size_t i = 0;
+  if (i < n && (s[i] == '+' || s[i] == '-'))
+    ++i;
+  if (i >= n || !isdigit((unsigned char)s[i]))
+    return NULL;
+  int hex = n > i + 1 && s[i] == '0' && (s[i + 1] == 'x' || s[i + 1] == 'X');
+  int binary =
+      n > i + 1 && s[i] == '0' && (s[i + 1] == 'b' || s[i + 1] == 'B');
+  int floating = 0;
+  for (size_t k = i; k < n; ++k) {
+    char c = s[k];
+    if (c == '.' || c == 'p' || c == 'P' ||
+        (!hex && !binary && (c == 'e' || c == 'E')))
+      floating = 1;
+  }
+  char suffix = s[n - 1];
+  const char *type;
+  if (floating) {
+    if (suffix == 'f' || suffix == 'F')
+      type = "float";
+    else if (suffix == 'l' || suffix == 'L')
+      type = "long double";
+    else
+      type = "double";
+  } else if (suffix == 'u' || suffix == 'U') {
+    type = n >= 2 && (s[n - 2] == 'l' || s[n - 2] == 'L') ? "unsigned long"
+                                                          : "unsigned int";
+  } else if (suffix == 'l' || suffix == 'L') {
+    int twice = n >= 2 && (s[n - 2] == 'l' || s[n - 2] == 'L');
+    int unsigned_l = n >= 2 && (s[n - 2] == 'u' || s[n - 2] == 'U');
+    if (unsigned_l)
+      type = n >= 3 && (s[n - 3] == 'l' || s[n - 3] == 'L')
+                 ? "unsigned long long"
+                 : "unsigned long";
+    else
+      type = twice ? "long long" : "long";
+  } else {
+    type = "int";
+  }
+  return xstrdup(type);
+}
+
+static int tmpl_has_payload_key(const TemplateDef *tmpl) {
+  if (!tmpl || tmpl->kind != TEMPLATE_TYPE || tmpl->nparams != 1)
+    return 0;
+  for (size_t i = 0; i < tmpl->dispatch_keys.len; ++i) {
+    DispatchKey *key = (DispatchKey *)tmpl->dispatch_keys.items[i];
+    if (!strcmp(key->expr, tmpl->params[0]))
+      return 1;
+  }
+  return 0;
+}
+
+static char *dispatch_payload_type_from_call(const char *raw,
+                                             const TemplateDef *tmpl) {
+  if (!tmpl_has_payload_key(tmpl))
+    return NULL;
+  Vec args;
+  args.items = NULL;
+  args.len = args.cap = 0;
+  split_type_args(raw, &args);
+  char *type = args.len ? literal_type_from_expr((const char *)args.items[0])
+                        : NULL;
+  for (size_t i = 0; i < args.len; ++i)
+    free(args.items[i]);
+  free(args.items);
+  return type;
+}
+
 static char *join_strings(Vec *items, const char *sep) {
   Str out;
   str_init(&out);
@@ -4366,6 +4447,13 @@ static void scan_usages_impl(const char *code, Registry *reg, Vec *out,
           if (depth == 0 && close > begin + 1) {
             char *raw = xstrdup_n(clean + begin, close - begin - 1);
             char *type = dispatch_type_args_from_call(raw, reg);
+            if (!type[0]) {
+              char *payload = dispatch_payload_type_from_call(raw, op_tmpl);
+              if (payload) {
+                free(type);
+                type = payload;
+              }
+            }
             if (type[0])
               scan_template_usage(op_tmpl, type, reg, out, scan_headers);
             free(type);
@@ -5009,9 +5097,16 @@ static void append_dispatch_case_selector(Str *out, const DispatchConfig *cfg,
       str_append(&next, container);
       str_append(&next, "*), ");
       str_append(&next, target_name);
+      str_append(&next, ", __builtin_choose_expr(");
+      str_append(&next, "__builtin_types_compatible_p(__typeof__(");
+      str_append(&next, pname);
+      str_append(&next, "), const ");
+      str_append(&next, container);
+      str_append(&next, "*), ");
+      str_append(&next, target_name);
       str_append(&next, ", ");
       str_append(&next, expr.data);
-      str_append(&next, "))");
+      str_append(&next, ")))");
     } else {
       str_append(&next, "_Generic((");
       str_append(&next, pname);
@@ -5020,6 +5115,10 @@ static void append_dispatch_case_selector(Str *out, const DispatchConfig *cfg,
       str_append(&next, ": ");
       str_append(&next, target_name);
       str_append(&next, ", ");
+      str_append(&next, container);
+      str_append(&next, "*: ");
+      str_append(&next, target_name);
+      str_append(&next, ", const ");
       str_append(&next, container);
       str_append(&next, "*: ");
       str_append(&next, target_name);

@@ -569,11 +569,14 @@ static void appendDispatchCaseSelector(std::string &Out,
       Next = "__builtin_choose_expr(__builtin_types_compatible_p(__typeof__(" +
              Param + "), " + Container.str() + "), " + Target.str() +
              ", __builtin_choose_expr(__builtin_types_compatible_p(__typeof__(" +
-             Param + "), " + Container.str() + "*), " + Target.str() + ", " + Expr +
-             "))";
+             Param + "), " + Container.str() + "*), " + Target.str() +
+             ", __builtin_choose_expr(__builtin_types_compatible_p(__typeof__(" +
+             Param + "), const " + Container.str() + "*), " + Target.str() + ", " +
+             Expr + ")))";
     } else {
       Next = "_Generic((" + Param + "), " + Container.str() + ": " + Target.str() +
-             ", " + Container.str() + "*: " + Target.str() + ", default: " + Expr +
+             ", " + Container.str() + "*: " + Target.str() + ", const " +
+             Container.str() + "*: " + Target.str() + ", default: " + Expr +
              ")";
     }
     Expr = std::move(Next);
